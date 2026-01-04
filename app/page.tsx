@@ -4,6 +4,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AuthGate from "../components/AuthGate";
 import { supabase } from "../lib/supabaseClient";
 
+import {
+  DndContext,
+  DragEndEvent,
+  PointerSensor,
+  useDroppable,
+  useDraggable,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+
 /* ================= TYPES ================= */
 
 type MediaType = "movie" | "tv" | "anime" | "manga" | "book" | "game";
@@ -13,7 +23,7 @@ type MediaItem = {
   id: string;
   title: string;
   type: MediaType;
-  rating?: number;
+  rating?: number; // 0–10
   inTheaters?: boolean;
   dateFinished?: string; // YYYY-MM-DD
   notes?: string;
@@ -56,6 +66,11 @@ function todayYMD() {
 function toMonthKey(dateStr?: string) {
   if (!dateStr) return "Undated";
   return dateStr.slice(0, 7); // YYYY-MM
+}
+
+function clampRating(v: number) {
+  if (!Number.isFinite(v)) return undefined;
+  return Math.max(0, Math.min(10, v));
 }
 
 /* ================= TMDB ================= */
@@ -121,9 +136,59 @@ function StackApp() {
     notes: "",
     dateFinished: "",
     rewatchCount: 0,
+    rating: undefined,
   });
 
   const isRewatch = (form.rewatchCount ?? 0) > 0;
+
+  /* ================= DND ================= */
+
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+
+  function parseDragId(raw: string): { kind: "item"; id: string } | null {
+    if (!raw.startsWith("item:")) return null;
+    return { kind: "item", id: raw.slice("item:".length) };
+  }
+
+  function parseDropId(raw: string): { kind: "column"; status: Status } | null {
+    if (!raw.startsWith("col:")) return null;
+    const s = raw.slice("col:".length) as Status;
+    if (s === "completed" || s === "planned" || s === "in_progress" || s === "dropped") {
+      return { kind: "column", status: s };
+    }
+    return null;
+  }
+
+  const onDragEnd = useCallback(
+    (e: DragEndEvent) => {
+      const activeId = String(e.active.id);
+      const overId = e.over?.id ? String(e.over.id) : null;
+      if (!overId) return;
+
+      const a = parseDragId(activeId);
+      const o = parseDropId(overId);
+      if (!a || !o) return;
+
+      setItems((prev) => {
+        const idx = prev.findIndex((x) => x.id === a.id);
+        if (idx === -1) return prev;
+
+        const next = prev.slice();
+        const curr = next[idx];
+
+        if (curr.status === o.status) return prev;
+
+        // If moving to completed, auto-set date if missing
+        let nextDateFinished = curr.dateFinished;
+        if (o.status === "completed" && !nextDateFinished) nextDateFinished = todayYMD();
+        // If moving out of completed, keep dateFinished as-is (so your history stays)
+
+        next[idx] = { ...curr, status: o.status, dateFinished: nextDateFinished };
+        return next;
+      });
+    },
+    [setItems]
+  );
 
   /* ================= LOCAL BACKUP ================= */
 
@@ -151,11 +216,7 @@ function StackApp() {
       setSaveStatus("Loading…");
       setCloudLoaded(false);
 
-      const { data, error } = await supabase
-        .from("media_items")
-        .select("data")
-        .eq("user_id", uid)
-        .maybeSingle();
+      const { data, error } = await supabase.from("media_items").select("data").eq("user_id", uid).maybeSingle();
 
       if (error) {
         console.error(error);
@@ -173,10 +234,7 @@ function StackApp() {
         setCloudLoaded(true);
         setSaveStatus("Loaded");
       } else {
-        const ins = await supabase.from("media_items").insert({
-          user_id: uid,
-          data: { items: [] },
-        });
+        const ins = await supabase.from("media_items").insert({ user_id: uid, data: { items: [] } });
 
         if (ins.error) {
           console.error(ins.error);
@@ -243,9 +301,15 @@ function StackApp() {
   }, [loadCloud]);
 
   useEffect(() => {
-    if (userId) saveCloud(userId, items);
+    if (userId) void saveCloud(userId, items);
     else saveLocalBackup(items);
   }, [items, userId, cloudLoaded, saveCloud, saveLocalBackup]);
+
+  /* ================= HELPERS ================= */
+
+  const updateItem = useCallback((id: string, patch: Partial<MediaItem>) => {
+    setItems((prev) => prev.map((x) => (x.id === id ? { ...x, ...patch } : x)));
+  }, []);
 
   /* ================= ACTIONS ================= */
 
@@ -259,6 +323,8 @@ function StackApp() {
     const autoDate = status === "completed" ? todayYMD() : "";
     const finalDate = manualDate || autoDate || undefined;
 
+    const rating = typeof form.rating === "number" ? clampRating(form.rating) : undefined;
+
     const item: MediaItem = {
       id: uid(),
       title: String(form.title).trim(),
@@ -271,6 +337,7 @@ function StackApp() {
       notes: (form.notes || "").trim() || undefined,
       tags: form.tags ?? [],
       rewatchCount: Math.max(0, Number(form.rewatchCount ?? 0) || 0),
+      rating,
       createdAt: new Date().toISOString(),
     };
 
@@ -288,6 +355,7 @@ function StackApp() {
       posterUrl: "",
       runtime: undefined,
       rewatchCount: 0,
+      rating: undefined,
     });
   }
 
@@ -376,6 +444,17 @@ function StackApp() {
     return Array.from(map.entries()).sort((a, b) => (a[0] < b[0] ? 1 : -1));
   }, [filtered, groupByMonth]);
 
+  /* ================= BOARD (All tab) ================= */
+
+  const board = useMemo(() => {
+    const all = filtered; // filtered already includes search query
+    const planned = all.filter((x) => x.status === "planned");
+    const inProg = all.filter((x) => x.status === "in_progress");
+    const completed = all.filter((x) => x.status === "completed");
+    const dropped = all.filter((x) => x.status === "dropped");
+    return { planned, inProg, completed, dropped };
+  }, [filtered]);
+
   /* ================= UI ================= */
 
   return (
@@ -459,6 +538,16 @@ function StackApp() {
               ]}
             />
 
+            <NumInput
+              label="Rating (0–10)"
+              value={typeof form.rating === "number" ? form.rating : 0}
+              onChange={(n) => setForm((f) => ({ ...f, rating: clampRating(n) }))}
+              min={0}
+              max={10}
+              step={0.5}
+              allowEmpty
+            />
+
             {/* one line row: in theaters + rewatch + count */}
             <div className="md:col-span-3 grid grid-cols-1 sm:grid-cols-3 gap-3">
               <Toggle
@@ -479,7 +568,7 @@ function StackApp() {
               <NumInput
                 label="Count"
                 value={Number(form.rewatchCount ?? 0)}
-                onChange={(n) => setForm((f) => ({ ...f, rewatchCount: Math.max(0, Number(n ?? 0) || 0) }))}
+                onChange={(n) => setForm((f) => ({ ...f, rewatchCount: Math.max(0, Number(n) || 0) }))}
                 disabled={!isRewatch}
                 min={0}
               />
@@ -543,26 +632,68 @@ function StackApp() {
           />
         </section>
 
-        {/* List */}
-        {groupByMonth && grouped ? (
-          <div className="space-y-6">
-            {grouped.map(([k, list]) => (
-              <section key={k} className="space-y-2">
-                <h3 className="text-sm text-neutral-400">{k}</h3>
-                <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {list.map((i) => (
-                    <MediaCard key={i.id} item={i} onDelete={() => removeItem(i.id)} />
-                  ))}
-                </div>
-              </section>
-            ))}
-          </div>
+        {/* All tab = Drag board */}
+        {tab === "all" ? (
+          <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <DropColumn
+                id="col:completed"
+                title="Completed"
+                items={board.completed}
+                onDelete={removeItem}
+                onUpdate={updateItem}
+              />
+              <DropColumn
+                id="col:in_progress"
+                title="Watching"
+                items={board.inProg}
+                onDelete={removeItem}
+                onUpdate={updateItem}
+              />
+              <DropColumn
+                id="col:planned"
+                title="Watchlist"
+                items={board.planned}
+                onDelete={removeItem}
+                onUpdate={updateItem}
+              />
+              <DropColumn
+                id="col:dropped"
+                title="Dropped"
+                items={board.dropped}
+                onDelete={removeItem}
+                onUpdate={updateItem}
+              />
+            </div>
+
+            <div className="text-xs text-neutral-500 mt-2">
+              Tip: drag a card into a column to change its status.
+            </div>
+          </DndContext>
         ) : (
-          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {filtered.map((i) => (
-              <MediaCard key={i.id} item={i} onDelete={() => removeItem(i.id)} />
-            ))}
-          </div>
+          <>
+            {/* List (non-all tabs) */}
+            {groupByMonth && grouped ? (
+              <div className="space-y-6">
+                {grouped.map(([k, list]) => (
+                  <section key={k} className="space-y-2">
+                    <h3 className="text-sm text-neutral-400">{k}</h3>
+                    <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {list.map((i) => (
+                        <MediaCard key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={updateItem} />
+                      ))}
+                    </div>
+                  </section>
+                ))}
+              </div>
+            ) : (
+              <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {filtered.map((i) => (
+                  <MediaCard key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={updateItem} />
+                ))}
+              </div>
+            )}
+          </>
         )}
 
         <footer className="pt-6 text-xs text-neutral-500">
@@ -575,9 +706,134 @@ function StackApp() {
   );
 }
 
+/* ================= DND COLUMN ================= */
+
+function DropColumn({
+  id,
+  title,
+  items,
+  onDelete,
+  onUpdate,
+}: {
+  id: string;
+  title: string;
+  items: MediaItem[];
+  onDelete: (id: string) => void;
+  onUpdate: (id: string, patch: Partial<MediaItem>) => void;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id });
+
+  return (
+    <section
+      ref={setNodeRef}
+      className={[
+        "rounded-2xl ring-1 p-3 min-h-[140px]",
+        isOver ? "bg-white/10 ring-white/20" : "bg-neutral-900/40 ring-neutral-800/80",
+      ].join(" ")}
+    >
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-medium text-neutral-200">{title}</h3>
+        <div className="text-xs text-neutral-500">{items.length}</div>
+      </div>
+
+      <div className="space-y-3">
+        {items.map((i) => (
+          <DraggableCard key={i.id} item={i} onDelete={() => onDelete(i.id)} onUpdate={onUpdate} />
+        ))}
+
+        {items.length === 0 ? (
+          <div className="text-xs text-neutral-500">Drop here</div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function DraggableCard({
+  item,
+  onDelete,
+  onUpdate,
+}: {
+  item: MediaItem;
+  onDelete: () => void;
+  onUpdate: (id: string, patch: Partial<MediaItem>) => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+    id: `item:${item.id}`,
+  });
+
+  const style: React.CSSProperties = transform
+    ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)` }
+    : {};
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={[
+        "rounded-2xl overflow-hidden ring-1 shadow-sm",
+        isDragging ? "bg-neutral-900/70 ring-white/20" : "bg-neutral-900/50 ring-neutral-800/80",
+      ].join(" ")}
+    >
+      <div className="p-3">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <div className="font-medium truncate text-sm">{item.title}</div>
+            <div className="text-[11px] text-neutral-400">
+              {item.type}
+              {typeof item.rating === "number" ? ` • ${item.rating.toFixed(1)}/10` : ""}
+              {item.inTheaters ? " • theaters" : ""}
+              {(item.rewatchCount ?? 0) > 0 ? ` • rewatch x${item.rewatchCount}` : ""}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              {...attributes}
+              {...listeners}
+              className="text-[11px] px-2 py-1 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
+              title="Drag"
+            >
+              Drag
+            </button>
+
+            <button
+              type="button"
+              onClick={onDelete}
+              className="text-[11px] px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+              title="Delete"
+            >
+              Delete
+            </button>
+          </div>
+        </div>
+
+        {/* quick rating edit */}
+        <div className="mt-2">
+          <MiniRating
+            value={item.rating}
+            onChange={(v) => onUpdate(item.id, { rating: v })}
+          />
+        </div>
+
+        {item.notes ? <div className="mt-2 text-[11px] text-neutral-300 line-clamp-2">{item.notes}</div> : null}
+      </div>
+    </div>
+  );
+}
+
 /* ================= COMPONENTS ================= */
 
-function MediaCard({ item, onDelete }: { item: MediaItem; onDelete: () => void }) {
+function MediaCard({
+  item,
+  onDelete,
+  onUpdate,
+}: {
+  item: MediaItem;
+  onDelete: () => void;
+  onUpdate: (id: string, patch: Partial<MediaItem>) => void;
+}) {
   return (
     <article className="bg-neutral-900/50 rounded-2xl overflow-hidden ring-1 ring-neutral-800/80 shadow-sm">
       <div className="flex gap-3 p-4">
@@ -590,12 +846,13 @@ function MediaCard({ item, onDelete }: { item: MediaItem; onDelete: () => void }
           )}
         </div>
 
-        <div className="min-w-0 flex-1 space-y-1">
+        <div className="min-w-0 flex-1 space-y-2">
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0">
               <div className="font-medium truncate">{item.title}</div>
               <div className="text-xs text-neutral-400">
                 {item.type} • {labelStatus(item.status)}
+                {typeof item.rating === "number" ? ` • ${item.rating.toFixed(1)}/10` : ""}
                 {item.inTheaters ? " • in theaters" : ""}
                 {item.dateFinished ? ` • ${item.dateFinished}` : ""}
                 {(item.rewatchCount ?? 0) > 0 ? ` • rewatch x${item.rewatchCount}` : ""}
@@ -603,6 +860,7 @@ function MediaCard({ item, onDelete }: { item: MediaItem; onDelete: () => void }
             </div>
 
             <button
+              type="button"
               onClick={onDelete}
               className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 shrink-0"
               title="Delete"
@@ -611,11 +869,57 @@ function MediaCard({ item, onDelete }: { item: MediaItem; onDelete: () => void }
             </button>
           </div>
 
+          {/* quick rating edit */}
+          <MiniRating
+            value={item.rating}
+            onChange={(v) => onUpdate(item.id, { rating: v })}
+          />
+
           {item.notes ? <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div> : null}
-          {item.tags?.length ? <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div> : null}
+          {item.tags?.length ? (
+            <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div>
+          ) : null}
         </div>
       </div>
     </article>
+  );
+}
+
+function MiniRating({
+  value,
+  onChange,
+}: {
+  value?: number;
+  onChange: (v: number | undefined) => void;
+}) {
+  const display = typeof value === "number" ? value : undefined;
+
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-[11px] text-neutral-400">Rating</span>
+      <select
+        value={display ?? ""}
+        onChange={(e) => {
+          const raw = e.target.value;
+          if (raw === "") onChange(undefined);
+          else onChange(clampRating(Number(raw)));
+        }}
+        className="text-[11px] rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 outline-none focus:border-neutral-500"
+      >
+        <option value="">—</option>
+        {Array.from({ length: 21 }).map((_, i) => {
+          const v = i * 0.5; // 0.0 to 10.0
+          return (
+            <option key={v} value={v}>
+              {v.toFixed(1)}
+            </option>
+          );
+        })}
+      </select>
+      {typeof display === "number" ? (
+        <span className="text-[11px] text-neutral-500">/10</span>
+      ) : null}
+    </div>
   );
 }
 
@@ -628,6 +932,7 @@ function labelStatus(s: Status) {
 function Tab({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
   return (
     <button
+      type="button"
       onClick={onClick}
       className={`px-3 py-2 rounded-xl border text-sm ${
         active ? "bg-white/15 border-white/20" : "bg-white/5 border-white/10 hover:bg-white/10"
@@ -751,22 +1056,50 @@ function NumInput({
   onChange,
   disabled,
   min,
+  max,
+  step,
+  allowEmpty,
 }: {
   label: string;
   value: number;
   onChange: (v: number) => void;
   disabled?: boolean;
   min?: number;
+  max?: number;
+  step?: number;
+  allowEmpty?: boolean;
 }) {
+  const [raw, setRaw] = useState<string>(() => (allowEmpty ? "" : String(value)));
+
+  useEffect(() => {
+    if (!allowEmpty) {
+      setRaw(String(Number.isFinite(value) ? value : 0));
+    }
+  }, [value, allowEmpty]);
+
   return (
     <label className="block">
       <div className="text-xs mb-1 text-neutral-400">{label}</div>
       <input
         type="number"
-        value={Number.isFinite(value) ? value : 0}
-        onChange={(e) => onChange(Number(e.target.value))}
+        value={allowEmpty ? raw : String(Number.isFinite(value) ? value : 0)}
+        onChange={(e) => {
+          const next = e.target.value;
+          if (allowEmpty) setRaw(next);
+          const n = Number(next);
+          if (next === "" && allowEmpty) return;
+          onChange(n);
+        }}
+        onBlur={() => {
+          if (!allowEmpty) return;
+          if (raw.trim() === "") return;
+          const n = Number(raw);
+          if (!Number.isFinite(n)) setRaw("");
+        }}
         disabled={disabled}
         min={min}
+        max={max}
+        step={step}
         className={`w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500 ${
           disabled ? "opacity-50" : ""
         }`}

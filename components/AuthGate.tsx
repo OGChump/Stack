@@ -52,13 +52,6 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
             Continue with GitHub
           </button>
 
-          <button
-            onClick={() => supabase.auth.signInWithOAuth({ provider: "google" })}
-            className="w-full px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-          >
-            Continue with Google
-          </button>
-
           <div className="text-xs text-neutral-500">
             (If you didn’t enable these providers in Supabase Auth, enable at: Authentication → Providers.)
           </div>
