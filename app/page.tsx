@@ -464,7 +464,7 @@ function StackApp() {
           <div className="flex items-end justify-between gap-4">
             <div>
               <h1 className="text-3xl font-semibold">Stack</h1>
-              <p className="text-sm text-neutral-400">Your personal media stack</p>
+              <p className="text-sm text-neutral-400">Your personal media website</p>
             </div>
             <div className="text-xs text-neutral-500">{saveStatus}</div>
           </div>
