@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AuthGate from "../components/AuthGate";
 import { supabase } from "../lib/supabaseClient";
 
@@ -30,6 +30,19 @@ type MediaItem = {
   createdAt: string; // ISO
 };
 
+type TmdbSearchResult = {
+  results?: Array<{ id: number; title?: string; name?: string }>;
+};
+
+type TmdbGenre = { name: string };
+
+type TmdbDetailsResult = {
+  poster_path?: string | null;
+  runtime?: number | null;
+  episode_run_time?: number[] | null;
+  genres?: TmdbGenre[] | null;
+};
+
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
 
 function uid() {
@@ -47,7 +60,7 @@ function toMonthKey(dateStr?: string) {
 
 /* ================= TMDB ================= */
 
-async function tmdbSearch(title: string, type: "movie" | "tv") {
+async function tmdbSearch(title: string, type: "movie" | "tv"): Promise<TmdbSearchResult> {
   const key = process.env.NEXT_PUBLIC_TMDB_KEY;
   if (!key) throw new Error("Missing TMDB key (NEXT_PUBLIC_TMDB_KEY).");
 
@@ -58,10 +71,10 @@ async function tmdbSearch(title: string, type: "movie" | "tv") {
 
   const res = await fetch(url.toString());
   if (!res.ok) throw new Error(`TMDB search failed (${res.status}).`);
-  return res.json();
+  return (await res.json()) as TmdbSearchResult;
 }
 
-async function tmdbDetails(id: number, type: "movie" | "tv") {
+async function tmdbDetails(id: number, type: "movie" | "tv"): Promise<TmdbDetailsResult> {
   const key = process.env.NEXT_PUBLIC_TMDB_KEY;
   if (!key) throw new Error("Missing TMDB key (NEXT_PUBLIC_TMDB_KEY).");
 
@@ -70,7 +83,7 @@ async function tmdbDetails(id: number, type: "movie" | "tv") {
 
   const res = await fetch(url.toString());
   if (!res.ok) throw new Error(`TMDB details failed (${res.status}).`);
-  return res.json();
+  return (await res.json()) as TmdbDetailsResult;
 }
 
 /* ================= PAGE ================= */
@@ -90,17 +103,15 @@ function StackApp() {
   const [userId, setUserId] = useState<string | null>(null);
 
   const [query, setQuery] = useState("");
-
-  // ✅ Refresh should always start at "All"
   const [tab, setTab] = useState<"all" | "completed" | "watching" | "watchlist" | "dropped">("all");
 
   const [groupByMonth, setGroupByMonth] = useState(true);
-  const [autofillStatus, setAutofillStatus] = useState<string>("");
+  const [autofillStatus, setAutofillStatus] = useState("");
 
   const [cloudLoaded, setCloudLoaded] = useState(false);
-  const [saveStatus, setSaveStatus] = useState<string>("");
+  const [saveStatus, setSaveStatus] = useState("");
 
-  // ✅ Default status should be "Completed"
+  // Default status "completed"
   const [form, setForm] = useState<Partial<MediaItem>>({
     title: "",
     type: "movie",
@@ -112,63 +123,42 @@ function StackApp() {
     rewatchCount: 0,
   });
 
-  // ✅ Rewatch UI helper (derived from rewatchCount)
   const isRewatch = (form.rewatchCount ?? 0) > 0;
 
   /* ================= LOCAL BACKUP ================= */
 
-  function loadLocalBackup() {
+  const loadLocalBackup = useCallback((): MediaItem[] | null => {
     try {
       const raw = localStorage.getItem(LOCAL_BACKUP_KEY);
       if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed as MediaItem[];
-      return null;
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? (parsed as MediaItem[]) : null;
     } catch {
       return null;
     }
-  }
+  }, []);
 
-  function saveLocalBackup(next: MediaItem[]) {
+  const saveLocalBackup = useCallback((next: MediaItem[]) => {
     try {
       localStorage.setItem(LOCAL_BACKUP_KEY, JSON.stringify(next));
     } catch {}
-  }
+  }, []);
 
   /* ================= SUPABASE ================= */
 
-  async function loadCloud(uid: string) {
-    setSaveStatus("Loading…");
-    setCloudLoaded(false);
+  const loadCloud = useCallback(
+    async (uid: string) => {
+      setSaveStatus("Loading…");
+      setCloudLoaded(false);
 
-    const { data, error } = await supabase
-      .from("media_items")
-      .select("data")
-      .eq("user_id", uid)
-      .maybeSingle();
+      const { data, error } = await supabase
+        .from("media_items")
+        .select("data")
+        .eq("user_id", uid)
+        .maybeSingle();
 
-    if (error) {
-      console.error(error);
-      const backup = loadLocalBackup();
-      if (backup) setItems(backup);
-      setCloudLoaded(true);
-      setSaveStatus("Loaded (local backup)");
-      return;
-    }
-
-    if (data?.data?.items) {
-      setItems(data.data.items);
-      saveLocalBackup(data.data.items);
-      setCloudLoaded(true);
-      setSaveStatus("Loaded");
-    } else {
-      const ins = await supabase.from("media_items").insert({
-        user_id: uid,
-        data: { items: [] },
-      });
-
-      if (ins.error) {
-        console.error(ins.error);
+      if (error) {
+        console.error(error);
         const backup = loadLocalBackup();
         if (backup) setItems(backup);
         setCloudLoaded(true);
@@ -176,40 +166,65 @@ function StackApp() {
         return;
       }
 
-      setItems([]);
-      saveLocalBackup([]);
-      setCloudLoaded(true);
-      setSaveStatus("Loaded");
-    }
-  }
+      if (data?.data && typeof data.data === "object" && "items" in data.data) {
+        const next = (data.data as { items: MediaItem[] }).items ?? [];
+        setItems(next);
+        saveLocalBackup(next);
+        setCloudLoaded(true);
+        setSaveStatus("Loaded");
+      } else {
+        const ins = await supabase.from("media_items").insert({
+          user_id: uid,
+          data: { items: [] },
+        });
 
-  async function saveCloud(uid: string, next: MediaItem[]) {
-    saveLocalBackup(next);
-    if (!cloudLoaded) return;
+        if (ins.error) {
+          console.error(ins.error);
+          const backup = loadLocalBackup();
+          if (backup) setItems(backup);
+          setCloudLoaded(true);
+          setSaveStatus("Loaded (local backup)");
+          return;
+        }
 
-    setSaveStatus("Saving…");
+        setItems([]);
+        saveLocalBackup([]);
+        setCloudLoaded(true);
+        setSaveStatus("Loaded");
+      }
+    },
+    [loadLocalBackup, saveLocalBackup]
+  );
 
-    const { error } = await supabase
-      .from("media_items")
-      .upsert({ user_id: uid, data: { items: next } }, { onConflict: "user_id" });
+  const saveCloud = useCallback(
+    async (uid: string, next: MediaItem[]) => {
+      saveLocalBackup(next);
+      if (!cloudLoaded) return;
 
-    if (error) {
-      console.error(error);
-      setSaveStatus("Saved locally (cloud error)");
-      return;
-    }
+      setSaveStatus("Saving…");
 
-    setSaveStatus("Saved");
-  }
+      const { error } = await supabase
+        .from("media_items")
+        .upsert({ user_id: uid, data: { items: next } }, { onConflict: "user_id" });
+
+      if (error) {
+        console.error(error);
+        setSaveStatus("Saved locally (cloud error)");
+        return;
+      }
+
+      setSaveStatus("Saved");
+    },
+    [cloudLoaded, saveLocalBackup]
+  );
 
   useEffect(() => {
-    // instant local load
     const backup = loadLocalBackup();
     if (backup) setItems(backup);
 
-    // ✅ Always reset tab to "All" on page load/refresh
+    // Always reset tab to All on load/refresh
     setTab("all");
-  }, []);
+  }, [loadLocalBackup]);
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
@@ -225,26 +240,21 @@ function StackApp() {
     });
 
     return () => sub.subscription.unsubscribe();
-  }, []);
+  }, [loadCloud]);
 
   useEffect(() => {
     if (userId) saveCloud(userId, items);
     else saveLocalBackup(items);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items, userId, cloudLoaded]);
+  }, [items, userId, cloudLoaded, saveCloud, saveLocalBackup]);
 
   /* ================= ACTIONS ================= */
 
-  function addItem(e: React.FormEvent) {
+  function addItem(e: React.SyntheticEvent) {
     e.preventDefault();
     if (!form.title) return;
 
     const status = (form.status as Status) ?? "completed";
 
-    // Auto-date logic:
-    // - If completed and date is blank => today
-    // - If user set a date => use it
-    // - Otherwise => undefined
     const manualDate = (form.dateFinished || "").trim();
     const autoDate = status === "completed" ? todayYMD() : "";
     const finalDate = manualDate || autoDate || undefined;
@@ -267,7 +277,6 @@ function StackApp() {
     setItems((p) => [item, ...p]);
 
     setAutofillStatus("");
-    // ✅ keep defaults optimized for “mostly completed”
     setForm({
       title: "",
       type: form.type ?? "movie",
@@ -310,7 +319,7 @@ function StackApp() {
         return;
       }
 
-      setAutofillStatus(`Found: ${hit.title || hit.name}`);
+      setAutofillStatus(`Found: ${hit.title || hit.name || "Match"}`);
 
       const d = await tmdbDetails(hit.id, form.type);
 
@@ -318,12 +327,13 @@ function StackApp() {
         ...f,
         posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
         runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
-        tags: (d.genres ?? []).map((g: any) => g.name),
+        tags: (d.genres ?? []).map((g) => g.name),
       }));
 
       setAutofillStatus("Auto-fill complete.");
-    } catch (err: any) {
-      setAutofillStatus(`TMDB error: ${err?.message || "Unknown error"}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      setAutofillStatus(`TMDB error: ${msg}`);
     }
   }
 
@@ -382,7 +392,10 @@ function StackApp() {
         </header>
 
         {/* Add */}
-        <section className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-4">
+        <form
+          onSubmit={addItem}
+          className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-4"
+        >
           <div className="flex gap-2">
             <input
               value={form.title || ""}
@@ -419,7 +432,6 @@ function StackApp() {
             </div>
           ) : null}
 
-          {/* ✅ Type + Status + (In theaters / Rewatch / Count) all in one clean block */}
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
             <Select
               label="Type"
@@ -447,6 +459,7 @@ function StackApp() {
               ]}
             />
 
+            {/* one line row: in theaters + rewatch + count */}
             <div className="md:col-span-3 grid grid-cols-1 sm:grid-cols-3 gap-3">
               <Toggle
                 label="In theaters"
@@ -473,7 +486,6 @@ function StackApp() {
             </div>
           </div>
 
-          {/* Date watched */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <Text
               label="Date watched (optional)"
@@ -484,7 +496,6 @@ function StackApp() {
             />
           </div>
 
-          {/* Notes */}
           <TextArea
             label="Notes"
             value={String(form.notes || "")}
@@ -495,7 +506,6 @@ function StackApp() {
           <div className="flex items-center justify-between gap-3">
             <button
               type="submit"
-              onClick={(e) => addItem(e as any)}
               className="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
             >
               Add to Stack
@@ -503,7 +513,7 @@ function StackApp() {
 
             <Toggle label="Group by month" checked={groupByMonth} onChange={setGroupByMonth} />
           </div>
-        </section>
+        </form>
 
         {/* Tabs + search */}
         <section className="space-y-3">
@@ -602,7 +612,6 @@ function MediaCard({ item, onDelete }: { item: MediaItem; onDelete: () => void }
           </div>
 
           {item.notes ? <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div> : null}
-
           {item.tags?.length ? <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div> : null}
         </div>
       </div>
