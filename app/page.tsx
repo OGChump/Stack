@@ -52,6 +52,10 @@ type TmdbDetailsResult = {
   genres?: TmdbGenre[] | null;
 };
 
+type TmdbRecommendationsResult = {
+  results?: Array<{ id: number; title?: string; name?: string }>;
+};
+
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
 
 function uid() {
@@ -98,7 +102,7 @@ async function tmdbDetails(id: number, type: "movie" | "tv"): Promise<TmdbDetail
   return (await res.json()) as TmdbDetailsResult;
 }
 
-async function tmdbRecommendations(id: number, type: "movie" | "tv") {
+async function tmdbRecommendations(id: number, type: "movie" | "tv"): Promise<TmdbRecommendationsResult> {
   const key = process.env.NEXT_PUBLIC_TMDB_KEY;
   if (!key) throw new Error("Missing TMDB key (NEXT_PUBLIC_TMDB_KEY).");
 
@@ -107,7 +111,7 @@ async function tmdbRecommendations(id: number, type: "movie" | "tv") {
 
   const res = await fetch(url.toString());
   if (!res.ok) throw new Error(`TMDB recommendations failed (${res.status}).`);
-  return (await res.json()) as { results?: Array<{ id: number; title?: string; name?: string }> };
+  return (await res.json()) as TmdbRecommendationsResult;
 }
 
 /* ================= PAGE ================= */
@@ -186,15 +190,11 @@ function StackApp() {
   /* ================= SUPABASE ================= */
 
   const loadCloud = useCallback(
-    async (uid: string) => {
+    async (uidStr: string) => {
       setSaveStatus("Loading…");
       setCloudLoaded(false);
 
-      const { data, error } = await supabase
-        .from("media_items")
-        .select("data")
-        .eq("user_id", uid)
-        .maybeSingle();
+      const { data, error } = await supabase.from("media_items").select("data").eq("user_id", uidStr).maybeSingle();
 
       if (error) {
         console.error(error);
@@ -213,7 +213,7 @@ function StackApp() {
         setSaveStatus("Loaded");
       } else {
         const ins = await supabase.from("media_items").insert({
-          user_id: uid,
+          user_id: uidStr,
           data: { items: [] },
         });
 
@@ -236,7 +236,7 @@ function StackApp() {
   );
 
   const saveCloud = useCallback(
-    async (uid: string, next: MediaItem[]) => {
+    async (uidStr: string, next: MediaItem[]) => {
       saveLocalBackup(next);
       if (!cloudLoaded) return;
 
@@ -244,7 +244,7 @@ function StackApp() {
 
       const { error } = await supabase
         .from("media_items")
-        .upsert({ user_id: uid, data: { items: next } }, { onConflict: "user_id" });
+        .upsert({ user_id: uidStr, data: { items: next } }, { onConflict: "user_id" });
 
       if (error) {
         console.error(error);
@@ -381,7 +381,7 @@ function StackApp() {
       setForm((f) => ({
         ...f,
         tmdbId: hit.id,
-        tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
+        tmdbType: form.type, // ✅ FIX: use form.type (movie/tv), not form.tmdbType
         posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
         runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
         tags: (d.genres ?? []).map((g) => g.name),
@@ -413,7 +413,11 @@ function StackApp() {
       const all: string[] = [];
 
       for (const i of liked) {
-        const rec = await tmdbRecommendations(i.tmdbId!, i.tmdbType!);
+        const type = i.tmdbType;
+        const tmdbId = i.tmdbId;
+        if (!type || !tmdbId) continue;
+
+        const rec = await tmdbRecommendations(tmdbId, type);
         for (const r of rec.results ?? []) {
           const t = (r.title || r.name || "").trim();
           if (!t) continue;
@@ -425,7 +429,7 @@ function StackApp() {
       const unique = Array.from(new Set(all)).slice(0, 5);
       setPicks(unique);
       setPickStatus(unique.length ? "Here you go." : "No new picks found (try rating more items).");
-    } catch (e) {
+    } catch (e: unknown) {
       setPickStatus(e instanceof Error ? e.message : "Pick failed");
     }
   }
@@ -473,14 +477,14 @@ function StackApp() {
         setForm((f) => ({
           ...f,
           tmdbId: hit.id,
-          tmdbType: type === "movie" || type === "tv" ? type : undefined,
+          tmdbType: type,
           posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
           runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
           tags: (d.genres ?? []).map((g) => g.name),
         }));
 
         setAutofillStatus("Auto-fill complete.");
-      } catch (e) {
+      } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Unknown error";
         setAutofillStatus(`TMDB error: ${msg}`);
       }
@@ -607,8 +611,7 @@ function StackApp() {
                   <div key={x.type} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
                     <div className="text-xs text-neutral-400">{x.type}</div>
                     <div>
-                      {x.avg.toFixed(1)}{" "}
-                      <span className="text-xs text-neutral-500">({x.count} rated)</span>
+                      {x.avg.toFixed(1)} <span className="text-xs text-neutral-500">({x.count} rated)</span>
                     </div>
                   </div>
                 ))
@@ -675,7 +678,15 @@ function StackApp() {
               <div className="flex-1" />
               <button
                 type="button"
-                onClick={() => setForm((f) => ({ ...f, posterUrl: "", tags: f.tags ?? [], tmdbId: undefined, tmdbType: undefined }))}
+                onClick={() =>
+                  setForm((f) => ({
+                    ...f,
+                    posterUrl: "",
+                    tags: f.tags ?? [],
+                    tmdbId: undefined,
+                    tmdbType: undefined,
+                  }))
+                }
                 className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
               >
                 Remove poster
@@ -712,7 +723,7 @@ function StackApp() {
 
             <NumInput
               label="Rating (0–10)"
-              value={Number(form.rating ?? 0)}
+              value={typeof form.rating === "number" ? form.rating : 0}
               onChange={(n) =>
                 setForm((f) => ({
                   ...f,
@@ -724,11 +735,7 @@ function StackApp() {
 
             {/* one line row: in theaters + rewatch + count */}
             <div className="md:col-span-3 grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <Toggle
-                label="In theaters"
-                checked={!!form.inTheaters}
-                onChange={(v) => setForm({ ...form, inTheaters: v })}
-              />
+              <Toggle label="In theaters" checked={!!form.inTheaters} onChange={(v) => setForm({ ...form, inTheaters: v })} />
 
               <Toggle
                 label="Rewatch"
