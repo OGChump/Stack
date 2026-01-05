@@ -74,6 +74,10 @@ function toGroupKey(mode: GroupMode, dateStr?: string) {
   return "All";
 }
 
+function isMovieOrTv(t: MediaType): t is "movie" | "tv" {
+  return t === "movie" || t === "tv";
+}
+
 /* ================= TMDB ================= */
 
 async function tmdbSearch(title: string, type: "movie" | "tv"): Promise<TmdbSearchResult> {
@@ -303,10 +307,12 @@ function StackApp() {
         ? Math.max(0, Math.min(10, form.rating))
         : undefined;
 
+    const type: MediaType = (form.type as MediaType) ?? "movie";
+
     const item: MediaItem = {
       id: uid(),
       title: String(form.title).trim(),
-      type: form.type as MediaType,
+      type,
       status,
       inTheaters: !!form.inTheaters,
       dateFinished: finalDate,
@@ -319,7 +325,8 @@ function StackApp() {
 
       rating,
       tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
-      tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
+      // if they chose movie/tv, store tmdbType even if autofill wasn't used
+      tmdbType: isMovieOrTv(type) ? type : undefined,
     };
 
     setItems((p) => [item, ...p]);
@@ -327,7 +334,7 @@ function StackApp() {
     setAutofillStatus("");
     setForm({
       title: "",
-      type: form.type ?? "movie",
+      type: type,
       status: "completed",
       tags: [],
       inTheaters: false,
@@ -352,13 +359,14 @@ function StackApp() {
 
   async function autofill() {
     const title = (form.title || "").trim();
+    const type = (form.type as MediaType) ?? "movie";
 
     if (!title) {
       setAutofillStatus("Type a title first.");
       return;
     }
 
-    if (form.type !== "movie" && form.type !== "tv") {
+    if (!isMovieOrTv(type)) {
       setAutofillStatus("Auto-fill only works for Movie or TV (TMDB).");
       return;
     }
@@ -366,7 +374,7 @@ function StackApp() {
     try {
       setAutofillStatus("Searching TMDB…");
 
-      const s = await tmdbSearch(title, form.type);
+      const s = await tmdbSearch(title, type);
       const hit = s?.results?.[0];
 
       if (!hit) {
@@ -376,12 +384,12 @@ function StackApp() {
 
       setAutofillStatus(`Found: ${hit.title || hit.name || "Match"}`);
 
-      const d = await tmdbDetails(hit.id, form.type);
+      const d = await tmdbDetails(hit.id, type);
 
       setForm((f) => ({
         ...f,
         tmdbId: hit.id,
-        tmdbType: form.type, // ✅ FIX: use form.type (movie/tv), not form.tmdbType
+        tmdbType: type, // ✅ ALWAYS movie/tv here
         posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
         runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
         tags: (d.genres ?? []).map((g) => g.name),
@@ -413,11 +421,9 @@ function StackApp() {
       const all: string[] = [];
 
       for (const i of liked) {
-        const type = i.tmdbType;
-        const tmdbId = i.tmdbId;
-        if (!type || !tmdbId) continue;
+        if (!i.tmdbId || !i.tmdbType) continue;
 
-        const rec = await tmdbRecommendations(tmdbId, type);
+        const rec = await tmdbRecommendations(i.tmdbId, i.tmdbType);
         for (const r of rec.results ?? []) {
           const t = (r.title || r.name || "").trim();
           if (!t) continue;
@@ -449,10 +455,10 @@ function StackApp() {
     if (!autoAutofill) return;
 
     const title = (form.title || "").trim();
-    const type = form.type;
+    const type = (form.type as MediaType) ?? "movie";
 
     if (!title || title.length < 3) return;
-    if (type !== "movie" && type !== "tv") return;
+    if (!isMovieOrTv(type)) return;
 
     const key = `${type}:${title.toLowerCase()}`;
     if (lastAutofillKey.current === key) return;
@@ -477,7 +483,7 @@ function StackApp() {
         setForm((f) => ({
           ...f,
           tmdbId: hit.id,
-          tmdbType: type,
+          tmdbType: type, // ✅ narrowed to movie/tv
           posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
           runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
           tags: (d.genres ?? []).map((g) => g.name),
