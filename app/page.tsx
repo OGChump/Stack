@@ -319,7 +319,7 @@ function StackApp() {
 
       rating,
       tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
-      tmdbType: form.tmdbType as any,
+      tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
     };
 
     setItems((p) => [item, ...p]);
@@ -381,7 +381,7 @@ function StackApp() {
       setForm((f) => ({
         ...f,
         tmdbId: hit.id,
-        tmdbType: form.type as any,
+        tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
         posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
         runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
         tags: (d.genres ?? []).map((g) => g.name),
@@ -473,7 +473,7 @@ function StackApp() {
         setForm((f) => ({
           ...f,
           tmdbId: hit.id,
-          tmdbType: type,
+          tmdbType: type === "movie" || type === "tv" ? type : undefined,
           posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
           runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
           tags: (d.genres ?? []).map((g) => g.name),
