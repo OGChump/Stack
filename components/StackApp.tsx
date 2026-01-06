@@ -4,6 +4,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { supabase } from "../lib/supabaseClient";
 import { DndContext, DragEndEvent, useDraggable, useDroppable } from "@dnd-kit/core";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+  LineChart,
+  Line,
+  PieChart,
+  Pie,
+  Cell,
+} from "recharts";
 
 /* ================= TYPES ================= */
 
@@ -13,7 +27,7 @@ type Status = "planned" | "in_progress" | "dropped" | "completed";
 type GroupMode = "none" | "day" | "month" | "year";
 type SortMode = "newest" | "oldest" | "title" | "rating_high" | "rating_low";
 
-export type StackView = "all" | "completed" | "watching" | "watchlist" | "dropped" | "stats";
+export type StackView = "all" | "completed" | "watching" | "watchlist" | "dropped" | "stats" | "tags";
 
 type MediaItem = {
   id: string;
@@ -30,10 +44,10 @@ type MediaItem = {
   dateFinished?: string; // YYYY-MM-DD
   notes?: string;
 
-  rewatchCount?: number; // 0 = not a rewatch, >=1 = rewatch count
+  rewatchCount?: number; // 0 = not a rewatch
   runtime?: number; // minutes
 
-  // Phase 4: optional extra metadata
+  // optional metadata
   platform?: string;
   withWhom?: string;
   format?: string;
@@ -86,14 +100,6 @@ function toGroupKey(mode: GroupMode, dateStr?: string) {
   return "All";
 }
 
-function fmtMinutes(mins: number) {
-  const m = Math.max(0, Math.floor(mins));
-  const h = Math.floor(m / 60);
-  const r = m % 60;
-  if (h <= 0) return `${m}m`;
-  return `${h}h ${r}m`;
-}
-
 function safeNum(n: unknown) {
   return typeof n === "number" && Number.isFinite(n) ? n : undefined;
 }
@@ -102,168 +108,12 @@ function clampRating(v: number) {
   return Math.max(0, Math.min(10, v));
 }
 
-function parseMaybeNumber(x: string) {
-  const t = x.trim();
-  if (!t) return undefined;
-  const n = Number(t);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-/* ================= CSV HELPERS ================= */
-
-const CSV_HEADERS = [
-  "id",
-  "title",
-  "type",
-  "status",
-  "rating",
-  "dateFinished",
-  "runtime",
-  "rewatchCount",
-  "tags",
-  "notes",
-  "posterUrl",
-  "tmdbId",
-  "tmdbType",
-  "inTheaters",
-  "platform",
-  "withWhom",
-  "format",
-  "seasonOrChapter",
-  "createdAt",
-] as const;
-
-function csvEscape(v: unknown) {
-  const s = String(v ?? "");
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
-
-function toCsv(items: MediaItem[]) {
-  const lines: string[] = [];
-  lines.push(CSV_HEADERS.join(","));
-  for (const i of items) {
-    const row: Record<(typeof CSV_HEADERS)[number], string> = {
-      id: i.id,
-      title: i.title,
-      type: i.type,
-      status: i.status,
-      rating: i.rating == null ? "" : String(i.rating),
-      dateFinished: i.dateFinished ?? "",
-      runtime: i.runtime == null ? "" : String(i.runtime),
-      rewatchCount: i.rewatchCount == null ? "" : String(i.rewatchCount),
-      tags: (i.tags ?? []).join("|"),
-      notes: i.notes ?? "",
-      posterUrl: i.posterUrl ?? "",
-      tmdbId: i.tmdbId == null ? "" : String(i.tmdbId),
-      tmdbType: i.tmdbType ?? "",
-      inTheaters: i.inTheaters ? "true" : "false",
-      platform: i.platform ?? "",
-      withWhom: i.withWhom ?? "",
-      format: i.format ?? "",
-      seasonOrChapter: i.seasonOrChapter ?? "",
-      createdAt: i.createdAt,
-    };
-    lines.push(CSV_HEADERS.map((h) => csvEscape(row[h])).join(","));
-  }
-  return lines.join("\n");
-}
-
-function splitCsvLine(line: string) {
-  // simple robust CSV parser for quotes
-  const out: string[] = [];
-  let cur = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"' && inQuotes && line[i + 1] === '"') {
-      cur += '"';
-      i++;
-      continue;
-    }
-    if (ch === '"') {
-      inQuotes = !inQuotes;
-      continue;
-    }
-    if (ch === "," && !inQuotes) {
-      out.push(cur);
-      cur = "";
-      continue;
-    }
-    cur += ch;
-  }
-  out.push(cur);
-  return out;
-}
-
-function fromCsv(csvText: string): MediaItem[] {
-  const lines = csvText
-    .split(/\r?\n/)
-    .map((l) => l.trimEnd())
-    .filter((l) => l.length);
-
-  if (!lines.length) return [];
-  const header = splitCsvLine(lines[0]).map((h) => h.trim());
-  const idx = new Map<string, number>();
-  header.forEach((h, i) => idx.set(h, i));
-
-  function get(row: string[], key: string) {
-    const i = idx.get(key);
-    if (i == null) return "";
-    return row[i] ?? "";
-  }
-
-  const out: MediaItem[] = [];
-  for (let li = 1; li < lines.length; li++) {
-    const row = splitCsvLine(lines[li]);
-
-    const title = get(row, "title").trim();
-    const type = get(row, "type").trim() as MediaType;
-    const status = get(row, "status").trim() as Status;
-
-    if (!title) continue;
-    if (!["movie", "tv", "anime", "manga", "book", "game"].includes(type)) continue;
-    if (!["planned", "in_progress", "dropped", "completed"].includes(status)) continue;
-
-    const tags = get(row, "tags")
-      .split("|")
-      .map((t) => t.trim())
-      .filter(Boolean);
-
-    const rating = parseMaybeNumber(get(row, "rating"));
-    const runtime = parseMaybeNumber(get(row, "runtime"));
-    const rewatchCount = parseMaybeNumber(get(row, "rewatchCount"));
-    const tmdbId = parseMaybeNumber(get(row, "tmdbId"));
-    const inTheaters = get(row, "inTheaters").trim().toLowerCase() === "true";
-    const tmdbType = get(row, "tmdbType").trim();
-    const createdAt = get(row, "createdAt").trim() || new Date().toISOString();
-
-    out.push({
-      id: get(row, "id").trim() || uid(),
-      title,
-      type,
-      status,
-      rating: rating == null ? undefined : clampRating(rating),
-      dateFinished: get(row, "dateFinished").trim() || undefined,
-      runtime: runtime == null ? undefined : Math.max(0, Math.floor(runtime)),
-      rewatchCount: rewatchCount == null ? 0 : Math.max(0, Math.floor(rewatchCount)),
-      tags,
-      notes: get(row, "notes").trim() || undefined,
-      posterUrl: get(row, "posterUrl").trim() || undefined,
-      tmdbId: tmdbId == null ? undefined : Math.floor(tmdbId),
-      tmdbType: tmdbType === "movie" || tmdbType === "tv" ? (tmdbType as "movie" | "tv") : undefined,
-      inTheaters,
-      platform: get(row, "platform").trim() || undefined,
-      withWhom: get(row, "withWhom").trim() || undefined,
-      format: get(row, "format").trim() || undefined,
-      seasonOrChapter: get(row, "seasonOrChapter").trim() || undefined,
-      createdAt,
-    });
-  }
-
-  // newest first, like app
-  out.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  return out;
+function fmtMinutes(mins: number) {
+  const m = Math.max(0, Math.floor(mins));
+  const h = Math.floor(m / 60);
+  const r = m % 60;
+  if (h <= 0) return `${m}m`;
+  return `${h}h ${r}m`;
 }
 
 /* ================= TMDB ================= */
@@ -309,16 +159,12 @@ async function tmdbRecommendations(id: number, type: "movie" | "tv"): Promise<Tm
 /* ================= APP ================= */
 
 export default function StackApp({ view = "all" }: { view?: StackView }) {
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-
   const [items, setItems] = useState<MediaItem[]>([]);
   const [userId, setUserId] = useState<string | null>(null);
 
   const [query, setQuery] = useState("");
-
   const [groupMode, setGroupMode] = useState<GroupMode>("month");
   const [sortMode, setSortMode] = useState<SortMode>("newest");
-
   const [boardView, setBoardView] = useState(true);
 
   const [autofillStatus, setAutofillStatus] = useState("");
@@ -334,10 +180,13 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const [excludeTypes, setExcludeTypes] = useState<Set<MediaType>>(new Set());
 
-  // Phase 4: multi-select + edit modal
+  // multi-select + edit modal
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [editingId, setEditingId] = useState<string | null>(null);
   const editingItem = useMemo(() => items.find((i) => i.id === editingId) ?? null, [items, editingId]);
+
+  // tags page state
+  const [activeTag, setActiveTag] = useState<string>("");
 
   const [form, setForm] = useState<Partial<MediaItem>>({
     title: "",
@@ -348,20 +197,18 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     notes: "",
     dateFinished: "",
     rewatchCount: 0,
-
     rating: undefined,
     posterUrl: "",
     tmdbId: undefined,
     tmdbType: undefined,
     runtime: undefined,
-
     platform: "",
     withWhom: "",
     format: "",
     seasonOrChapter: "",
   });
 
-  /* ================= NAV + PAGE META ================= */
+  /* ================= NAV ================= */
 
   const nav = useMemo(
     () => [
@@ -371,6 +218,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       { href: "/watchlist", label: "Watchlist", key: "watchlist" as StackView },
       { href: "/dropped", label: "Dropped", key: "dropped" as StackView },
       { href: "/stats", label: "Stats", key: "stats" as StackView },
+      { href: "/tags", label: "Tags", key: "tags" as StackView },
     ],
     []
   );
@@ -382,7 +230,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       watching: { title: "Watching", subtitle: "In progress" },
       watchlist: { title: "Watchlist", subtitle: "Planned — for later" },
       dropped: { title: "Dropped", subtitle: "Paused or abandoned" },
-      stats: { title: "Stats", subtitle: "Your breakdowns" },
+      stats: { title: "Stats", subtitle: "Your breakdowns + charts" },
+      tags: { title: "Tags", subtitle: "Explore your library by tag" },
     }),
     []
   );
@@ -408,6 +257,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       setGroupMode("month");
       setSortMode("newest");
       setBoardView(true);
+    } else if (view === "tags") {
+      setGroupMode("none");
+      setSortMode("title");
+      setBoardView(false);
     }
   }, [view]);
 
@@ -543,7 +396,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       posterUrl: (form.posterUrl || "").trim() || undefined,
       runtime: safeNum(form.runtime),
       notes: (form.notes || "").trim() || undefined,
-      tags: form.tags ?? [],
+      tags: (form.tags ?? []).map((t) => String(t).trim()).filter(Boolean),
       rewatchCount: Math.max(0, Number(form.rewatchCount ?? 0) || 0),
       createdAt: new Date().toISOString(),
       rating,
@@ -686,7 +539,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     updateItem(itemId, { status: newStatus });
   }
 
-  /* ================= AUTO AUTOFILL (DEBOUNCED) ================= */
+  /* ================= AUTO AUTOFILL ================= */
 
   useEffect(() => {
     if (!autoAutofill) return;
@@ -750,6 +603,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     if (view === "watchlist") out = out.filter((i) => i.status === "planned");
     if (view === "dropped") out = out.filter((i) => i.status === "dropped");
 
+    if (view === "tags") {
+      if (activeTag.trim()) out = out.filter((i) => (i.tags ?? []).some((t) => t.toLowerCase() === activeTag.toLowerCase()));
+    }
+
     if (query) {
       const q = query.toLowerCase();
       out = out.filter((i) =>
@@ -769,7 +626,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     });
 
     return out;
-  }, [items, view, query, sortMode]);
+  }, [items, view, query, sortMode, activeTag]);
 
   const grouped = useMemo(() => {
     if (groupMode === "none") return null;
@@ -781,63 +638,73 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       if (!map.has(k)) map.set(k, []);
       map.get(k)!.push(i);
     }
-
     return Array.from(map.entries()).sort((a, b) => (a[0] < b[0] ? 1 : -1));
   }, [filtered, groupMode]);
 
-  /* ================= PHASE 3 STATS (still here) ================= */
+  /* ================= PHASE 5 ANALYTICS ================= */
 
-  const completedForStats = useMemo(() => {
-    return items.filter((i) => i.status === "completed" && !excludeTypes.has(i.type));
-  }, [items, excludeTypes]);
+  const completedItems = useMemo(() => items.filter((i) => i.status === "completed" && !excludeTypes.has(i.type)), [items, excludeTypes]);
 
-  const totalCompleted = completedForStats.length;
+  const totalCompleted = completedItems.length;
 
-  const totalMinutes = useMemo(() => {
-    return completedForStats.reduce((sum, i) => sum + (safeNum(i.runtime) ?? 0), 0);
-  }, [completedForStats]);
+  const totalMinutes = useMemo(() => completedItems.reduce((sum, i) => sum + (safeNum(i.runtime) ?? 0), 0), [completedItems]);
 
-  /* ================= IMPORT/EXPORT ================= */
+  const statusBreakdown = useMemo(() => {
+    const map: Record<Status, number> = { planned: 0, in_progress: 0, dropped: 0, completed: 0 };
+    for (const i of items) map[i.status] += 1;
+    return (Object.entries(map) as Array<[Status, number]>).map(([k, v]) => ({ status: k, count: v }));
+  }, [items]);
 
-  function exportCsv() {
-    const csv = toCsv(items);
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `stack-export-${todayYMD()}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  }
-
-  async function importCsvFromFile(file: File) {
-    const text = await file.text();
-    const incoming = fromCsv(text);
-    if (!incoming.length) {
-      alert("No items found in CSV.");
-      return;
+  const byTypeCompleted = useMemo(() => {
+    const map = new Map<MediaType, { count: number; minutes: number }>();
+    for (const i of completedItems) {
+      const cur = map.get(i.type) ?? { count: 0, minutes: 0 };
+      cur.count += 1;
+      cur.minutes += safeNum(i.runtime) ?? 0;
+      map.set(i.type, cur);
     }
-    const ok = confirm(
-      `Import ${incoming.length} item(s)?\n\nThis will MERGE into your library (no duplicates by id, incoming overwrites).`
-    );
-    if (!ok) return;
+    return Array.from(map.entries())
+      .map(([type, v]) => ({ type, count: v.count, minutes: v.minutes }))
+      .sort((a, b) => b.count - a.count);
+  }, [completedItems]);
 
-    setItems((prev) => {
-      const map = new Map<string, MediaItem>();
-      for (const p of prev) map.set(p.id, p);
-      for (const n of incoming) map.set(n.id, n);
-      const merged = Array.from(map.values()).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      return merged;
-    });
-  }
+  const monthlyCompletions = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const i of completedItems) {
+      const d = (i.dateFinished ?? i.createdAt).slice(0, 7); // YYYY-MM
+      map.set(d, (map.get(d) ?? 0) + 1);
+    }
+    return Array.from(map.entries())
+      .map(([month, count]) => ({ month, count }))
+      .sort((a, b) => (a.month < b.month ? -1 : 1));
+  }, [completedItems]);
 
-  /* ================= QUICK ADD ================= */
+  const ratingHistogram = useMemo(() => {
+    // buckets: 0-1,1-2,...,9-10
+    const buckets = Array.from({ length: 10 }, (_, i) => ({ bucket: `${i}-${i + 1}`, count: 0 }));
+    for (const i of completedItems) {
+      if (typeof i.rating !== "number") continue;
+      const r = clampRating(i.rating);
+      const idx = Math.min(9, Math.max(0, Math.floor(r)));
+      buckets[idx].count += 1;
+    }
+    return buckets;
+  }, [completedItems]);
 
-  function quickSetType(t: MediaType) {
-    setForm((f) => ({ ...f, type: t, tmdbId: undefined, tmdbType: undefined, tags: [], posterUrl: "" }));
-  }
+  const topTags = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const i of items) {
+      for (const t of i.tags ?? []) {
+        const tag = String(t).trim();
+        if (!tag) continue;
+        m.set(tag, (m.get(tag) ?? 0) + 1);
+      }
+    }
+    return Array.from(m.entries())
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 30);
+  }, [items]);
 
   /* ================= UI ================= */
 
@@ -870,114 +737,18 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           </nav>
         </header>
 
-        {/* ✅ PHASE 4 TOOLBAR */}
-        <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={exportCsv}
-                className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
-              >
-                Export CSV
-              </button>
-
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
-              >
-                Import CSV
-              </button>
-
-              <div className="hidden sm:block w-px bg-white/10 mx-2" />
-
-              <div className="flex flex-wrap gap-2">
-                <button type="button" onClick={() => quickSetType("movie")} className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm">
-                  + Movie
-                </button>
-                <button type="button" onClick={() => quickSetType("tv")} className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm">
-                  + TV
-                </button>
-                <button type="button" onClick={() => quickSetType("anime")} className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm">
-                  + Anime
-                </button>
-                <button type="button" onClick={() => quickSetType("book")} className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm">
-                  + Book
-                </button>
-                <button type="button" onClick={() => quickSetType("game")} className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm">
-                  + Game
-                </button>
-              </div>
-            </div>
-
-            <div className="text-xs text-neutral-400">
-              Selected: <span className="text-neutral-200">{selectedIds.size}</span>
-            </div>
-          </div>
-
-          {/* Bulk actions */}
-          {selectedIds.size ? (
-            <div className="mt-3 flex flex-wrap gap-2 items-center">
-              <button
-                type="button"
-                onClick={() => bulkSetStatus("completed")}
-                className="px-3 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/25 hover:bg-emerald-500/20 text-sm"
-              >
-                Mark Completed
-              </button>
-              <button
-                type="button"
-                onClick={() => bulkSetStatus("planned")}
-                className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
-              >
-                Mark Watchlist
-              </button>
-              <button
-                type="button"
-                onClick={() => bulkSetStatus("in_progress")}
-                className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
-              >
-                Mark Watching
-              </button>
-              <button
-                type="button"
-                onClick={() => bulkSetStatus("dropped")}
-                className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
-              >
-                Mark Dropped
-              </button>
-
-              <div className="flex-1" />
-
-              <button
-                type="button"
-                onClick={bulkDelete}
-                className="px-3 py-2 rounded-xl bg-red-500/15 border border-red-500/25 hover:bg-red-500/20 text-sm"
-              >
-                Delete selected
-              </button>
-
-              <button
-                type="button"
-                onClick={clearSelected}
-                className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm"
-              >
-                Clear
-              </button>
-            </div>
-          ) : null}
-        </div>
-
-        {/* ✅ STATS PAGE */}
+        {/* ✅ STATS (PHASE 5) */}
         {view === "stats" ? (
-          <div className="grid md:grid-cols-2 gap-4">
-            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-              <div className="text-sm font-medium">Total completed</div>
-              <div className="text-3xl font-semibold mt-1">{totalCompleted}</div>
+          <div className="space-y-4">
+            <div className="grid md:grid-cols-3 gap-4">
+              <StatCard title="Total completed" value={String(totalCompleted)} sub="Respects excluded types" />
+              <StatCard title="Total time watched" value={fmtMinutes(totalMinutes)} sub="Sum of runtime minutes" />
+              <StatCard title="Library size" value={String(items.length)} sub="All statuses" />
+            </div>
 
-              <div className="text-xs text-neutral-400 mt-3">Exclude types:</div>
-              <div className="flex flex-wrap gap-2 mt-2">
+            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+              <div className="text-sm font-medium mb-2">Exclude types</div>
+              <div className="flex flex-wrap gap-2">
                 {(["movie", "tv", "anime", "manga", "book", "game"] as MediaType[]).map((t) => (
                   <button
                     key={t}
@@ -995,13 +766,156 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               </div>
             </div>
 
+            <div className="grid lg:grid-cols-2 gap-4">
+              <ChartCard title="Completed by type">
+                <ResponsiveContainer width="100%" height={280}>
+                  <BarChart data={byTypeCompleted}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="type" />
+                    <YAxis allowDecimals={false} />
+                    <Tooltip />
+                    <Bar dataKey="count" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </ChartCard>
+
+              <ChartCard title="Status breakdown">
+                <ResponsiveContainer width="100%" height={280}>
+                  <PieChart>
+                    <Pie data={statusBreakdown} dataKey="count" nameKey="status" outerRadius={100} label />
+                    {/* no custom colors (keeps it simple + consistent with your constraints) */}
+                    {statusBreakdown.map((_, idx) => (
+                      <Cell key={idx} />
+                    ))}
+                    <Tooltip />
+                  </PieChart>
+                </ResponsiveContainer>
+              </ChartCard>
+            </div>
+
+            <div className="grid lg:grid-cols-2 gap-4">
+              <ChartCard title="Completions over time">
+                <ResponsiveContainer width="100%" height={280}>
+                  <LineChart data={monthlyCompletions}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="month" />
+                    <YAxis allowDecimals={false} />
+                    <Tooltip />
+                    <Line type="monotone" dataKey="count" dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </ChartCard>
+
+              <ChartCard title="Rating distribution (completed)">
+                <ResponsiveContainer width="100%" height={280}>
+                  <BarChart data={ratingHistogram}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="bucket" />
+                    <YAxis allowDecimals={false} />
+                    <Tooltip />
+                    <Bar dataKey="count" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </ChartCard>
+            </div>
+
             <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-              <div className="text-sm font-medium">Total time</div>
-              <div className="text-3xl font-semibold mt-1">{fmtMinutes(totalMinutes)}</div>
-              <div className="text-xs text-neutral-500 mt-2">Based on runtime minutes.</div>
+              <div className="text-sm font-medium mb-2">Top tags</div>
+              <div className="flex flex-wrap gap-2">
+                {topTags.length ? (
+                  topTags.map((t) => (
+                    <span key={t.tag} className="px-3 py-1 rounded-xl bg-white/5 border border-white/10 text-xs">
+                      {t.tag} <span className="text-neutral-500">({t.count})</span>
+                    </span>
+                  ))
+                ) : (
+                  <div className="text-xs text-neutral-400">No tags yet — add some via auto-fill or manually.</div>
+                )}
+              </div>
             </div>
           </div>
-        ) : (
+        ) : null}
+
+        {/* ✅ TAGS PAGE */}
+        {view === "tags" ? (
+          <div className="space-y-4">
+            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">Browse by tag</div>
+                  <div className="text-xs text-neutral-500">Click a tag to filter your library.</div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <input
+                    value={activeTag}
+                    onChange={(e) => setActiveTag(e.target.value)}
+                    placeholder="Type a tag…"
+                    className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500 text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setActiveTag("")}
+                    className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-4 flex flex-wrap gap-2">
+                {topTags.length ? (
+                  topTags.map((t) => (
+                    <button
+                      key={t.tag}
+                      type="button"
+                      onClick={() => setActiveTag(t.tag)}
+                      className={`px-3 py-1 rounded-xl border text-xs ${
+                        activeTag.toLowerCase() === t.tag.toLowerCase()
+                          ? "bg-white/15 border-white/20"
+                          : "bg-white/5 border-white/10 hover:bg-white/10"
+                      }`}
+                    >
+                      {t.tag} <span className="text-neutral-500">({t.count})</span>
+                    </button>
+                  ))
+                ) : (
+                  <div className="text-xs text-neutral-400">No tags yet.</div>
+                )}
+              </div>
+            </div>
+
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search within tag results..."
+              className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+            />
+
+            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {filtered.map((i) => (
+                <MediaCard
+                  key={i.id}
+                  item={i}
+                  selected={selectedIds.has(i.id)}
+                  onToggleSelected={() => toggleSelected(i.id)}
+                  onDelete={() => removeItem(i.id)}
+                  onUpdate={(patch) => updateItem(i.id, patch)}
+                  onEdit={() => setEditingId(i.id)}
+                />
+              ))}
+            </div>
+
+            {!filtered.length ? (
+              <div className="text-sm text-neutral-500 text-center py-10">
+                No results for <span className="text-neutral-200">{activeTag || "that tag"}</span>.
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        {/* ✅ MAIN APP (non-stats, non-tags) */}
+        {view !== "stats" && view !== "tags" ? (
           <>
             {/* Recommender */}
             <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-3">
@@ -1220,26 +1134,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               )}
             </DndContext>
           </>
-        )}
+        ) : null}
 
         <footer className="pt-6 text-xs text-neutral-500">Stack • Saves to Supabase + local backup</footer>
 
-        {/* Import file input */}
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".csv,text/csv"
-          className="hidden"
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (!f) return;
-            importCsvFromFile(f).finally(() => {
-              if (fileInputRef.current) fileInputRef.current.value = "";
-            });
-          }}
-        />
-
-        {/* Edit modal */}
         {editingItem ? (
           <EditModal
             item={editingItem}
@@ -1251,6 +1149,27 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           />
         ) : null}
       </div>
+    </div>
+  );
+}
+
+/* ================= SMALL UI PIECES ================= */
+
+function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
+  return (
+    <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+      <div className="text-sm font-medium">{title}</div>
+      <div className="text-3xl font-semibold mt-1">{value}</div>
+      {sub ? <div className="text-xs text-neutral-500 mt-2">{sub}</div> : null}
+    </div>
+  );
+}
+
+function ChartCard({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+      <div className="text-sm font-medium mb-3">{title}</div>
+      {children}
     </div>
   );
 }
@@ -1361,26 +1280,14 @@ function EditModal({
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4"
-      onMouseDown={onClose}
-      role="dialog"
-      aria-modal="true"
-    >
-      <div
-        className="w-full max-w-2xl rounded-2xl bg-neutral-950 border border-neutral-800 p-4 sm:p-6"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onMouseDown={onClose} role="dialog" aria-modal="true">
+      <div className="w-full max-w-2xl rounded-2xl bg-neutral-950 border border-neutral-800 p-4 sm:p-6" onMouseDown={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-lg font-semibold">Edit item</div>
             <div className="text-xs text-neutral-500">Click outside to close.</div>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm"
-          >
+          <button type="button" onClick={onClose} className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm">
             Close
           </button>
         </div>
@@ -1413,88 +1320,41 @@ function EditModal({
             ]}
           />
 
-          <NumInput
-            label="Rating (0–10)"
-            value={Number(draft.rating ?? 0)}
-            onChange={(n) => setDraft((d) => ({ ...d, rating: clampRating(Number(n) || 0) }))}
-            min={0}
-          />
+          <NumInput label="Rating (0–10)" value={Number(draft.rating ?? 0)} onChange={(n) => setDraft((d) => ({ ...d, rating: clampRating(Number(n) || 0) }))} min={0} />
+          <Text label="Date finished" type="date" value={draft.dateFinished ?? ""} onChange={(v) => setDraft((d) => ({ ...d, dateFinished: v }))} />
+          <NumInput label="Runtime (minutes)" value={Number(draft.runtime ?? 0)} onChange={(n) => setDraft((d) => ({ ...d, runtime: Math.max(0, Number(n) || 0) }))} min={0} />
+          <NumInput label="Rewatch count" value={Number(draft.rewatchCount ?? 0)} onChange={(n) => setDraft((d) => ({ ...d, rewatchCount: Math.max(0, Number(n) || 0) }))} min={0} />
 
-          <Text
-            label="Date finished"
-            type="date"
-            value={draft.dateFinished ?? ""}
-            onChange={(v) => setDraft((d) => ({ ...d, dateFinished: v }))}
-          />
-
-          <NumInput
-            label="Runtime (minutes)"
-            value={Number(draft.runtime ?? 0)}
-            onChange={(n) => setDraft((d) => ({ ...d, runtime: Math.max(0, Number(n) || 0) }))}
-            min={0}
-          />
-
-          <NumInput
-            label="Rewatch count"
-            value={Number(draft.rewatchCount ?? 0)}
-            onChange={(n) => setDraft((d) => ({ ...d, rewatchCount: Math.max(0, Number(n) || 0) }))}
-            min={0}
-          />
-
-          <Toggle
-            label="In theaters"
-            checked={!!draft.inTheaters}
-            onChange={(v) => setDraft((d) => ({ ...d, inTheaters: v }))}
-          />
-
+          <Toggle label="In theaters" checked={!!draft.inTheaters} onChange={(v) => setDraft((d) => ({ ...d, inTheaters: v }))} />
           <Text label="Platform" value={draft.platform ?? ""} onChange={(v) => setDraft((d) => ({ ...d, platform: v }))} />
           <Text label="With whom" value={draft.withWhom ?? ""} onChange={(v) => setDraft((d) => ({ ...d, withWhom: v }))} />
           <Text label="Format" value={draft.format ?? ""} onChange={(v) => setDraft((d) => ({ ...d, format: v }))} />
-          <Text
-            label="Season / Chapter"
-            value={draft.seasonOrChapter ?? ""}
-            onChange={(v) => setDraft((d) => ({ ...d, seasonOrChapter: v }))}
-          />
+          <Text label="Season / Chapter" value={draft.seasonOrChapter ?? ""} onChange={(v) => setDraft((d) => ({ ...d, seasonOrChapter: v }))} />
+        </div>
+
+        <div className="mt-3">
+          <Text label="Poster URL" value={draft.posterUrl ?? ""} onChange={(v) => setDraft((d) => ({ ...d, posterUrl: v }))} />
         </div>
 
         <div className="mt-3">
           <Text
-            label="Poster URL"
-            value={draft.posterUrl ?? ""}
-            onChange={(v) => setDraft((d) => ({ ...d, posterUrl: v }))}
-          />
-        </div>
-
-        <div className="mt-3">
-          <Text
-            label="Tags (separate with commas)"
+            label="Tags (comma separated)"
             value={(draft.tags ?? []).join(", ")}
             onChange={(v) =>
               setDraft((d) => ({
                 ...d,
-                tags: v
-                  .split(",")
-                  .map((x) => x.trim())
-                  .filter(Boolean),
+                tags: v.split(",").map((x) => x.trim()).filter(Boolean),
               }))
             }
           />
         </div>
 
         <div className="mt-3">
-          <TextArea
-            label="Notes"
-            value={draft.notes ?? ""}
-            onChange={(v) => setDraft((d) => ({ ...d, notes: v }))}
-          />
+          <TextArea label="Notes" value={draft.notes ?? ""} onChange={(v) => setDraft((d) => ({ ...d, notes: v }))} />
         </div>
 
         <div className="mt-4 flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={save}
-            className="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25 text-sm"
-          >
+          <button type="button" onClick={save} className="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25 text-sm">
             Save changes
           </button>
         </div>
@@ -1622,11 +1482,8 @@ function MediaCard({
 
           {item.platform ? <div className="text-[11px] text-neutral-500">Platform: {item.platform}</div> : null}
           {item.withWhom ? <div className="text-[11px] text-neutral-500">With: {item.withWhom}</div> : null}
-
           {item.notes ? <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div> : null}
-          {item.tags?.length ? (
-            <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div>
-          ) : null}
+          {item.tags?.length ? <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div> : null}
         </div>
       </div>
     </article>
@@ -1669,13 +1526,11 @@ function Text({
   value,
   onChange,
   type = "text",
-  helper,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   type?: string;
-  helper?: string;
 }) {
   return (
     <label className="block">
@@ -1686,7 +1541,6 @@ function Text({
         onChange={(e) => onChange(e.target.value)}
         className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
       />
-      {helper ? <div className="text-[11px] text-neutral-500 mt-1">{helper}</div> : null}
     </label>
   );
 }
@@ -1695,12 +1549,10 @@ function TextArea({
   label,
   value,
   onChange,
-  placeholder,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
-  placeholder?: string;
 }) {
   return (
     <label className="block">
@@ -1708,7 +1560,6 @@ function TextArea({
       <textarea
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
         rows={3}
         className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
       />
@@ -1720,13 +1571,11 @@ function NumInput({
   label,
   value,
   onChange,
-  disabled,
   min,
 }: {
   label: string;
   value: number;
   onChange: (v: number) => void;
-  disabled?: boolean;
   min?: number;
 }) {
   return (
@@ -1736,11 +1585,8 @@ function NumInput({
         type="number"
         value={Number.isFinite(value) ? value : 0}
         onChange={(e) => onChange(Number(e.target.value))}
-        disabled={disabled}
         min={min}
-        className={`w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500 ${
-          disabled ? "opacity-50" : ""
-        }`}
+        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
       />
     </label>
   );
