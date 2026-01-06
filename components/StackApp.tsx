@@ -4,20 +4,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { supabase } from "../lib/supabaseClient";
 import { DndContext, DragEndEvent, useDraggable, useDroppable } from "@dnd-kit/core";
-import {
-  ResponsiveContainer,
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  CartesianGrid,
-  LineChart,
-  Line,
-  PieChart,
-  Pie,
-  Cell,
-} from "recharts";
 
 /* ================= TYPES ================= */
 
@@ -27,7 +13,7 @@ type Status = "planned" | "in_progress" | "dropped" | "completed";
 type GroupMode = "none" | "day" | "month" | "year";
 type SortMode = "newest" | "oldest" | "title" | "rating_high" | "rating_low";
 
-export type StackView = "all" | "completed" | "watching" | "watchlist" | "dropped" | "stats" | "tags";
+export type StackView = "all" | "completed" | "watching" | "watchlist" | "dropped" | "stats" | "add";
 
 type MediaItem = {
   id: string;
@@ -37,29 +23,26 @@ type MediaItem = {
   rating?: number; // 0-10
   posterUrl?: string;
 
+  // TMDB fields (movie/tv only)
   tmdbId?: number;
   tmdbType?: "movie" | "tv";
 
   inTheaters?: boolean;
   dateFinished?: string; // YYYY-MM-DD
   notes?: string;
-
-  rewatchCount?: number; // 0 = not a rewatch
-  runtime?: number; // minutes
-
-  // optional metadata
-  platform?: string;
-  withWhom?: string;
-  format?: string;
-  seasonOrChapter?: string;
-
+  rewatchCount?: number;
+  runtime?: number;
   status: Status;
   tags: string[];
   createdAt: string; // ISO
+
+  // Optional progress (anime/manga/books/games)
+  progressCur?: number;
+  progressTotal?: number;
 };
 
 type TmdbSearchResult = {
-  results?: Array<{ id: number; title?: string; name?: string }>;
+  results?: Array<{ id: number; title?: string; name?: string; release_date?: string; first_air_date?: string }>;
 };
 
 type TmdbGenre = { name: string };
@@ -72,7 +55,19 @@ type TmdbDetailsResult = {
 };
 
 type TmdbRecommendationsResult = {
-  results?: Array<{ id: number; title?: string; name?: string }>;
+  results?: Array<{
+    id: number;
+    title?: string;
+    name?: string;
+    poster_path?: string | null;
+  }>;
+};
+
+type PickRec = {
+  title: string;
+  tmdbId: number;
+  tmdbType: "movie" | "tv";
+  posterUrl?: string;
 };
 
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
@@ -98,22 +93,6 @@ function toGroupKey(mode: GroupMode, dateStr?: string) {
   if (mode === "month") return dateStr.slice(0, 7);
   if (mode === "year") return dateStr.slice(0, 4);
   return "All";
-}
-
-function safeNum(n: unknown) {
-  return typeof n === "number" && Number.isFinite(n) ? n : undefined;
-}
-
-function clampRating(v: number) {
-  return Math.max(0, Math.min(10, v));
-}
-
-function fmtMinutes(mins: number) {
-  const m = Math.max(0, Math.floor(mins));
-  const h = Math.floor(m / 60);
-  const r = m % 60;
-  if (h <= 0) return `${m}m`;
-  return `${h}h ${r}m`;
 }
 
 /* ================= TMDB ================= */
@@ -159,12 +138,17 @@ async function tmdbRecommendations(id: number, type: "movie" | "tv"): Promise<Tm
 /* ================= APP ================= */
 
 export default function StackApp({ view = "all" }: { view?: StackView }) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   const [items, setItems] = useState<MediaItem[]>([]);
   const [userId, setUserId] = useState<string | null>(null);
 
   const [query, setQuery] = useState("");
-  const [groupMode, setGroupMode] = useState<GroupMode>("month");
+
+  // If you want grouping later, re-add the UI. For now, keep it fixed to "none".
+  const groupMode: GroupMode = "none";
   const [sortMode, setSortMode] = useState<SortMode>("newest");
+
   const [boardView, setBoardView] = useState(true);
 
   const [autofillStatus, setAutofillStatus] = useState("");
@@ -175,19 +159,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [cloudLoaded, setCloudLoaded] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
 
-  const [picks, setPicks] = useState<string[]>([]);
+  const [picks, setPicks] = useState<PickRec[]>([]);
   const [pickStatus, setPickStatus] = useState("");
 
   const [excludeTypes, setExcludeTypes] = useState<Set<MediaType>>(new Set());
 
-  // multi-select + edit modal
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const editingItem = useMemo(() => items.find((i) => i.id === editingId) ?? null, [items, editingId]);
-
-  // tags page state
-  const [activeTag, setActiveTag] = useState<string>("");
-
+  // Add form lives only on /add
   const [form, setForm] = useState<Partial<MediaItem>>({
     title: "",
     type: "movie",
@@ -201,68 +178,26 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     posterUrl: "",
     tmdbId: undefined,
     tmdbType: undefined,
-    runtime: undefined,
-    platform: "",
-    withWhom: "",
-    format: "",
-    seasonOrChapter: "",
+    progressCur: undefined,
+    progressTotal: undefined,
   });
+
+  const isRewatch = (form.rewatchCount ?? 0) > 0;
 
   /* ================= NAV ================= */
 
   const nav = useMemo(
     () => [
       { href: "/", label: "All", key: "all" as StackView },
+      { href: "/watching", label: "Currently Watching", key: "watching" as StackView },
       { href: "/completed", label: "Completed", key: "completed" as StackView },
-      { href: "/watching", label: "Watching", key: "watching" as StackView },
-      { href: "/watchlist", label: "Watchlist", key: "watchlist" as StackView },
+      { href: "/watchlist", label: "Plan to Watch", key: "watchlist" as StackView },
       { href: "/dropped", label: "Dropped", key: "dropped" as StackView },
       { href: "/stats", label: "Stats", key: "stats" as StackView },
-      { href: "/tags", label: "Tags", key: "tags" as StackView },
+      { href: "/add", label: "Add", key: "add" as StackView },
     ],
     []
   );
-
-  const pageMeta: Record<StackView, { title: string; subtitle: string }> = useMemo(
-    () => ({
-      all: { title: "All", subtitle: "Everything you’ve added to Stack" },
-      completed: { title: "Completed", subtitle: "Finished media" },
-      watching: { title: "Watching", subtitle: "In progress" },
-      watchlist: { title: "Watchlist", subtitle: "Planned — for later" },
-      dropped: { title: "Dropped", subtitle: "Paused or abandoned" },
-      stats: { title: "Stats", subtitle: "Your breakdowns + charts" },
-      tags: { title: "Tags", subtitle: "Explore your library by tag" },
-    }),
-    []
-  );
-
-  useEffect(() => {
-    if (view === "watchlist") {
-      setGroupMode("none");
-      setSortMode("title");
-      setBoardView(false);
-    } else if (view === "completed") {
-      setGroupMode("month");
-      setSortMode("newest");
-      setBoardView(false);
-    } else if (view === "watching") {
-      setGroupMode("none");
-      setSortMode("newest");
-      setBoardView(false);
-    } else if (view === "dropped") {
-      setGroupMode("none");
-      setSortMode("newest");
-      setBoardView(false);
-    } else if (view === "all") {
-      setGroupMode("month");
-      setSortMode("newest");
-      setBoardView(true);
-    } else if (view === "tags") {
-      setGroupMode("none");
-      setSortMode("title");
-      setBoardView(false);
-    }
-  }, [view]);
 
   /* ================= LOCAL BACKUP ================= */
 
@@ -308,7 +243,11 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         setCloudLoaded(true);
         setSaveStatus("Loaded");
       } else {
-        const ins = await supabase.from("media_items").insert({ user_id: uidStr, data: { items: [] } });
+        const ins = await supabase.from("media_items").insert({
+          user_id: uidStr,
+          data: { items: [] },
+        });
+
         if (ins.error) {
           console.error(ins.error);
           const backup = loadLocalBackup();
@@ -317,6 +256,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           setSaveStatus("Loaded (local backup)");
           return;
         }
+
         setItems([]);
         saveLocalBackup([]);
         setCloudLoaded(true);
@@ -332,6 +272,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       if (!cloudLoaded) return;
 
       setSaveStatus("Saving…");
+
       const { error } = await supabase
         .from("media_items")
         .upsert({ user_id: uidStr, data: { items: next } }, { onConflict: "user_id" });
@@ -341,6 +282,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         setSaveStatus("Saved locally (cloud error)");
         return;
       }
+
       setSaveStatus("Saved");
     },
     [cloudLoaded, saveLocalBackup]
@@ -379,12 +321,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     if (!form.title) return;
 
     const status = (form.status as Status) ?? "completed";
+
     const manualDate = (form.dateFinished || "").trim();
     const autoDate = status === "completed" ? todayYMD() : "";
     const finalDate = manualDate || autoDate || undefined;
 
     const rating =
-      typeof form.rating === "number" && Number.isFinite(form.rating) ? clampRating(form.rating) : undefined;
+      typeof form.rating === "number" && Number.isFinite(form.rating)
+        ? Math.max(0, Math.min(10, form.rating))
+        : undefined;
 
     const item: MediaItem = {
       id: uid(),
@@ -394,24 +339,21 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       inTheaters: !!form.inTheaters,
       dateFinished: finalDate,
       posterUrl: (form.posterUrl || "").trim() || undefined,
-      runtime: safeNum(form.runtime),
+      runtime: typeof form.runtime === "number" ? form.runtime : undefined,
       notes: (form.notes || "").trim() || undefined,
-      tags: (form.tags ?? []).map((t) => String(t).trim()).filter(Boolean),
+      tags: form.tags ?? [],
       rewatchCount: Math.max(0, Number(form.rewatchCount ?? 0) || 0),
       createdAt: new Date().toISOString(),
       rating,
-      tmdbId: safeNum(form.tmdbId),
+      tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
       tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
-
-      platform: (form.platform || "").trim() || undefined,
-      withWhom: (form.withWhom || "").trim() || undefined,
-      format: (form.format || "").trim() || undefined,
-      seasonOrChapter: (form.seasonOrChapter || "").trim() || undefined,
+      progressCur: typeof form.progressCur === "number" ? form.progressCur : undefined,
+      progressTotal: typeof form.progressTotal === "number" ? form.progressTotal : undefined,
     };
 
     setItems((p) => [item, ...p]);
-    setAutofillStatus("");
 
+    setAutofillStatus("");
     setForm((prev) => ({
       title: "",
       type: prev.type ?? "movie",
@@ -426,59 +368,17 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       rating: undefined,
       tmdbId: undefined,
       tmdbType: undefined,
-      platform: "",
-      withWhom: "",
-      format: "",
-      seasonOrChapter: "",
+      progressCur: undefined,
+      progressTotal: undefined,
     }));
   }
 
   function removeItem(id: string) {
     setItems((prev) => prev.filter((i) => i.id !== id));
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      next.delete(id);
-      return next;
-    });
   }
 
   function updateItem(id: string, patch: Partial<MediaItem>) {
     setItems((prev) => prev.map((x) => (x.id === id ? { ...x, ...patch } : x)));
-  }
-
-  function toggleExclude(t: MediaType) {
-    setExcludeTypes((prev) => {
-      const next = new Set(prev);
-      if (next.has(t)) next.delete(t);
-      else next.add(t);
-      return next;
-    });
-  }
-
-  function toggleSelected(id: string) {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
-  function clearSelected() {
-    setSelectedIds(new Set());
-  }
-
-  function bulkSetStatus(status: Status) {
-    if (!selectedIds.size) return;
-    setItems((prev) => prev.map((i) => (selectedIds.has(i.id) ? { ...i, status } : i)));
-  }
-
-  function bulkDelete() {
-    if (!selectedIds.size) return;
-    const ok = confirm(`Delete ${selectedIds.size} selected item(s)? This cannot be undone.`);
-    if (!ok) return;
-    setItems((prev) => prev.filter((i) => !selectedIds.has(i.id)));
-    clearSelected();
   }
 
   async function pickForMe() {
@@ -497,28 +397,56 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       }
 
       const existingTitles = new Set(items.map((i) => i.title.toLowerCase()));
-      const all: string[] = [];
+      const all: PickRec[] = [];
 
-      for (const i of liked) {
-        const type = i.tmdbType;
-        const tmdbId = i.tmdbId;
-        if (!type || !tmdbId) continue;
+      for (const seed of liked) {
+        const tmdbType = seed.tmdbType;
+        const tmdbId = seed.tmdbId;
+        if (!tmdbType || !tmdbId) continue;
 
-        const rec = await tmdbRecommendations(tmdbId, type);
+        const rec = await tmdbRecommendations(tmdbId, tmdbType);
+
         for (const r of rec.results ?? []) {
           const t = (r.title || r.name || "").trim();
           if (!t) continue;
           if (existingTitles.has(t.toLowerCase())) continue;
-          all.push(t);
+
+          const posterUrl = r.poster_path ? `https://image.tmdb.org/t/p/w342${r.poster_path}` : undefined;
+
+          all.push({
+            title: t,
+            tmdbId: r.id,
+            tmdbType,
+            posterUrl,
+          });
         }
       }
 
-      const unique = Array.from(new Set(all)).slice(0, 5);
+      // Unique by tmdbId + type
+      const seen = new Set<string>();
+      const unique: PickRec[] = [];
+      for (const p of all) {
+        const k = `${p.tmdbType}:${p.tmdbId}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        unique.push(p);
+        if (unique.length >= 10) break;
+      }
+
       setPicks(unique);
-      setPickStatus(unique.length ? "Here you go." : "No new picks found (try rating more items).");
+      setPickStatus(unique.length ? "Click a poster to autofill it." : "No new picks found (try rating more items).");
     } catch (e: unknown) {
       setPickStatus(e instanceof Error ? e.message : "Pick failed");
     }
+  }
+
+  function toggleExclude(t: MediaType) {
+    setExcludeTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(t)) next.delete(t);
+      else next.add(t);
+      return next;
+    });
   }
 
   /* ================= DRAG & DROP ================= */
@@ -539,7 +467,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     updateItem(itemId, { status: newStatus });
   }
 
-  /* ================= AUTO AUTOFILL ================= */
+  /* ================= AUTO AUTOFILL (DEBOUNCED) ================= */
 
   useEffect(() => {
     if (!autoAutofill) return;
@@ -603,16 +531,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     if (view === "watchlist") out = out.filter((i) => i.status === "planned");
     if (view === "dropped") out = out.filter((i) => i.status === "dropped");
 
-    if (view === "tags") {
-      if (activeTag.trim()) out = out.filter((i) => (i.tags ?? []).some((t) => t.toLowerCase() === activeTag.toLowerCase()));
-    }
-
     if (query) {
       const q = query.toLowerCase();
       out = out.filter((i) =>
-        [i.title, i.notes, i.tags.join(" "), i.platform, i.withWhom, i.format, i.seasonOrChapter].some((v) =>
-          String(v || "").toLowerCase().includes(q)
-        )
+        [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q))
       );
     }
 
@@ -620,13 +542,14 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       if (sortMode === "title") return a.title.localeCompare(b.title);
       if (sortMode === "rating_high") return (b.rating ?? -1) - (a.rating ?? -1);
       if (sortMode === "rating_low") return (a.rating ?? 999) - (b.rating ?? 999);
+
       const ad = new Date((a.dateFinished ?? a.createdAt) as string).getTime();
       const bd = new Date((b.dateFinished ?? b.createdAt) as string).getTime();
       return sortMode === "oldest" ? ad - bd : bd - ad;
     });
 
     return out;
-  }, [items, view, query, sortMode, activeTag]);
+  }, [items, view, query, sortMode]);
 
   const grouped = useMemo(() => {
     if (groupMode === "none") return null;
@@ -641,535 +564,609 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     return Array.from(map.entries()).sort((a, b) => (a[0] < b[0] ? 1 : -1));
   }, [filtered, groupMode]);
 
-  /* ================= PHASE 5 ANALYTICS ================= */
+  /* ================= STATS ================= */
 
-  const completedItems = useMemo(() => items.filter((i) => i.status === "completed" && !excludeTypes.has(i.type)), [items, excludeTypes]);
-
-  const totalCompleted = completedItems.length;
-
-  const totalMinutes = useMemo(() => completedItems.reduce((sum, i) => sum + (safeNum(i.runtime) ?? 0), 0), [completedItems]);
-
-  const statusBreakdown = useMemo(() => {
-    const map: Record<Status, number> = { planned: 0, in_progress: 0, dropped: 0, completed: 0 };
-    for (const i of items) map[i.status] += 1;
-    return (Object.entries(map) as Array<[Status, number]>).map(([k, v]) => ({ status: k, count: v }));
+  const statusCounts = useMemo(() => {
+    const base: Record<Status, number> = {
+      completed: 0,
+      in_progress: 0,
+      planned: 0,
+      dropped: 0,
+    };
+    for (const i of items) base[i.status] += 1;
+    return base;
   }, [items]);
 
-  const byTypeCompleted = useMemo(() => {
-    const map = new Map<MediaType, { count: number; minutes: number }>();
-    for (const i of completedItems) {
-      const cur = map.get(i.type) ?? { count: 0, minutes: 0 };
+  const typeCounts = useMemo(() => {
+    const map = new Map<MediaType, number>();
+    for (const i of items) map.set(i.type, (map.get(i.type) ?? 0) + 1);
+    return Array.from(map.entries())
+      .map(([type, count]) => ({ type, count }))
+      .sort((a, b) => b.count - a.count);
+  }, [items]);
+
+  const avgByType = useMemo(() => {
+    const map = new Map<MediaType, { sum: number; count: number }>();
+    for (const i of items) {
+      if (typeof i.rating !== "number") continue;
+      const cur = map.get(i.type) ?? { sum: 0, count: 0 };
+      cur.sum += i.rating;
       cur.count += 1;
-      cur.minutes += safeNum(i.runtime) ?? 0;
       map.set(i.type, cur);
     }
     return Array.from(map.entries())
-      .map(([type, v]) => ({ type, count: v.count, minutes: v.minutes }))
-      .sort((a, b) => b.count - a.count);
-  }, [completedItems]);
+      .map(([type, v]) => ({
+        type,
+        avg: v.count ? v.sum / v.count : 0,
+        count: v.count,
+      }))
+      .sort((a, b) => b.avg - a.avg);
+  }, [items]);
 
-  const monthlyCompletions = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const i of completedItems) {
-      const d = (i.dateFinished ?? i.createdAt).slice(0, 7); // YYYY-MM
-      map.set(d, (map.get(d) ?? 0) + 1);
-    }
-    return Array.from(map.entries())
-      .map(([month, count]) => ({ month, count }))
-      .sort((a, b) => (a.month < b.month ? -1 : 1));
-  }, [completedItems]);
+  const totalCompleted = useMemo(() => {
+    return items.filter((i) => {
+      if (excludeTypes.has(i.type)) return false;
+      return i.status === "completed";
+    }).length;
+  }, [items, excludeTypes]);
 
-  const ratingHistogram = useMemo(() => {
-    // buckets: 0-1,1-2,...,9-10
-    const buckets = Array.from({ length: 10 }, (_, i) => ({ bucket: `${i}-${i + 1}`, count: 0 }));
-    for (const i of completedItems) {
-      if (typeof i.rating !== "number") continue;
-      const r = clampRating(i.rating);
-      const idx = Math.min(9, Math.max(0, Math.floor(r)));
-      buckets[idx].count += 1;
-    }
-    return buckets;
-  }, [completedItems]);
-
-  const topTags = useMemo(() => {
-    const m = new Map<string, number>();
+  const totalRuntimeMinutesCompleted = useMemo(() => {
+    let sum = 0;
     for (const i of items) {
-      for (const t of i.tags ?? []) {
-        const tag = String(t).trim();
-        if (!tag) continue;
-        m.set(tag, (m.get(tag) ?? 0) + 1);
+      if (i.status !== "completed") continue;
+      if (excludeTypes.has(i.type)) continue;
+      if (typeof i.runtime === "number" && Number.isFinite(i.runtime) && i.runtime > 0) sum += i.runtime;
+    }
+    return sum;
+  }, [items, excludeTypes]);
+
+  const rewatchTotals = useMemo(() => {
+    let rewatches = 0;
+    let itemsRewatched = 0;
+    for (const i of items) {
+      const c = Math.max(0, Number(i.rewatchCount ?? 0) || 0);
+      if (c > 0) {
+        itemsRewatched += 1;
+        rewatches += c;
       }
     }
-    return Array.from(m.entries())
+    return { itemsRewatched, rewatches };
+  }, [items]);
+
+  const topTags = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const i of items) {
+      if (i.status !== "completed") continue;
+      for (const t of i.tags ?? []) {
+        const k = String(t || "").trim();
+        if (!k) continue;
+        map.set(k, (map.get(k) ?? 0) + 1);
+      }
+    }
+    return Array.from(map.entries())
       .map(([tag, count]) => ({ tag, count }))
       .sort((a, b) => b.count - a.count)
-      .slice(0, 30);
+      .slice(0, 12);
   }, [items]);
+
+  const monthlyCompleted = useMemo(() => {
+    const now = new Date();
+    const months: Array<{ key: string; label: string; count: number }> = [];
+
+    for (let back = 11; back >= 0; back--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - back, 1);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const key = `${y}-${m}`;
+      const label = d.toLocaleString(undefined, { month: "short" });
+      months.push({ key, label, count: 0 });
+    }
+
+    const idx = new Map(months.map((x, i) => [x.key, i]));
+
+    for (const i of items) {
+      if (i.status !== "completed") continue;
+      if (excludeTypes.has(i.type)) continue;
+
+      const dateStr = (i.dateFinished ?? i.createdAt ?? "").slice(0, 7);
+      if (!dateStr) continue;
+
+      const pos = idx.get(dateStr);
+      if (pos !== undefined) months[pos].count += 1;
+    }
+
+    const max = Math.max(1, ...months.map((x) => x.count));
+    return { months, max };
+  }, [items, excludeTypes]);
 
   /* ================= UI ================= */
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100 p-6">
-      <div className="max-w-6xl mx-auto space-y-8">
+    <div className="min-h-screen bg-neutral-950 text-neutral-100">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+        {/* Header */}
         <header className="space-y-3">
           <div className="flex items-end justify-between gap-4">
             <div>
-              <h1 className="text-3xl font-semibold">Stack</h1>
-              <p className="text-sm text-neutral-400">
-                {pageMeta[view].title} • {pageMeta[view].subtitle}
-              </p>
+              <h1 className="text-3xl font-semibold tracking-tight">Stack</h1>
+              <p className="text-sm text-neutral-400">Your personal media website</p>
             </div>
             <div className="text-xs text-neutral-500">{saveStatus}</div>
           </div>
 
-          <nav className="flex flex-wrap gap-2">
-            {nav.map((n) => (
-              <Link
-                key={n.href}
-                href={n.href}
-                className={`px-3 py-2 rounded-xl border text-sm ${
-                  view === n.key ? "bg-white/15 border-white/20" : "bg-white/5 border-white/10 hover:bg-white/10"
-                }`}
-              >
-                {n.label}
-              </Link>
-            ))}
+          {/* Centered tabs */}
+          <nav className="flex justify-center">
+            <div className="inline-flex flex-wrap justify-center gap-2 rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/80 px-2 py-2">
+              {nav.map((n) => (
+                <Link
+                  key={n.href}
+                  href={n.href}
+                  className={[
+                    "px-3 py-2 rounded-xl border text-sm transition",
+                    view === n.key ? "bg-white/15 border-white/20" : "bg-white/5 border-white/10 hover:bg-white/10",
+                  ].join(" ")}
+                >
+                  {n.label}
+                </Link>
+              ))}
+            </div>
           </nav>
         </header>
 
-        {/* ✅ STATS (PHASE 5) */}
+        {/* STATS PAGE */}
         {view === "stats" ? (
           <div className="space-y-4">
-            <div className="grid md:grid-cols-3 gap-4">
-              <StatCard title="Total completed" value={String(totalCompleted)} sub="Respects excluded types" />
-              <StatCard title="Total time watched" value={fmtMinutes(totalMinutes)} sub="Sum of runtime minutes" />
-              <StatCard title="Library size" value={String(items.length)} sub="All statuses" />
-            </div>
-
-            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-              <div className="text-sm font-medium mb-2">Exclude types</div>
-              <div className="flex flex-wrap gap-2">
-                {(["movie", "tv", "anime", "manga", "book", "game"] as MediaType[]).map((t) => (
-                  <button
-                    key={t}
-                    type="button"
-                    onClick={() => toggleExclude(t)}
-                    className={`px-3 py-1 rounded-xl border text-xs ${
-                      excludeTypes.has(t)
-                        ? "bg-red-500/15 border-red-500/20"
-                        : "bg-white/5 border-white/10 hover:bg-white/10"
-                    }`}
-                  >
-                    {excludeTypes.has(t) ? `Excluded: ${t}` : t}
-                  </button>
-                ))}
-              </div>
+            <div className="grid md:grid-cols-4 gap-4">
+              <StatCard title="Total items" value={items.length.toString()} sub={`${statusCounts.completed} completed`} />
+              <StatCard title="Completed" value={totalCompleted.toString()} sub="(after excludes)" />
+              <StatCard
+                title="Time watched (runtime)"
+                value={`${Math.floor(totalRuntimeMinutesCompleted / 60)}h`}
+                sub={`${totalRuntimeMinutesCompleted} min tracked`}
+              />
+              <StatCard
+                title="Rewatches"
+                value={`${rewatchTotals.rewatches}`}
+                sub={`${rewatchTotals.itemsRewatched} items rewatched`}
+              />
             </div>
 
             <div className="grid lg:grid-cols-2 gap-4">
-              <ChartCard title="Completed by type">
-                <ResponsiveContainer width="100%" height={280}>
-                  <BarChart data={byTypeCompleted}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="type" />
-                    <YAxis allowDecimals={false} />
-                    <Tooltip />
-                    <Bar dataKey="count" />
-                  </BarChart>
-                </ResponsiveContainer>
-              </ChartCard>
-
-              <ChartCard title="Status breakdown">
-                <ResponsiveContainer width="100%" height={280}>
-                  <PieChart>
-                    <Pie data={statusBreakdown} dataKey="count" nameKey="status" outerRadius={100} label />
-                    {/* no custom colors (keeps it simple + consistent with your constraints) */}
-                    {statusBreakdown.map((_, idx) => (
-                      <Cell key={idx} />
-                    ))}
-                    <Tooltip />
-                  </PieChart>
-                </ResponsiveContainer>
-              </ChartCard>
-            </div>
-
-            <div className="grid lg:grid-cols-2 gap-4">
-              <ChartCard title="Completions over time">
-                <ResponsiveContainer width="100%" height={280}>
-                  <LineChart data={monthlyCompletions}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="month" />
-                    <YAxis allowDecimals={false} />
-                    <Tooltip />
-                    <Line type="monotone" dataKey="count" dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </ChartCard>
-
-              <ChartCard title="Rating distribution (completed)">
-                <ResponsiveContainer width="100%" height={280}>
-                  <BarChart data={ratingHistogram}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="bucket" />
-                    <YAxis allowDecimals={false} />
-                    <Tooltip />
-                    <Bar dataKey="count" />
-                  </BarChart>
-                </ResponsiveContainer>
-              </ChartCard>
-            </div>
-
-            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-              <div className="text-sm font-medium mb-2">Top tags</div>
-              <div className="flex flex-wrap gap-2">
-                {topTags.length ? (
-                  topTags.map((t) => (
-                    <span key={t.tag} className="px-3 py-1 rounded-xl bg-white/5 border border-white/10 text-xs">
-                      {t.tag} <span className="text-neutral-500">({t.count})</span>
-                    </span>
-                  ))
-                ) : (
-                  <div className="text-xs text-neutral-400">No tags yet — add some via auto-fill or manually.</div>
-                )}
-              </div>
-            </div>
-          </div>
-        ) : null}
-
-        {/* ✅ TAGS PAGE */}
-        {view === "tags" ? (
-          <div className="space-y-4">
-            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-medium">Browse by tag</div>
-                  <div className="text-xs text-neutral-500">Click a tag to filter your library.</div>
+              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+                <div className="text-sm font-medium mb-3">Status breakdown</div>
+                <div className="space-y-2 text-sm">
+                  <BarRow label="Completed" value={statusCounts.completed} total={items.length || 1} />
+                  <BarRow label="Watching" value={statusCounts.in_progress} total={items.length || 1} />
+                  <BarRow label="Watchlist" value={statusCounts.planned} total={items.length || 1} />
+                  <BarRow label="Dropped" value={statusCounts.dropped} total={items.length || 1} />
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <input
-                    value={activeTag}
-                    onChange={(e) => setActiveTag(e.target.value)}
-                    placeholder="Type a tag…"
-                    className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500 text-sm"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setActiveTag("")}
-                    className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm"
-                  >
-                    Clear
-                  </button>
-                </div>
-              </div>
-
-              <div className="mt-4 flex flex-wrap gap-2">
-                {topTags.length ? (
-                  topTags.map((t) => (
+                <div className="text-xs text-neutral-400 mt-4">Exclude types (affects some stats):</div>
+                <div className="flex flex-wrap gap-2 mt-2">
+                  {(["movie", "tv", "anime", "manga", "book", "game"] as MediaType[]).map((t) => (
                     <button
-                      key={t.tag}
+                      key={t}
                       type="button"
-                      onClick={() => setActiveTag(t.tag)}
+                      onClick={() => toggleExclude(t)}
                       className={`px-3 py-1 rounded-xl border text-xs ${
-                        activeTag.toLowerCase() === t.tag.toLowerCase()
-                          ? "bg-white/15 border-white/20"
+                        excludeTypes.has(t)
+                          ? "bg-red-500/15 border-red-500/20"
                           : "bg-white/5 border-white/10 hover:bg-white/10"
                       }`}
                     >
-                      {t.tag} <span className="text-neutral-500">({t.count})</span>
+                      {excludeTypes.has(t) ? `Excluded: ${t}` : t}
                     </button>
-                  ))
-                ) : (
-                  <div className="text-xs text-neutral-400">No tags yet.</div>
-                )}
+                  ))}
+                </div>
+              </div>
+
+              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+                <div className="text-sm font-medium mb-3">Type totals</div>
+                <div className="space-y-2">
+                  {typeCounts.length ? (
+                    typeCounts.map((x) => (
+                      <div
+                        key={x.type}
+                        className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2"
+                      >
+                        <div className="text-sm text-neutral-200">{x.type}</div>
+                        <div className="text-sm text-neutral-300">{x.count}</div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-xs text-neutral-400">No items yet.</div>
+                  )}
+                </div>
               </div>
             </div>
 
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search within tag results..."
-              className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
-            />
+            <div className="grid lg:grid-cols-2 gap-4">
+              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+                <div className="text-sm font-medium mb-3">Average rating (by type)</div>
+                <div className="grid sm:grid-cols-2 gap-2 text-sm text-neutral-300">
+                  {avgByType.length ? (
+                    avgByType.map((x) => (
+                      <div key={x.type} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+                        <div className="text-xs text-neutral-400">{x.type}</div>
+                        <div>
+                          {x.avg.toFixed(1)} <span className="text-xs text-neutral-500">({x.count} rated)</span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-xs text-neutral-400">Rate some items to see averages.</div>
+                  )}
+                </div>
+              </div>
 
-            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              {filtered.map((i) => (
-                <MediaCard
-                  key={i.id}
-                  item={i}
-                  selected={selectedIds.has(i.id)}
-                  onToggleSelected={() => toggleSelected(i.id)}
-                  onDelete={() => removeItem(i.id)}
-                  onUpdate={(patch) => updateItem(i.id, patch)}
-                  onEdit={() => setEditingId(i.id)}
-                />
-              ))}
+              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+                <div className="text-sm font-medium mb-3">Completed per month (last 12)</div>
+
+                <div className="flex items-end gap-2 h-28">
+                  {monthlyCompleted.months.map((m) => {
+                    const h = Math.round((m.count / monthlyCompleted.max) * 100);
+                    return (
+                      <div key={m.key} className="flex-1 min-w-[18px] text-center">
+                        <div
+                          className="rounded-lg bg-white/10 border border-white/10 mx-auto"
+                          style={{ height: `${Math.max(6, h)}%` }}
+                          title={`${m.key}: ${m.count}`}
+                        />
+                        <div className="text-[10px] text-neutral-500 mt-2">{m.label}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="text-xs text-neutral-500 mt-3">Uses date watched if set; otherwise created date.</div>
+              </div>
             </div>
 
-            {!filtered.length ? (
-              <div className="text-sm text-neutral-500 text-center py-10">
-                No results for <span className="text-neutral-200">{activeTag || "that tag"}</span>.
-              </div>
-            ) : null}
+            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+              <div className="text-sm font-medium mb-3">Top tags / genres (completed)</div>
+
+              {topTags.length ? (
+                <div className="flex flex-wrap gap-2">
+                  {topTags.map((t) => (
+                    <div
+                      key={t.tag}
+                      className="px-3 py-1 rounded-xl bg-neutral-950 border border-neutral-800 text-xs text-neutral-200"
+                      title={`${t.count} items`}
+                    >
+                      {t.tag} <span className="text-neutral-500">({t.count})</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-neutral-400">No tags yet (TMDB autofill adds genres for Movie/TV).</div>
+              )}
+            </div>
           </div>
         ) : null}
 
-        {/* ✅ MAIN APP (non-stats, non-tags) */}
-        {view !== "stats" && view !== "tags" ? (
-          <>
-            {/* Recommender */}
-            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-3">
-              <div className="flex items-center gap-3">
-                <button
-                  type="button"
-                  onClick={pickForMe}
-                  className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-                >
-                  Pick something for me
-                </button>
-                <div className="text-xs text-neutral-400">{pickStatus}</div>
-              </div>
-
-              {picks.length ? (
-                <ul className="text-sm text-neutral-200 list-disc pl-5 space-y-1">
-                  {picks.map((p) => (
-                    <li key={p}>{p}</li>
-                  ))}
-                </ul>
-              ) : null}
+        {/* ADD PAGE WITH LEFT/RIGHT MASCOTS */}
+        {view === "add" ? (
+          <div className="relative overflow-hidden rounded-3xl ring-1 ring-neutral-800/70 bg-neutral-900/25">
+            <div className="absolute inset-0 pointer-events-none">
+              <div className="absolute inset-y-0 left-0 w-[18%] bg-[#2a2f8f]/90" />
+              <div className="absolute inset-y-0 right-0 w-[18%] bg-[#2a2f8f]/90" />
+              <div className="absolute inset-y-0 left-[18%] w-[6%] bg-neutral-700/60 blur-2xl" />
+              <div className="absolute inset-y-0 right-[18%] w-[6%] bg-neutral-700/60 blur-2xl" />
             </div>
 
-            {/* Add */}
-            <form
-              onSubmit={addItem}
-              className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-4"
-            >
-              <div className="flex gap-2">
-                <input
-                  value={form.title || ""}
-                  onChange={(e) => setForm({ ...form, title: e.target.value })}
-                  placeholder="Title"
-                  className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
-                />
-              </div>
-
-              {autofillStatus ? <div className="text-xs text-neutral-400">{autofillStatus}</div> : null}
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-                <Select
-                  label="Type"
-                  value={form.type || "movie"}
-                  onChange={(v) => setForm({ ...form, type: v as MediaType, tmdbId: undefined, tmdbType: undefined })}
-                  options={[
-                    { value: "movie", label: "Movie" },
-                    { value: "tv", label: "TV" },
-                    { value: "anime", label: "Anime" },
-                    { value: "manga", label: "Manga" },
-                    { value: "book", label: "Book" },
-                    { value: "game", label: "Game" },
-                  ]}
-                />
-
-                <Select
-                  label="Status"
-                  value={form.status || "completed"}
-                  onChange={(v) => setForm({ ...form, status: v as Status })}
-                  options={[
-                    { value: "completed", label: "Completed" },
-                    { value: "planned", label: "Watchlist" },
-                    { value: "in_progress", label: "Watching" },
-                    { value: "dropped", label: "Dropped" },
-                  ]}
-                />
-
-                <NumInput
-                  label="Rating (0–10)"
-                  value={typeof form.rating === "number" ? form.rating : 0}
-                  onChange={(n) => setForm((f) => ({ ...f, rating: clampRating(Number(n) || 0) }))}
-                  min={0}
-                />
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <Text
-                  label="Date watched (optional)"
-                  type="date"
-                  value={String(form.dateFinished || "")}
-                  onChange={(v) => setForm({ ...form, dateFinished: v })}
-                />
-
-                <NumInput
-                  label="Runtime (minutes)"
-                  value={Number(form.runtime ?? 0)}
-                  onChange={(n) => setForm((f) => ({ ...f, runtime: Math.max(0, Number(n) || 0) }))}
-                  min={0}
-                />
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <Text label="Platform (optional)" value={String(form.platform || "")} onChange={(v) => setForm({ ...form, platform: v })} />
-                <Text label="With whom (optional)" value={String(form.withWhom || "")} onChange={(v) => setForm({ ...form, withWhom: v })} />
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <Text label="Format (optional)" value={String(form.format || "")} onChange={(v) => setForm({ ...form, format: v })} />
-                <Text
-                  label="Season / Chapter (optional)"
-                  value={String(form.seasonOrChapter || "")}
-                  onChange={(v) => setForm({ ...form, seasonOrChapter: v })}
-                />
-              </div>
-
-              <TextArea
-                label="Notes"
-                value={String(form.notes || "")}
-                onChange={(v) => setForm({ ...form, notes: v })}
-                placeholder="Anything you want to remember"
+            <div className="absolute inset-y-0 left-0 w-[18%] hidden md:flex items-center justify-center pointer-events-none">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src="/mascot-left.png"
+                alt="Mascot left"
+                className="max-h-[520px] w-auto object-contain opacity-95 drop-shadow-2xl"
               />
+            </div>
+            <div className="absolute inset-y-0 right-0 w-[18%] hidden md:flex items-center justify-center pointer-events-none">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src="/mascot-right.png"
+                alt="Mascot right"
+                className="max-h-[520px] w-auto object-contain opacity-95 drop-shadow-2xl"
+              />
+            </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <button
-                  type="submit"
-                  className="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
-                >
-                  Add to Stack
-                </button>
-
-                <div className="flex gap-3 flex-wrap">
-                  <Toggle label="Auto-fill as you type" checked={autoAutofill} onChange={setAutoAutofill} />
-                </div>
+            <div className="relative px-4 sm:px-6 py-6 md:px-10 md:py-10 mx-auto max-w-3xl space-y-4">
+              <div className="text-center">
+                <div className="text-2xl font-semibold tracking-tight">Add to Stack</div>
+                <div className="text-sm text-neutral-400 mt-1">Search / autofill Movie + TV, or add anything manually.</div>
               </div>
-            </form>
 
-            {/* Search + view controls */}
-            <section className="space-y-3">
+              {/* FORM FIRST */}
+              <form
+                onSubmit={addItem}
+                className="bg-neutral-950/40 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-4"
+              >
+                <div className="flex gap-2">
+                  <input
+                    value={form.title || ""}
+                    onChange={(e) => setForm({ ...form, title: e.target.value })}
+                    placeholder="Title"
+                    className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+                  />
+                </div>
+
+                {autofillStatus ? <div className="text-xs text-neutral-400">{autofillStatus}</div> : null}
+
+                {form.posterUrl ? (
+                  <div className="flex items-center gap-3 rounded-2xl bg-neutral-950 border border-neutral-800 p-3">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={form.posterUrl} alt="Poster" className="w-12 h-16 rounded-lg object-cover bg-neutral-900" />
+                    <div className="text-xs text-neutral-400">
+                      Poster loaded • Tags: {(form.tags || []).slice(0, 4).join(", ") || "—"}
+                    </div>
+                    <div className="flex-1" />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setForm((f) => ({
+                          ...f,
+                          posterUrl: "",
+                          tags: f.tags ?? [],
+                          tmdbId: undefined,
+                          tmdbType: undefined,
+                        }))
+                      }
+                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                    >
+                      Remove poster
+                    </button>
+                  </div>
+                ) : null}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                  <Select
+                    label="Type"
+                    value={form.type || "movie"}
+                    onChange={(v) => setForm({ ...form, type: v as MediaType, tmdbId: undefined, tmdbType: undefined })}
+                    options={[
+                      { value: "movie", label: "Movie" },
+                      { value: "tv", label: "TV" },
+                      { value: "anime", label: "Anime" },
+                      { value: "manga", label: "Manga" },
+                      { value: "book", label: "Book" },
+                      { value: "game", label: "Game" },
+                    ]}
+                  />
+
+                  <Select
+                    label="Status"
+                    value={form.status || "completed"}
+                    onChange={(v) => setForm({ ...form, status: v as Status })}
+                    options={[
+                      { value: "completed", label: "Completed" },
+                      { value: "planned", label: "Watchlist / Plan to Watch" },
+                      { value: "in_progress", label: "Watching" },
+                      { value: "dropped", label: "Dropped" },
+                    ]}
+                  />
+
+                  <NumInput
+                    label="Rating (0–10)"
+                    value={typeof form.rating === "number" ? form.rating : 0}
+                    onChange={(n) =>
+                      setForm((f) => ({
+                        ...f,
+                        rating: Number.isFinite(n) ? Math.max(0, Math.min(10, Number(n))) : undefined,
+                      }))
+                    }
+                    min={0}
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <NumInput
+                    label="Progress current (optional)"
+                    value={Number(form.progressCur ?? 0)}
+                    onChange={(n) => setForm((f) => ({ ...f, progressCur: Math.max(0, Number(n ?? 0) || 0) }))}
+                    min={0}
+                  />
+                  <NumInput
+                    label="Progress total (optional)"
+                    value={Number(form.progressTotal ?? 0)}
+                    onChange={(n) => setForm((f) => ({ ...f, progressTotal: Math.max(0, Number(n ?? 0) || 0) }))}
+                    min={0}
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <Text
+                    label="Date watched (optional)"
+                    type="date"
+                    value={String(form.dateFinished || "")}
+                    onChange={(v) => setForm({ ...form, dateFinished: v })}
+                    helper="If blank: Completed auto-sets to today."
+                  />
+
+                  <Text
+                    label="Poster image URL (optional)"
+                    value={String(form.posterUrl || "")}
+                    onChange={(v) => setForm({ ...form, posterUrl: v })}
+                    helper="Paste any image URL, or auto-fill sets it for Movie/TV."
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <Toggle label="In theaters" checked={!!form.inTheaters} onChange={(v) => setForm({ ...form, inTheaters: v })} />
+
+                  <Toggle
+                    label="Rewatch"
+                    checked={isRewatch}
+                    onChange={(v) => {
+                      if (v) setForm((f) => ({ ...f, rewatchCount: Math.max(1, Number(f.rewatchCount ?? 1) || 1) }));
+                      else setForm((f) => ({ ...f, rewatchCount: 0 }));
+                    }}
+                  />
+
+                  <NumInput
+                    label="Count"
+                    value={Number(form.rewatchCount ?? 0)}
+                    onChange={(n) => setForm((f) => ({ ...f, rewatchCount: Math.max(0, Number(n ?? 0) || 0) }))}
+                    disabled={!isRewatch}
+                    min={0}
+                  />
+                </div>
+
+                <TextArea
+                  label="Notes"
+                  value={String(form.notes || "")}
+                  onChange={(v) => setForm({ ...form, notes: v })}
+                  placeholder="Anything you want to remember"
+                />
+
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <button
+                    type="submit"
+                    className="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
+                  >
+                    Add to Stack
+                  </button>
+
+                  <div className="flex gap-3 flex-wrap">
+                    <Toggle label="Auto-fill as you type (Movie/TV)" checked={autoAutofill} onChange={setAutoAutofill} />
+                  </div>
+                </div>
+              </form>
+
+              {/* PICK SECTION MOVED TO BOTTOM */}
+              <div className="bg-neutral-950/40 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-3">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={pickForMe}
+                    className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+                  >
+                    Pick something for me
+                  </button>
+                  <div className="text-xs text-neutral-400">{pickStatus}</div>
+                </div>
+
+                {picks.length ? (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
+                    {picks.map((p) => (
+                      <button
+                        key={`${p.tmdbType}:${p.tmdbId}`}
+                        type="button"
+                        onClick={() => {
+                          // Force autofill to re-run for this title
+                          lastAutofillKey.current = "";
+                          setAutofillStatus("");
+                          setForm((f) => ({
+                            ...f,
+                            title: p.title,
+                            type: p.tmdbType,
+                            tmdbId: undefined,
+                            tmdbType: undefined,
+                          }));
+                        }}
+                        className="text-left group"
+                        title="Click to autofill this"
+                      >
+                        <div className="rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800 aspect-[2/3]">
+                          {p.posterUrl ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={p.posterUrl}
+                              alt={p.title}
+                              className="w-full h-full object-cover group-hover:scale-[1.02] transition"
+                            />
+                          ) : (
+                            <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">
+                              No poster
+                            </div>
+                          )}
+                        </div>
+                        <div className="mt-2 text-[11px] text-neutral-200 line-clamp-2">{p.title}</div>
+                        <div className="text-[10px] text-neutral-500">{p.tmdbType.toUpperCase()}</div>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-xs text-neutral-500">
+                    Click the button to generate poster picks based on your top-rated Movie/TV items.
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {/* LIST PAGES */}
+        {view !== "stats" && view !== "add" ? (
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search title, notes, tags, platform..."
+                placeholder="Search title, notes, tags..."
                 className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
               />
 
-              {view === "all" ? (
-                <div className="flex items-center justify-between">
-                  <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
-                  <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
-                </div>
-              ) : null}
+              <Select
+                label="Sort"
+                value={sortMode}
+                onChange={(v) => setSortMode(v as SortMode)}
+                options={[
+                  { value: "newest", label: "Newest first" },
+                  { value: "oldest", label: "Oldest first" },
+                  { value: "title", label: "Title (A–Z)" },
+                  { value: "rating_high", label: "Rating (high → low)" },
+                  { value: "rating_low", label: "Rating (low → high)" },
+                ]}
+              />
+            </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <Select
-                  label="Group"
-                  value={groupMode}
-                  onChange={(v) => setGroupMode(v as GroupMode)}
-                  options={[
-                    { value: "none", label: "No grouping" },
-                    { value: "day", label: "By day" },
-                    { value: "month", label: "By month" },
-                    { value: "year", label: "By year" },
-                  ]}
-                />
-
-                <Select
-                  label="Sort"
-                  value={sortMode}
-                  onChange={(v) => setSortMode(v as SortMode)}
-                  options={[
-                    { value: "newest", label: "Newest first" },
-                    { value: "oldest", label: "Oldest first" },
-                    { value: "title", label: "Title (A–Z)" },
-                    { value: "rating_high", label: "Rating (high → low)" },
-                    { value: "rating_low", label: "Rating (low → high)" },
-                  ]}
-                />
+            {view === "all" ? (
+              <div className="flex items-center justify-between">
+                <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
+                <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
               </div>
-            </section>
+            ) : null}
 
-            {/* List / Board */}
             <DndContext onDragEnd={handleDragEnd}>
               {view === "all" && boardView ? (
-                <BoardView
-                  items={filtered}
-                  selectedIds={selectedIds}
-                  onToggleSelected={toggleSelected}
-                  onDelete={removeItem}
-                  onUpdate={updateItem}
-                  onEdit={(id) => setEditingId(id)}
-                />
+                <BoardView items={filtered} onDelete={removeItem} onUpdate={updateItem} />
               ) : groupMode !== "none" && grouped ? (
                 <div className="space-y-6">
                   {grouped.map(([k, list]) => (
                     <section key={k} className="space-y-2">
                       <h3 className="text-sm text-neutral-400">{k}</h3>
-                      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                      <div className="space-y-3">
                         {list.map((i) => (
-                          <MediaCard
-                            key={i.id}
-                            item={i}
-                            selected={selectedIds.has(i.id)}
-                            onToggleSelected={() => toggleSelected(i.id)}
-                            onDelete={() => removeItem(i.id)}
-                            onUpdate={(patch) => updateItem(i.id, patch)}
-                            onEdit={() => setEditingId(i.id)}
-                          />
+                          <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
                         ))}
                       </div>
                     </section>
                   ))}
                 </div>
               ) : (
-                <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div className="space-y-3">
+                  <div className="hidden sm:grid grid-cols-[72px_1fr_90px_90px_120px] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
+                    <div />
+                    <div>Title</div>
+                    <div className="text-center">Score</div>
+                    <div className="text-center">Type</div>
+                    <div className="text-center">Progress</div>
+                  </div>
+
                   {filtered.map((i) => (
-                    <MediaCard
-                      key={i.id}
-                      item={i}
-                      selected={selectedIds.has(i.id)}
-                      onToggleSelected={() => toggleSelected(i.id)}
-                      onDelete={() => removeItem(i.id)}
-                      onUpdate={(patch) => updateItem(i.id, patch)}
-                      onEdit={() => setEditingId(i.id)}
-                    />
+                    <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
                   ))}
                 </div>
               )}
             </DndContext>
-          </>
+          </div>
         ) : null}
 
         <footer className="pt-6 text-xs text-neutral-500">Stack • Saves to Supabase + local backup</footer>
 
-        {editingItem ? (
-          <EditModal
-            item={editingItem}
-            onClose={() => setEditingId(null)}
-            onSave={(patch) => {
-              updateItem(editingItem.id, patch);
-              setEditingId(null);
-            }}
-          />
-        ) : null}
+        <input ref={fileInputRef} type="file" className="hidden" />
       </div>
-    </div>
-  );
-}
-
-/* ================= SMALL UI PIECES ================= */
-
-function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
-  return (
-    <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-      <div className="text-sm font-medium">{title}</div>
-      <div className="text-3xl font-semibold mt-1">{value}</div>
-      {sub ? <div className="text-xs text-neutral-500 mt-2">{sub}</div> : null}
-    </div>
-  );
-}
-
-function ChartCard({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-      <div className="text-sm font-medium mb-3">{title}</div>
-      {children}
     </div>
   );
 }
@@ -1178,18 +1175,12 @@ function ChartCard({ title, children }: { title: string; children: React.ReactNo
 
 function BoardView({
   items,
-  selectedIds,
-  onToggleSelected,
   onDelete,
   onUpdate,
-  onEdit,
 }: {
   items: MediaItem[];
-  selectedIds: Set<string>;
-  onToggleSelected: (id: string) => void;
   onDelete: (id: string) => void;
   onUpdate: (id: string, patch: Partial<MediaItem>) => void;
-  onEdit: (id: string) => void;
 }) {
   const byStatus = useMemo(() => {
     const map: Record<Status, MediaItem[]> = {
@@ -1208,15 +1199,7 @@ function BoardView({
         <StatusColumn key={s.id} status={s.id} title={s.label}>
           <div className="space-y-3">
             {byStatus[s.id].map((i) => (
-              <MediaCard
-                key={i.id}
-                item={i}
-                selected={selectedIds.has(i.id)}
-                onToggleSelected={() => onToggleSelected(i.id)}
-                onDelete={() => onDelete(i.id)}
-                onUpdate={(patch) => onUpdate(i.id, patch)}
-                onEdit={() => onEdit(i.id)}
-              />
+              <CardDraggable key={i.id} item={i} onDelete={() => onDelete(i.id)} onUpdate={(p) => onUpdate(i.id, p)} />
             ))}
             {!byStatus[s.id].length ? <div className="text-xs text-neutral-600 text-center py-8">Drop here</div> : null}
           </div>
@@ -1243,144 +1226,124 @@ function StatusColumn({ status, title, children }: { status: Status; title: stri
   );
 }
 
-/* ================= EDIT MODAL ================= */
+/* ================= MAL ROW ================= */
 
-function EditModal({
+function MALRow({
   item,
-  onClose,
-  onSave,
+  onDelete,
+  onUpdate,
 }: {
   item: MediaItem;
-  onClose: () => void;
-  onSave: (patch: Partial<MediaItem>) => void;
+  onDelete: () => void;
+  onUpdate: (patch: Partial<MediaItem>) => void;
 }) {
-  const [draft, setDraft] = useState<MediaItem>(item);
-
-  useEffect(() => setDraft(item), [item]);
-
-  function save() {
-    const patch: Partial<MediaItem> = {
-      title: draft.title.trim(),
-      type: draft.type,
-      status: draft.status,
-      rating: typeof draft.rating === "number" ? clampRating(draft.rating) : undefined,
-      dateFinished: draft.dateFinished?.trim() || undefined,
-      runtime: draft.runtime == null ? undefined : Math.max(0, Math.floor(draft.runtime)),
-      rewatchCount: Math.max(0, Math.floor(draft.rewatchCount ?? 0)),
-      tags: (draft.tags ?? []).map((t) => String(t).trim()).filter(Boolean),
-      notes: draft.notes?.trim() || undefined,
-      posterUrl: draft.posterUrl?.trim() || undefined,
-      inTheaters: !!draft.inTheaters,
-      platform: draft.platform?.trim() || undefined,
-      withWhom: draft.withWhom?.trim() || undefined,
-      format: draft.format?.trim() || undefined,
-      seasonOrChapter: draft.seasonOrChapter?.trim() || undefined,
-    };
-    onSave(patch);
-  }
+  const progressText =
+    typeof item.progressCur === "number" || typeof item.progressTotal === "number"
+      ? `${item.progressCur ?? 0} / ${item.progressTotal ?? "—"}`
+      : "—";
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" onMouseDown={onClose} role="dialog" aria-modal="true">
-      <div className="w-full max-w-2xl rounded-2xl bg-neutral-950 border border-neutral-800 p-4 sm:p-6" onMouseDown={(e) => e.stopPropagation()}>
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <div className="text-lg font-semibold">Edit item</div>
-            <div className="text-xs text-neutral-500">Click outside to close.</div>
+    <div className="rounded-2xl bg-neutral-900/50 ring-1 ring-neutral-800/80 overflow-hidden">
+      <div className="grid grid-cols-1 sm:grid-cols-[72px_1fr_90px_90px_120px] gap-3 p-3 items-center">
+        <div className="w-[72px] h-[96px] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
+          {item.posterUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={item.posterUrl} alt={item.title} className="w-full h-full object-cover" />
+          ) : (
+            <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">No cover</div>
+          )}
+        </div>
+
+        <div className="min-w-0">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="font-semibold truncate">{item.title}</div>
+              <div className="text-xs text-neutral-400 mt-1">
+                Status:{" "}
+                <select
+                  value={item.status}
+                  onChange={(e) => onUpdate({ status: e.target.value as Status })}
+                  className="ml-1 rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
+                >
+                  <option value="completed">Completed</option>
+                  <option value="in_progress">Watching</option>
+                  <option value="planned">Watchlist</option>
+                  <option value="dropped">Dropped</option>
+                </select>
+                {item.dateFinished ? <span className="ml-2 text-neutral-500">• {item.dateFinished}</span> : null}
+              </div>
+
+              {item.notes ? <div className="text-xs text-neutral-300 mt-2 line-clamp-2">{item.notes}</div> : null}
+              {item.tags?.length ? (
+                <div className="text-[11px] text-neutral-500 mt-1 truncate">{item.tags.join(" • ")}</div>
+              ) : null}
+            </div>
+
+            <button
+              onClick={onDelete}
+              className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 shrink-0"
+              title="Delete"
+            >
+              Delete
+            </button>
           </div>
-          <button type="button" onClick={onClose} className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm">
-            Close
-          </button>
         </div>
 
-        <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <Text label="Title" value={draft.title} onChange={(v) => setDraft((d) => ({ ...d, title: v }))} />
-          <Select
-            label="Type"
-            value={draft.type}
-            onChange={(v) => setDraft((d) => ({ ...d, type: v as MediaType }))}
-            options={[
-              { value: "movie", label: "Movie" },
-              { value: "tv", label: "TV" },
-              { value: "anime", label: "Anime" },
-              { value: "manga", label: "Manga" },
-              { value: "book", label: "Book" },
-              { value: "game", label: "Game" },
-            ]}
-          />
-
-          <Select
-            label="Status"
-            value={draft.status}
-            onChange={(v) => setDraft((d) => ({ ...d, status: v as Status }))}
-            options={[
-              { value: "completed", label: "Completed" },
-              { value: "planned", label: "Watchlist" },
-              { value: "in_progress", label: "Watching" },
-              { value: "dropped", label: "Dropped" },
-            ]}
-          />
-
-          <NumInput label="Rating (0–10)" value={Number(draft.rating ?? 0)} onChange={(n) => setDraft((d) => ({ ...d, rating: clampRating(Number(n) || 0) }))} min={0} />
-          <Text label="Date finished" type="date" value={draft.dateFinished ?? ""} onChange={(v) => setDraft((d) => ({ ...d, dateFinished: v }))} />
-          <NumInput label="Runtime (minutes)" value={Number(draft.runtime ?? 0)} onChange={(n) => setDraft((d) => ({ ...d, runtime: Math.max(0, Number(n) || 0) }))} min={0} />
-          <NumInput label="Rewatch count" value={Number(draft.rewatchCount ?? 0)} onChange={(n) => setDraft((d) => ({ ...d, rewatchCount: Math.max(0, Number(n) || 0) }))} min={0} />
-
-          <Toggle label="In theaters" checked={!!draft.inTheaters} onChange={(v) => setDraft((d) => ({ ...d, inTheaters: v }))} />
-          <Text label="Platform" value={draft.platform ?? ""} onChange={(v) => setDraft((d) => ({ ...d, platform: v }))} />
-          <Text label="With whom" value={draft.withWhom ?? ""} onChange={(v) => setDraft((d) => ({ ...d, withWhom: v }))} />
-          <Text label="Format" value={draft.format ?? ""} onChange={(v) => setDraft((d) => ({ ...d, format: v }))} />
-          <Text label="Season / Chapter" value={draft.seasonOrChapter ?? ""} onChange={(v) => setDraft((d) => ({ ...d, seasonOrChapter: v }))} />
-        </div>
-
-        <div className="mt-3">
-          <Text label="Poster URL" value={draft.posterUrl ?? ""} onChange={(v) => setDraft((d) => ({ ...d, posterUrl: v }))} />
-        </div>
-
-        <div className="mt-3">
-          <Text
-            label="Tags (comma separated)"
-            value={(draft.tags ?? []).join(", ")}
-            onChange={(v) =>
-              setDraft((d) => ({
-                ...d,
-                tags: v.split(",").map((x) => x.trim()).filter(Boolean),
-              }))
-            }
+        <div className="text-center">
+          <input
+            type="number"
+            min={0}
+            max={10}
+            value={item.rating ?? ""}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v === "") onUpdate({ rating: undefined });
+              else onUpdate({ rating: Math.max(0, Math.min(10, Number(v))) });
+            }}
+            className="w-16 text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+            placeholder="—"
           />
         </div>
 
-        <div className="mt-3">
-          <TextArea label="Notes" value={draft.notes ?? ""} onChange={(v) => setDraft((d) => ({ ...d, notes: v }))} />
-        </div>
+        <div className="text-center text-sm text-neutral-300">{item.type}</div>
 
-        <div className="mt-4 flex items-center justify-end gap-2">
-          <button type="button" onClick={save} className="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25 text-sm">
-            Save changes
-          </button>
+        <div className="text-center">
+          <div className="text-sm text-neutral-200">{progressText}</div>
+          <div className="mt-1 flex justify-center gap-2">
+            <button
+              type="button"
+              onClick={() => onUpdate({ progressCur: Math.max(0, (item.progressCur ?? 0) - 1) })}
+              className="text-xs px-2 py-1 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
+            >
+              -
+            </button>
+            <button
+              type="button"
+              onClick={() => onUpdate({ progressCur: (item.progressCur ?? 0) + 1 })}
+              className="text-xs px-2 py-1 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
+            >
+              +
+            </button>
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
-/* ================= CARD ================= */
+/* ================= DRAG CARD ================= */
 
-function MediaCard({
+function CardDraggable({
   item,
-  selected,
-  onToggleSelected,
   onDelete,
   onUpdate,
-  onEdit,
 }: {
   item: MediaItem;
-  selected: boolean;
-  onToggleSelected: () => void;
   onDelete: () => void;
   onUpdate: (patch: Partial<MediaItem>) => void;
-  onEdit: () => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: item.id });
+
   const style = transform ? { transform: `translate(${transform.x}px, ${transform.y}px)` } : undefined;
 
   return (
@@ -1390,15 +1353,10 @@ function MediaCard({
       {...listeners}
       {...attributes}
       className={[
-        "bg-neutral-900/50 rounded-2xl overflow-hidden ring-1 shadow-sm",
-        selected ? "ring-emerald-500/40" : "ring-neutral-800/80",
+        "bg-neutral-900/50 rounded-2xl overflow-hidden ring-1 ring-neutral-800/80 shadow-sm",
         "cursor-grab active:cursor-grabbing select-none",
         isDragging ? "opacity-70" : "",
       ].join(" ")}
-      onDoubleClick={(e) => {
-        e.stopPropagation();
-        onEdit();
-      }}
     >
       <div className="flex gap-3 p-4">
         <div className="w-14 h-20 rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800 shrink-0">
@@ -1413,21 +1371,7 @@ function MediaCard({
         <div className="min-w-0 flex-1 space-y-1">
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onToggleSelected();
-                  }}
-                  onPointerDown={(e) => e.stopPropagation()}
-                  className={`w-5 h-5 rounded-md border ${
-                    selected ? "bg-emerald-500/20 border-emerald-500/30" : "bg-neutral-950 border-neutral-800"
-                  }`}
-                  title="Select"
-                />
-                <div className="font-medium truncate">{item.title}</div>
-              </div>
+              <div className="font-medium truncate">{item.title}</div>
 
               <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-neutral-400">
                 <span>{item.type}</span>
@@ -1445,43 +1389,41 @@ function MediaCard({
                 </select>
 
                 {item.dateFinished ? `• ${item.dateFinished}` : ""}
-                {(item.rewatchCount ?? 0) > 0 ? `• rewatch x${item.rewatchCount}` : ""}
                 {typeof item.rating === "number" ? `• ★ ${item.rating.toFixed(1)}` : ""}
-                {typeof item.runtime === "number" ? `• ${fmtMinutes(item.runtime)}` : ""}
               </div>
             </div>
 
-            <div className="flex gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onEdit();
-                }}
-                onPointerDown={(e) => e.stopPropagation()}
-                className="text-xs px-2 py-1 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
-                title="Edit"
-              >
-                Edit
-              </button>
-
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDelete();
-                }}
-                className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
-                title="Delete"
-                onPointerDown={(e) => e.stopPropagation()}
-              >
-                Delete
-              </button>
-            </div>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete();
+              }}
+              className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 shrink-0"
+              title="Delete"
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              Delete
+            </button>
           </div>
 
-          {item.platform ? <div className="text-[11px] text-neutral-500">Platform: {item.platform}</div> : null}
-          {item.withWhom ? <div className="text-[11px] text-neutral-500">With: {item.withWhom}</div> : null}
+          <div className="mt-2 flex items-center gap-2">
+            <span className="text-[11px] text-neutral-500">Rating</span>
+            <input
+              type="number"
+              min={0}
+              max={10}
+              value={item.rating ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v === "") onUpdate({ rating: undefined });
+                else onUpdate({ rating: Math.max(0, Math.min(10, Number(v))) });
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+              className="w-16 rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+            />
+            <span className="text-[11px] text-neutral-600">/ 10</span>
+          </div>
+
           {item.notes ? <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div> : null}
           {item.tags?.length ? <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div> : null}
         </div>
@@ -1490,7 +1432,7 @@ function MediaCard({
   );
 }
 
-/* ================= UI COMPONENTS ================= */
+/* ================= SMALL INPUT COMPONENTS ================= */
 
 function Select({
   label,
@@ -1526,11 +1468,13 @@ function Text({
   value,
   onChange,
   type = "text",
+  helper,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   type?: string;
+  helper?: string;
 }) {
   return (
     <label className="block">
@@ -1541,6 +1485,7 @@ function Text({
         onChange={(e) => onChange(e.target.value)}
         className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
       />
+      {helper ? <div className="text-[11px] text-neutral-500 mt-1">{helper}</div> : null}
     </label>
   );
 }
@@ -1549,10 +1494,12 @@ function TextArea({
   label,
   value,
   onChange,
+  placeholder,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
+  placeholder?: string;
 }) {
   return (
     <label className="block">
@@ -1560,6 +1507,7 @@ function TextArea({
       <textarea
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
         rows={3}
         className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
       />
@@ -1571,11 +1519,13 @@ function NumInput({
   label,
   value,
   onChange,
+  disabled,
   min,
 }: {
   label: string;
   value: number;
   onChange: (v: number) => void;
+  disabled?: boolean;
   min?: number;
 }) {
   return (
@@ -1585,8 +1535,11 @@ function NumInput({
         type="number"
         value={Number.isFinite(value) ? value : 0}
         onChange={(e) => onChange(Number(e.target.value))}
+        disabled={disabled}
         min={min}
-        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+        className={`w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500 ${
+          disabled ? "opacity-50" : ""
+        }`}
       />
     </label>
   );
@@ -1596,7 +1549,6 @@ function Toggle({ label, checked, onChange }: { label: string; checked: boolean;
   return (
     <label className="flex items-center justify-between gap-3 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
       <span className="text-sm text-neutral-300">{label}</span>
-
       <button
         type="button"
         role="switch"
@@ -1615,5 +1567,34 @@ function Toggle({ label, checked, onChange }: { label: string; checked: boolean;
         />
       </button>
     </label>
+  );
+}
+
+/* ================= STATS UI HELPERS ================= */
+
+function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
+  return (
+    <div className="bg-neutral-900/50 p-4 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+      <div className="text-xs text-neutral-400">{title}</div>
+      <div className="text-3xl font-semibold mt-1">{value}</div>
+      {sub ? <div className="text-xs text-neutral-500 mt-1">{sub}</div> : null}
+    </div>
+  );
+}
+
+function BarRow({ label, value, total }: { label: string; value: number; total: number }) {
+  const pct = Math.max(0, Math.min(100, Math.round((value / Math.max(1, total)) * 100)));
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between text-xs text-neutral-400">
+        <div>{label}</div>
+        <div>
+          {value} <span className="text-neutral-600">({pct}%)</span>
+        </div>
+      </div>
+      <div className="h-2 rounded-full bg-white/5 border border-white/10 overflow-hidden">
+        <div className="h-full bg-white/15" style={{ width: `${pct}%` }} />
+      </div>
+    </div>
   );
 }
