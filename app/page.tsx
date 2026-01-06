@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AuthGate from "../components/AuthGate";
 import { supabase } from "../lib/supabaseClient";
 
+import { DndContext, DragEndEvent, useDraggable, useDroppable } from "@dnd-kit/core";
+
 /* ================= TYPES ================= */
 
 type MediaType = "movie" | "tv" | "anime" | "manga" | "book" | "game";
@@ -58,6 +60,13 @@ type TmdbRecommendationsResult = {
 
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
 
+const STATUSES: Array<{ id: Status; label: string }> = [
+  { id: "completed", label: "Completed" },
+  { id: "in_progress", label: "Watching" },
+  { id: "planned", label: "Watchlist" },
+  { id: "dropped", label: "Dropped" },
+];
+
 function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
@@ -72,10 +81,6 @@ function toGroupKey(mode: GroupMode, dateStr?: string) {
   if (mode === "month") return dateStr.slice(0, 7); // YYYY-MM
   if (mode === "year") return dateStr.slice(0, 4); // YYYY
   return "All";
-}
-
-function isMovieOrTv(t: MediaType): t is "movie" | "tv" {
-  return t === "movie" || t === "tv";
 }
 
 /* ================= TMDB ================= */
@@ -139,6 +144,9 @@ function StackApp() {
 
   const [groupMode, setGroupMode] = useState<GroupMode>("month");
   const [sortMode, setSortMode] = useState<SortMode>("newest");
+
+  // NEW: Board view (drag & drop) for All tab
+  const [boardView, setBoardView] = useState(true);
 
   const [autofillStatus, setAutofillStatus] = useState("");
   const [autoAutofill, setAutoAutofill] = useState(true);
@@ -307,12 +315,10 @@ function StackApp() {
         ? Math.max(0, Math.min(10, form.rating))
         : undefined;
 
-    const type: MediaType = (form.type as MediaType) ?? "movie";
-
     const item: MediaItem = {
       id: uid(),
       title: String(form.title).trim(),
-      type,
+      type: form.type as MediaType,
       status,
       inTheaters: !!form.inTheaters,
       dateFinished: finalDate,
@@ -325,8 +331,7 @@ function StackApp() {
 
       rating,
       tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
-      // if they chose movie/tv, store tmdbType even if autofill wasn't used
-      tmdbType: isMovieOrTv(type) ? type : undefined,
+      tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
     };
 
     setItems((p) => [item, ...p]);
@@ -334,7 +339,7 @@ function StackApp() {
     setAutofillStatus("");
     setForm({
       title: "",
-      type: type,
+      type: form.type ?? "movie",
       status: "completed",
       tags: [],
       inTheaters: false,
@@ -359,14 +364,13 @@ function StackApp() {
 
   async function autofill() {
     const title = (form.title || "").trim();
-    const type = (form.type as MediaType) ?? "movie";
 
     if (!title) {
       setAutofillStatus("Type a title first.");
       return;
     }
 
-    if (!isMovieOrTv(type)) {
+    if (form.type !== "movie" && form.type !== "tv") {
       setAutofillStatus("Auto-fill only works for Movie or TV (TMDB).");
       return;
     }
@@ -374,7 +378,7 @@ function StackApp() {
     try {
       setAutofillStatus("Searching TMDB…");
 
-      const s = await tmdbSearch(title, type);
+      const s = await tmdbSearch(title, form.type);
       const hit = s?.results?.[0];
 
       if (!hit) {
@@ -384,12 +388,12 @@ function StackApp() {
 
       setAutofillStatus(`Found: ${hit.title || hit.name || "Match"}`);
 
-      const d = await tmdbDetails(hit.id, type);
+      const d = await tmdbDetails(hit.id, form.type);
 
       setForm((f) => ({
         ...f,
         tmdbId: hit.id,
-        tmdbType: type, // ✅ ALWAYS movie/tv here
+        tmdbType: form.type, // ✅ correct
         posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
         runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
         tags: (d.genres ?? []).map((g) => g.name),
@@ -421,9 +425,11 @@ function StackApp() {
       const all: string[] = [];
 
       for (const i of liked) {
-        if (!i.tmdbId || !i.tmdbType) continue;
+        const type = i.tmdbType;
+        const tmdbId = i.tmdbId;
+        if (!type || !tmdbId) continue;
 
-        const rec = await tmdbRecommendations(i.tmdbId, i.tmdbType);
+        const rec = await tmdbRecommendations(tmdbId, type);
         for (const r of rec.results ?? []) {
           const t = (r.title || r.name || "").trim();
           if (!t) continue;
@@ -449,16 +455,34 @@ function StackApp() {
     });
   }
 
+  /* ================= DRAG & DROP ================= */
+
+  function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over) return;
+
+    const itemId = String(active.id);
+    const newStatus = String(over.id) as Status;
+
+    if (!["completed", "in_progress", "planned", "dropped"].includes(newStatus)) return;
+
+    const item = items.find((x) => x.id === itemId);
+    if (!item) return;
+    if (item.status === newStatus) return;
+
+    updateItem(itemId, { status: newStatus });
+  }
+
   /* ================= AUTO AUTOFILL (DEBOUNCED) ================= */
 
   useEffect(() => {
     if (!autoAutofill) return;
 
     const title = (form.title || "").trim();
-    const type = (form.type as MediaType) ?? "movie";
+    const type = form.type;
 
     if (!title || title.length < 3) return;
-    if (!isMovieOrTv(type)) return;
+    if (type !== "movie" && type !== "tv") return;
 
     const key = `${type}:${title.toLowerCase()}`;
     if (lastAutofillKey.current === key) return;
@@ -483,7 +507,7 @@ function StackApp() {
         setForm((f) => ({
           ...f,
           tmdbId: hit.id,
-          tmdbType: type, // ✅ narrowed to movie/tv
+          tmdbType: type,
           posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
           runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
           tags: (d.genres ?? []).map((g) => g.name),
@@ -663,13 +687,7 @@ function StackApp() {
               placeholder="Title"
               className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
             />
-            <button
-              type="button"
-              onClick={autofill}
-              className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-            >
-              Auto-fill
-            </button>
+            {/* ✅ Auto-fill button removed (auto-fill still runs automatically) */}
           </div>
 
           {autofillStatus ? <div className="text-xs text-neutral-400">{autofillStatus}</div> : null}
@@ -739,9 +757,12 @@ function StackApp() {
               min={0}
             />
 
-            {/* one line row: in theaters + rewatch + count */}
             <div className="md:col-span-3 grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <Toggle label="In theaters" checked={!!form.inTheaters} onChange={(v) => setForm({ ...form, inTheaters: v })} />
+              <Toggle
+                label="In theaters"
+                checked={!!form.inTheaters}
+                onChange={(v) => setForm({ ...form, inTheaters: v })}
+              />
 
               <Toggle
                 label="Rewatch"
@@ -775,7 +796,7 @@ function StackApp() {
               label="Poster image URL (optional)"
               value={String(form.posterUrl || "")}
               onChange={(v) => setForm({ ...form, posterUrl: v })}
-              helper="Paste any image URL, or use Auto-fill."
+              helper="Paste any image URL, or auto-fill will set it for Movie/TV."
             />
           </div>
 
@@ -853,34 +874,57 @@ function StackApp() {
             placeholder="Search title, notes, tags..."
             className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
           />
+
+          {/* Only show board toggle on All tab */}
+          {tab === "all" ? (
+            <div className="flex items-center justify-between">
+              <div className="text-xs text-neutral-500">
+                Board view lets you drag cards between statuses.
+              </div>
+              <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
+            </div>
+          ) : null}
         </section>
 
-        {/* List */}
-        {groupMode !== "none" && grouped ? (
-          <div className="space-y-6">
-            {grouped.map(([k, list]) => (
-              <section key={k} className="space-y-2">
-                <h3 className="text-sm text-neutral-400">{k}</h3>
-                <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {list.map((i) => (
-                    <MediaCard
-                      key={i.id}
-                      item={i}
-                      onDelete={() => removeItem(i.id)}
-                      onUpdate={(patch) => updateItem(i.id, patch)}
-                    />
-                  ))}
-                </div>
-              </section>
-            ))}
-          </div>
-        ) : (
-          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {filtered.map((i) => (
-              <MediaCard key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
-            ))}
-          </div>
-        )}
+        {/* List / Board */}
+        <DndContext onDragEnd={handleDragEnd}>
+          {tab === "all" && boardView ? (
+            <BoardView
+              items={filtered}
+              onDelete={removeItem}
+              onUpdate={updateItem}
+            />
+          ) : groupMode !== "none" && grouped ? (
+            <div className="space-y-6">
+              {grouped.map(([k, list]) => (
+                <section key={k} className="space-y-2">
+                  <h3 className="text-sm text-neutral-400">{k}</h3>
+                  <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {list.map((i) => (
+                      <MediaCard
+                        key={i.id}
+                        item={i}
+                        onDelete={() => removeItem(i.id)}
+                        onUpdate={(patch) => updateItem(i.id, patch)}
+                      />
+                    ))}
+                  </div>
+                </section>
+              ))}
+            </div>
+          ) : (
+            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {filtered.map((i) => (
+                <MediaCard
+                  key={i.id}
+                  item={i}
+                  onDelete={() => removeItem(i.id)}
+                  onUpdate={(patch) => updateItem(i.id, patch)}
+                />
+              ))}
+            </div>
+          )}
+        </DndContext>
 
         <footer className="pt-6 text-xs text-neutral-500">
           Stack • Saves to Supabase + local backup • Auto-fill uses TMDB for movies/TV
@@ -889,6 +933,68 @@ function StackApp() {
         <input ref={fileInputRef} type="file" className="hidden" />
       </div>
     </div>
+  );
+}
+
+/* ================= BOARD VIEW ================= */
+
+function BoardView({
+  items,
+  onDelete,
+  onUpdate,
+}: {
+  items: MediaItem[];
+  onDelete: (id: string) => void;
+  onUpdate: (id: string, patch: Partial<MediaItem>) => void;
+}) {
+  const byStatus = useMemo(() => {
+    const map: Record<Status, MediaItem[]> = {
+      completed: [],
+      in_progress: [],
+      planned: [],
+      dropped: [],
+    };
+    for (const i of items) map[i.status].push(i);
+    return map;
+  }, [items]);
+
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      {STATUSES.map((s) => (
+        <StatusColumn key={s.id} status={s.id} title={s.label}>
+          <div className="space-y-3">
+            {byStatus[s.id].map((i) => (
+              <MediaCard
+                key={i.id}
+                item={i}
+                onDelete={() => onDelete(i.id)}
+                onUpdate={(patch) => onUpdate(i.id, patch)}
+              />
+            ))}
+            {!byStatus[s.id].length ? (
+              <div className="text-xs text-neutral-600 text-center py-8">Drop here</div>
+            ) : null}
+          </div>
+        </StatusColumn>
+      ))}
+    </div>
+  );
+}
+
+function StatusColumn({ status, title, children }: { status: Status; title: string; children: React.ReactNode }) {
+  const { setNodeRef, isOver } = useDroppable({ id: status });
+
+  return (
+    <section
+      ref={setNodeRef}
+      className={[
+        "rounded-2xl ring-1 shadow-sm p-3 min-h-[240px]",
+        isOver ? "ring-emerald-500/40 bg-emerald-500/5" : "ring-neutral-800/80 bg-neutral-900/40",
+      ].join(" ")}
+    >
+      <div className="text-sm font-medium mb-3 text-neutral-200">{title}</div>
+      {children}
+    </section>
   );
 }
 
@@ -903,8 +1009,26 @@ function MediaCard({
   onDelete: () => void;
   onUpdate: (patch: Partial<MediaItem>) => void;
 }) {
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+    id: item.id,
+  });
+
+  const style = transform
+    ? { transform: `translate(${transform.x}px, ${transform.y}px)` }
+    : undefined;
+
   return (
-    <article className="bg-neutral-900/50 rounded-2xl overflow-hidden ring-1 ring-neutral-800/80 shadow-sm">
+    <article
+      ref={setNodeRef}
+      style={style}
+      {...listeners}
+      {...attributes}
+      className={[
+        "bg-neutral-900/50 rounded-2xl overflow-hidden ring-1 ring-neutral-800/80 shadow-sm",
+        "cursor-grab active:cursor-grabbing select-none",
+        isDragging ? "opacity-70" : "",
+      ].join(" ")}
+    >
       <div className="flex gap-3 p-4">
         <div className="w-14 h-20 rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800 shrink-0">
           {item.posterUrl ? (
@@ -919,19 +1043,38 @@ function MediaCard({
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0">
               <div className="font-medium truncate">{item.title}</div>
-              <div className="text-xs text-neutral-400">
-                {item.type} • {labelStatus(item.status)}
-                {item.inTheaters ? " • in theaters" : ""}
-                {item.dateFinished ? ` • ${item.dateFinished}` : ""}
-                {(item.rewatchCount ?? 0) > 0 ? ` • rewatch x${item.rewatchCount}` : ""}
-                {typeof item.rating === "number" ? ` • ★ ${item.rating.toFixed(1)}` : ""}
+
+              {/* ✅ Status selector on the card */}
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-neutral-400">
+                <span>{item.type}</span>
+
+                <select
+                  value={item.status}
+                  onChange={(e) => onUpdate({ status: e.target.value as Status })}
+                  onPointerDown={(e) => e.stopPropagation()} // prevents dragging when changing status
+                  className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[1px] text-xs outline-none focus:border-neutral-500"
+                >
+                  <option value="completed">Completed</option>
+                  <option value="in_progress">Watching</option>
+                  <option value="planned">Watchlist</option>
+                  <option value="dropped">Dropped</option>
+                </select>
+
+                {item.inTheaters ? "• in theaters" : ""}
+                {item.dateFinished ? `• ${item.dateFinished}` : ""}
+                {(item.rewatchCount ?? 0) > 0 ? `• rewatch x${item.rewatchCount}` : ""}
+                {typeof item.rating === "number" ? `• ★ ${item.rating.toFixed(1)}` : ""}
               </div>
             </div>
 
             <button
-              onClick={onDelete}
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete();
+              }}
               className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 shrink-0"
               title="Delete"
+              onPointerDown={(e) => e.stopPropagation()}
             >
               Delete
             </button>
@@ -949,6 +1092,7 @@ function MediaCard({
                 if (v === "") onUpdate({ rating: undefined });
                 else onUpdate({ rating: Math.max(0, Math.min(10, Number(v))) });
               }}
+              onPointerDown={(e) => e.stopPropagation()} // prevents dragging when editing rating
               className="w-16 rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
             />
             <span className="text-[11px] text-neutral-600">/ 10</span>
@@ -960,12 +1104,6 @@ function MediaCard({
       </div>
     </article>
   );
-}
-
-function labelStatus(s: Status) {
-  if (s === "planned") return "watchlist";
-  if (s === "in_progress") return "watching";
-  return s;
 }
 
 function Tab({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
