@@ -1,9 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { supabase } from "../lib/supabaseClient";
-import { DndContext, DragEndEvent, useDraggable, useDroppable } from "@dnd-kit/core";
+import { DndContext, useDraggable, useDroppable } from "@dnd-kit/core";
+import type { DragEndEvent } from "@dnd-kit/core";
+
 
 /* ================= TYPES ================= */
 
@@ -26,6 +28,9 @@ type MediaItem = {
   // TMDB fields (movie/tv only)
   tmdbId?: number;
   tmdbType?: "movie" | "tv";
+
+  // IGDB fields (game only)
+  igdbId?: number;
 
   inTheaters?: boolean;
   dateFinished?: string; // YYYY-MM-DD
@@ -55,20 +60,15 @@ type TmdbDetailsResult = {
 };
 
 type TmdbRecommendationsResult = {
-  results?: Array<{
-    id: number;
-    title?: string;
-    name?: string;
-    poster_path?: string | null;
-  }>;
+  results?: Array<{ id: number; title?: string; name?: string }>;
 };
 
-type PickRec = {
-  title: string;
-  tmdbId: number;
-  tmdbType: "movie" | "tv";
-  posterUrl?: string;
+type IgdbSearchResponse = {
+  results: Array<{ id: number; name: string; coverUrl?: string; genres?: string[] }>;
+  error?: string;
 };
+
+type Pick = { title: string; posterUrl?: string; tmdbId?: number; tmdbType?: "movie" | "tv" };
 
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
 
@@ -138,17 +138,12 @@ async function tmdbRecommendations(id: number, type: "movie" | "tv"): Promise<Tm
 /* ================= APP ================= */
 
 export default function StackApp({ view = "all" }: { view?: StackView }) {
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-
   const [items, setItems] = useState<MediaItem[]>([]);
   const [userId, setUserId] = useState<string | null>(null);
 
   const [query, setQuery] = useState("");
-
-  // If you want grouping later, re-add the UI. For now, keep it fixed to "none".
-  const groupMode: GroupMode = "none";
+  const [groupMode, setGroupMode] = useState<GroupMode>("none");
   const [sortMode, setSortMode] = useState<SortMode>("newest");
-
   const [boardView, setBoardView] = useState(true);
 
   const [autofillStatus, setAutofillStatus] = useState("");
@@ -159,7 +154,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [cloudLoaded, setCloudLoaded] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
 
-  const [picks, setPicks] = useState<PickRec[]>([]);
+  const [picks, setPicks] = useState<Pick[]>([]);
   const [pickStatus, setPickStatus] = useState("");
 
   const [excludeTypes, setExcludeTypes] = useState<Set<MediaType>>(new Set());
@@ -178,6 +173,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     posterUrl: "",
     tmdbId: undefined,
     tmdbType: undefined,
+    igdbId: undefined,
     progressCur: undefined,
     progressTotal: undefined,
   });
@@ -312,7 +308,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   useEffect(() => {
     if (userId) saveCloud(userId, items);
     else saveLocalBackup(items);
-  }, [items, userId, cloudLoaded, saveCloud, saveLocalBackup]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, userId, cloudLoaded]);
 
   /* ================= ACTIONS ================= */
 
@@ -347,6 +344,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       rating,
       tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
       tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
+      igdbId: typeof form.igdbId === "number" ? form.igdbId : undefined,
       progressCur: typeof form.progressCur === "number" ? form.progressCur : undefined,
       progressTotal: typeof form.progressTotal === "number" ? form.progressTotal : undefined,
     };
@@ -368,6 +366,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       rating: undefined,
       tmdbId: undefined,
       tmdbType: undefined,
+      igdbId: undefined,
       progressCur: undefined,
       progressTotal: undefined,
     }));
@@ -397,44 +396,47 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       }
 
       const existingTitles = new Set(items.map((i) => i.title.toLowerCase()));
-      const all: PickRec[] = [];
+      const pool: Array<{ title: string; tmdbId: number; tmdbType: "movie" | "tv" }> = [];
 
-      for (const seed of liked) {
-        const tmdbType = seed.tmdbType;
-        const tmdbId = seed.tmdbId;
-        if (!tmdbType || !tmdbId) continue;
+      for (const i of liked) {
+        const type = i.tmdbType;
+        const tmdbId = i.tmdbId;
+        if (!type || !tmdbId) continue;
 
-        const rec = await tmdbRecommendations(tmdbId, tmdbType);
-
+        const rec = await tmdbRecommendations(tmdbId, type);
         for (const r of rec.results ?? []) {
           const t = (r.title || r.name || "").trim();
           if (!t) continue;
           if (existingTitles.has(t.toLowerCase())) continue;
-
-          const posterUrl = r.poster_path ? `https://image.tmdb.org/t/p/w342${r.poster_path}` : undefined;
-
-          all.push({
-            title: t,
-            tmdbId: r.id,
-            tmdbType,
-            posterUrl,
-          });
+          pool.push({ title: t, tmdbId: r.id, tmdbType: type });
         }
       }
 
-      // Unique by tmdbId + type
+      // unique by tmdbId+type
       const seen = new Set<string>();
-      const unique: PickRec[] = [];
-      for (const p of all) {
-        const k = `${p.tmdbType}:${p.tmdbId}`;
-        if (seen.has(k)) continue;
+      const unique = pool.filter((x) => {
+        const k = `${x.tmdbType}:${x.tmdbId}`;
+        if (seen.has(k)) return false;
         seen.add(k);
-        unique.push(p);
-        if (unique.length >= 10) break;
+        return true;
+      });
+
+      const top = unique.slice(0, 8);
+
+      // Fetch posters for nicer UI
+      const withPosters: Pick[] = [];
+      for (const p of top) {
+        try {
+          const d = await tmdbDetails(p.tmdbId, p.tmdbType);
+          const posterUrl = d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : undefined;
+          withPosters.push({ title: p.title, tmdbId: p.tmdbId, tmdbType: p.tmdbType, posterUrl });
+        } catch {
+          withPosters.push({ title: p.title, tmdbId: p.tmdbId, tmdbType: p.tmdbType });
+        }
       }
 
-      setPicks(unique);
-      setPickStatus(unique.length ? "Click a poster to autofill it." : "No new picks found (try rating more items).");
+      setPicks(withPosters);
+      setPickStatus(withPosters.length ? "Here you go." : "No new picks found (try rating more items).");
     } catch (e: unknown) {
       setPickStatus(e instanceof Error ? e.message : "Pick failed");
     }
@@ -467,7 +469,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     updateItem(itemId, { status: newStatus });
   }
 
-  /* ================= AUTO AUTOFILL (DEBOUNCED) ================= */
+  /* ================= AUTO AUTOFILL (TMDB + IGDB) ================= */
 
   useEffect(() => {
     if (!autoAutofill) return;
@@ -475,8 +477,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     const title = (form.title || "").trim();
     const type = form.type;
 
-    if (!title || title.length < 3) return;
-    if (type !== "movie" && type !== "tv") return;
+    if (!title || title.length < 2) return;
 
     const key = `${type}:${title.toLowerCase()}`;
     if (lastAutofillKey.current === key) return;
@@ -485,41 +486,83 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
     autofillTimer.current = window.setTimeout(async () => {
       try {
-        setAutofillStatus("Searching TMDB…");
-        const tmdbType: "movie" | "tv" = type;
+        // MOVIE / TV (TMDB)
+        if (type === "movie" || type === "tv") {
+          setAutofillStatus("Searching TMDB…");
+          const tmdbType: "movie" | "tv" = type;
 
-        const s = await tmdbSearch(title, tmdbType);
-        const hit = s?.results?.[0];
-        if (!hit) {
-          setAutofillStatus("No match found on TMDB.");
+          const s = await tmdbSearch(title, tmdbType);
+          const hit = s?.results?.[0];
+          if (!hit) {
+            setAutofillStatus("No match found on TMDB.");
+            return;
+          }
+
+          lastAutofillKey.current = key;
+          setAutofillStatus(`Found: ${hit.title || hit.name || "Match"}`);
+
+          const d = await tmdbDetails(hit.id, tmdbType);
+
+          setForm((f) => ({
+            ...f,
+            tmdbId: hit.id,
+            tmdbType,
+            igdbId: undefined,
+            posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
+            runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
+            tags: (d.genres ?? []).map((g) => g.name),
+          }));
+
+          setAutofillStatus("Auto-fill complete.");
           return;
         }
 
-        lastAutofillKey.current = key;
-        setAutofillStatus(`Found: ${hit.title || hit.name || "Match"}`);
+        // GAME (IGDB via your /api/igdb/search route)
+        if (type === "game") {
+          setAutofillStatus("Searching IGDB…");
 
-        const d = await tmdbDetails(hit.id, tmdbType);
+          const res = await fetch(`/api/igdb/search?q=${encodeURIComponent(title)}&limit=5`, { method: "GET" });
+          const json = (await res.json()) as IgdbSearchResponse;
 
-        setForm((f) => ({
-          ...f,
-          tmdbId: hit.id,
-          tmdbType,
-          posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
-          runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
-          tags: (d.genres ?? []).map((g) => g.name),
-        }));
+          if (!res.ok) {
+            setAutofillStatus(`IGDB error: ${json.error || "Search failed"}`);
+            return;
+          }
 
-        setAutofillStatus("Auto-fill complete.");
+          const hit = json.results?.[0];
+          if (!hit) {
+            setAutofillStatus("No match found on IGDB.");
+            return;
+          }
+
+          lastAutofillKey.current = key;
+          setAutofillStatus(`Found: ${hit.name}`);
+
+          setForm((f) => ({
+            ...f,
+            igdbId: hit.id,
+            tmdbId: undefined,
+            tmdbType: undefined,
+            posterUrl: hit.coverUrl || f.posterUrl,
+            tags: (hit.genres && hit.genres.length ? hit.genres : f.tags) ?? [],
+          }));
+
+          setAutofillStatus("Auto-fill complete.");
+          return;
+        }
+
+        // Other types: do nothing
+        return;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Unknown error";
-        setAutofillStatus(`TMDB error: ${msg}`);
+        setAutofillStatus(`Auto-fill error: ${msg}`);
       }
     }, 650);
 
     return () => {
       if (autofillTimer.current) window.clearTimeout(autofillTimer.current);
     };
-  }, [form.title, form.type, autoAutofill]);
+  }, [form.title, form.type, autoAutofill]); // keep as-is
 
   /* ================= FILTER ================= */
 
@@ -567,12 +610,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   /* ================= STATS ================= */
 
   const statusCounts = useMemo(() => {
-    const base: Record<Status, number> = {
-      completed: 0,
-      in_progress: 0,
-      planned: 0,
-      dropped: 0,
-    };
+    const base: Record<Status, number> = { completed: 0, in_progress: 0, planned: 0, dropped: 0 };
     for (const i of items) base[i.status] += 1;
     return base;
   }, [items]);
@@ -595,11 +633,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       map.set(i.type, cur);
     }
     return Array.from(map.entries())
-      .map(([type, v]) => ({
-        type,
-        avg: v.count ? v.sum / v.count : 0,
-        count: v.count,
-      }))
+      .map(([type, v]) => ({ type, avg: v.count ? v.sum / v.count : 0, count: v.count }))
       .sort((a, b) => b.avg - a.avg);
   }, [items]);
 
@@ -724,11 +758,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 value={`${Math.floor(totalRuntimeMinutesCompleted / 60)}h`}
                 sub={`${totalRuntimeMinutesCompleted} min tracked`}
               />
-              <StatCard
-                title="Rewatches"
-                value={`${rewatchTotals.rewatches}`}
-                sub={`${rewatchTotals.itemsRewatched} items rewatched`}
-              />
+              <StatCard title="Rewatches" value={`${rewatchTotals.rewatches}`} sub={`${rewatchTotals.itemsRewatched} items`} />
             </div>
 
             <div className="grid lg:grid-cols-2 gap-4">
@@ -838,15 +868,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   ))}
                 </div>
               ) : (
-                <div className="text-xs text-neutral-400">No tags yet (TMDB autofill adds genres for Movie/TV).</div>
+                <div className="text-xs text-neutral-400">No tags yet (auto-fill adds genres for Movie/TV + Game).</div>
               )}
             </div>
           </div>
         ) : null}
 
-        {/* ADD PAGE WITH LEFT/RIGHT MASCOTS */}
+        {/* ADD PAGE WITH LEFT/RIGHT MASCOTS + PICK AT BOTTOM + COVER RESULTS */}
         {view === "add" ? (
           <div className="relative overflow-hidden rounded-3xl ring-1 ring-neutral-800/70 bg-neutral-900/25">
+            {/* side “curtains” */}
             <div className="absolute inset-0 pointer-events-none">
               <div className="absolute inset-y-0 left-0 w-[18%] bg-[#2a2f8f]/90" />
               <div className="absolute inset-y-0 right-0 w-[18%] bg-[#2a2f8f]/90" />
@@ -854,6 +885,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               <div className="absolute inset-y-0 right-[18%] w-[6%] bg-neutral-700/60 blur-2xl" />
             </div>
 
+            {/* mascots */}
             <div className="absolute inset-y-0 left-0 w-[18%] hidden md:flex items-center justify-center pointer-events-none">
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
@@ -871,13 +903,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               />
             </div>
 
+            {/* center content */}
             <div className="relative px-4 sm:px-6 py-6 md:px-10 md:py-10 mx-auto max-w-3xl space-y-4">
               <div className="text-center">
                 <div className="text-2xl font-semibold tracking-tight">Add to Stack</div>
-                <div className="text-sm text-neutral-400 mt-1">Search / autofill Movie + TV, or add anything manually.</div>
+                <div className="text-sm text-neutral-400 mt-1">
+                  Auto-fill: Movie/TV (TMDB) + Game (IGDB). Everything else manual.
+                </div>
               </div>
 
-              {/* FORM FIRST */}
               <form
                 onSubmit={addItem}
                 className="bg-neutral-950/40 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-4"
@@ -896,9 +930,13 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 {form.posterUrl ? (
                   <div className="flex items-center gap-3 rounded-2xl bg-neutral-950 border border-neutral-800 p-3">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={form.posterUrl} alt="Poster" className="w-12 h-16 rounded-lg object-cover bg-neutral-900" />
+                    <img
+                      src={form.posterUrl}
+                      alt="Poster"
+                      className="w-12 h-16 rounded-lg object-cover bg-neutral-900"
+                    />
                     <div className="text-xs text-neutral-400">
-                      Poster loaded • Tags: {(form.tags || []).slice(0, 4).join(", ") || "—"}
+                      Cover loaded • Tags: {(form.tags || []).slice(0, 4).join(", ") || "—"}
                     </div>
                     <div className="flex-1" />
                     <button
@@ -910,11 +948,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                           tags: f.tags ?? [],
                           tmdbId: undefined,
                           tmdbType: undefined,
+                          igdbId: undefined,
                         }))
                       }
                       className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
                     >
-                      Remove poster
+                      Remove cover
                     </button>
                   </div>
                 ) : null}
@@ -923,7 +962,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   <Select
                     label="Type"
                     value={form.type || "movie"}
-                    onChange={(v) => setForm({ ...form, type: v as MediaType, tmdbId: undefined, tmdbType: undefined })}
+                    onChange={(v) =>
+                      setForm({
+                        ...form,
+                        type: v as MediaType,
+                        tmdbId: undefined,
+                        tmdbType: undefined,
+                        igdbId: undefined,
+                      })
+                    }
                     options={[
                       { value: "movie", label: "Movie" },
                       { value: "tv", label: "TV" },
@@ -984,15 +1031,19 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   />
 
                   <Text
-                    label="Poster image URL (optional)"
+                    label="Cover image URL (optional)"
                     value={String(form.posterUrl || "")}
                     onChange={(v) => setForm({ ...form, posterUrl: v })}
-                    helper="Paste any image URL, or auto-fill sets it for Movie/TV."
+                    helper="Paste any image URL, or auto-fill sets it for Movie/TV/Game."
                   />
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <Toggle label="In theaters" checked={!!form.inTheaters} onChange={(v) => setForm({ ...form, inTheaters: v })} />
+                  <Toggle
+                    label="In theaters"
+                    checked={!!form.inTheaters}
+                    onChange={(v) => setForm({ ...form, inTheaters: v })}
+                  />
 
                   <Toggle
                     label="Rewatch"
@@ -1028,14 +1079,14 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   </button>
 
                   <div className="flex gap-3 flex-wrap">
-                    <Toggle label="Auto-fill as you type (Movie/TV)" checked={autoAutofill} onChange={setAutoAutofill} />
+                    <Toggle label="Auto-fill as you type" checked={autoAutofill} onChange={setAutoAutofill} />
                   </div>
                 </div>
               </form>
 
-              {/* PICK SECTION MOVED TO BOTTOM */}
+              {/* PICK SECTION (BOTTOM) */}
               <div className="bg-neutral-950/40 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-3">
-                <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-3 flex-wrap">
                   <button
                     type="button"
                     onClick={pickForMe}
@@ -1047,50 +1098,24 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 </div>
 
                 {picks.length ? (
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                     {picks.map((p) => (
-                      <button
-                        key={`${p.tmdbType}:${p.tmdbId}`}
-                        type="button"
-                        onClick={() => {
-                          // Force autofill to re-run for this title
-                          lastAutofillKey.current = "";
-                          setAutofillStatus("");
-                          setForm((f) => ({
-                            ...f,
-                            title: p.title,
-                            type: p.tmdbType,
-                            tmdbId: undefined,
-                            tmdbType: undefined,
-                          }));
-                        }}
-                        className="text-left group"
-                        title="Click to autofill this"
-                      >
-                        <div className="rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800 aspect-[2/3]">
+                      <div key={`${p.tmdbType ?? "x"}:${p.tmdbId ?? p.title}`} className="space-y-2">
+                        <div className="aspect-[2/3] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
                           {p.posterUrl ? (
                             // eslint-disable-next-line @next/next/no-img-element
-                            <img
-                              src={p.posterUrl}
-                              alt={p.title}
-                              className="w-full h-full object-cover group-hover:scale-[1.02] transition"
-                            />
+                            <img src={p.posterUrl} alt={p.title} className="w-full h-full object-cover" />
                           ) : (
                             <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">
-                              No poster
+                              No cover
                             </div>
                           )}
                         </div>
-                        <div className="mt-2 text-[11px] text-neutral-200 line-clamp-2">{p.title}</div>
-                        <div className="text-[10px] text-neutral-500">{p.tmdbType.toUpperCase()}</div>
-                      </button>
+                        <div className="text-xs text-neutral-200 line-clamp-2">{p.title}</div>
+                      </div>
                     ))}
                   </div>
-                ) : (
-                  <div className="text-xs text-neutral-500">
-                    Click the button to generate poster picks based on your top-rated Movie/TV items.
-                  </div>
-                )}
+                ) : null}
               </div>
             </div>
           </div>
@@ -1138,7 +1163,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       <h3 className="text-sm text-neutral-400">{k}</h3>
                       <div className="space-y-3">
                         {list.map((i) => (
-                          <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
+                          <MALRow
+                            key={i.id}
+                            item={i}
+                            onDelete={() => removeItem(i.id)}
+                            onUpdate={(patch) => updateItem(i.id, patch)}
+                          />
                         ))}
                       </div>
                     </section>
@@ -1155,7 +1185,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   </div>
 
                   {filtered.map((i) => (
-                    <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
+                    <MALRow
+                      key={i.id}
+                      item={i}
+                      onDelete={() => removeItem(i.id)}
+                      onUpdate={(patch) => updateItem(i.id, patch)}
+                    />
                   ))}
                 </div>
               )}
@@ -1164,8 +1199,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         ) : null}
 
         <footer className="pt-6 text-xs text-neutral-500">Stack • Saves to Supabase + local backup</footer>
-
-        <input ref={fileInputRef} type="file" className="hidden" />
       </div>
     </div>
   );
@@ -1183,12 +1216,7 @@ function BoardView({
   onUpdate: (id: string, patch: Partial<MediaItem>) => void;
 }) {
   const byStatus = useMemo(() => {
-    const map: Record<Status, MediaItem[]> = {
-      completed: [],
-      in_progress: [],
-      planned: [],
-      dropped: [],
-    };
+    const map: Record<Status, MediaItem[]> = { completed: [], in_progress: [], planned: [], dropped: [] };
     for (const i of items) map[i.status].push(i);
     return map;
   }, [items]);
