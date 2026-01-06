@@ -145,7 +145,7 @@ function StackApp() {
   const [groupMode, setGroupMode] = useState<GroupMode>("month");
   const [sortMode, setSortMode] = useState<SortMode>("newest");
 
-  // NEW: Board view (drag & drop) for All tab
+  // Board view toggle (drag & drop) for All tab
   const [boardView, setBoardView] = useState(true);
 
   const [autofillStatus, setAutofillStatus] = useState("");
@@ -272,8 +272,6 @@ function StackApp() {
   useEffect(() => {
     const backup = loadLocalBackup();
     if (backup) setItems(backup);
-
-    // Always reset tab to All on load/refresh
     setTab("all");
   }, [loadLocalBackup]);
 
@@ -362,50 +360,6 @@ function StackApp() {
     setItems((prev) => prev.map((x) => (x.id === id ? { ...x, ...patch } : x)));
   }
 
-  async function autofill() {
-    const title = (form.title || "").trim();
-
-    if (!title) {
-      setAutofillStatus("Type a title first.");
-      return;
-    }
-
-    if (form.type !== "movie" && form.type !== "tv") {
-      setAutofillStatus("Auto-fill only works for Movie or TV (TMDB).");
-      return;
-    }
-
-    try {
-      setAutofillStatus("Searching TMDB…");
-
-      const s = await tmdbSearch(title, form.type);
-      const hit = s?.results?.[0];
-
-      if (!hit) {
-        setAutofillStatus("No match found on TMDB.");
-        return;
-      }
-
-      setAutofillStatus(`Found: ${hit.title || hit.name || "Match"}`);
-
-      const d = await tmdbDetails(hit.id, form.type);
-
-      setForm((f) => ({
-        ...f,
-        tmdbId: hit.id,
-        tmdbType: form.type, // ✅ correct
-        posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
-        runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
-        tags: (d.genres ?? []).map((g) => g.name),
-      }));
-
-      setAutofillStatus("Auto-fill complete.");
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Unknown error";
-      setAutofillStatus(`TMDB error: ${msg}`);
-    }
-  }
-
   async function pickForMe() {
     try {
       setPickStatus("Finding picks…");
@@ -492,7 +446,11 @@ function StackApp() {
     autofillTimer.current = window.setTimeout(async () => {
       try {
         setAutofillStatus("Searching TMDB…");
-        const s = await tmdbSearch(title, type);
+
+        // ✅ "type" is already narrowed here
+        const tmdbType: "movie" | "tv" = type;
+
+        const s = await tmdbSearch(title, tmdbType);
         const hit = s?.results?.[0];
         if (!hit) {
           setAutofillStatus("No match found on TMDB.");
@@ -502,12 +460,12 @@ function StackApp() {
         lastAutofillKey.current = key;
         setAutofillStatus(`Found: ${hit.title || hit.name || "Match"}`);
 
-        const d = await tmdbDetails(hit.id, type);
+        const d = await tmdbDetails(hit.id, tmdbType);
 
         setForm((f) => ({
           ...f,
           tmdbId: hit.id,
-          tmdbType: type,
+          tmdbType, // ✅ always "movie" | "tv"
           posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
           runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
           tags: (d.genres ?? []).map((g) => g.name),
@@ -687,7 +645,7 @@ function StackApp() {
               placeholder="Title"
               className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
             />
-            {/* ✅ Auto-fill button removed (auto-fill still runs automatically) */}
+            {/* Auto-fill button removed (auto-fill runs automatically) */}
           </div>
 
           {autofillStatus ? <div className="text-xs text-neutral-400">{autofillStatus}</div> : null}
@@ -758,11 +716,7 @@ function StackApp() {
             />
 
             <div className="md:col-span-3 grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <Toggle
-                label="In theaters"
-                checked={!!form.inTheaters}
-                onChange={(v) => setForm({ ...form, inTheaters: v })}
-              />
+              <Toggle label="In theaters" checked={!!form.inTheaters} onChange={(v) => setForm({ ...form, inTheaters: v })} />
 
               <Toggle
                 label="Rewatch"
@@ -875,12 +829,9 @@ function StackApp() {
             className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
           />
 
-          {/* Only show board toggle on All tab */}
           {tab === "all" ? (
             <div className="flex items-center justify-between">
-              <div className="text-xs text-neutral-500">
-                Board view lets you drag cards between statuses.
-              </div>
+              <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
               <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
             </div>
           ) : null}
@@ -889,11 +840,7 @@ function StackApp() {
         {/* List / Board */}
         <DndContext onDragEnd={handleDragEnd}>
           {tab === "all" && boardView ? (
-            <BoardView
-              items={filtered}
-              onDelete={removeItem}
-              onUpdate={updateItem}
-            />
+            <BoardView items={filtered} onDelete={removeItem} onUpdate={updateItem} />
           ) : groupMode !== "none" && grouped ? (
             <div className="space-y-6">
               {grouped.map(([k, list]) => (
@@ -964,16 +911,9 @@ function BoardView({
         <StatusColumn key={s.id} status={s.id} title={s.label}>
           <div className="space-y-3">
             {byStatus[s.id].map((i) => (
-              <MediaCard
-                key={i.id}
-                item={i}
-                onDelete={() => onDelete(i.id)}
-                onUpdate={(patch) => onUpdate(i.id, patch)}
-              />
+              <MediaCard key={i.id} item={i} onDelete={() => onDelete(i.id)} onUpdate={(patch) => onUpdate(i.id, patch)} />
             ))}
-            {!byStatus[s.id].length ? (
-              <div className="text-xs text-neutral-600 text-center py-8">Drop here</div>
-            ) : null}
+            {!byStatus[s.id].length ? <div className="text-xs text-neutral-600 text-center py-8">Drop here</div> : null}
           </div>
         </StatusColumn>
       ))}
@@ -1009,13 +949,9 @@ function MediaCard({
   onDelete: () => void;
   onUpdate: (patch: Partial<MediaItem>) => void;
 }) {
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
-    id: item.id,
-  });
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: item.id });
 
-  const style = transform
-    ? { transform: `translate(${transform.x}px, ${transform.y}px)` }
-    : undefined;
+  const style = transform ? { transform: `translate(${transform.x}px, ${transform.y}px)` } : undefined;
 
   return (
     <article
@@ -1044,14 +980,13 @@ function MediaCard({
             <div className="min-w-0">
               <div className="font-medium truncate">{item.title}</div>
 
-              {/* ✅ Status selector on the card */}
               <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-neutral-400">
                 <span>{item.type}</span>
 
                 <select
                   value={item.status}
                   onChange={(e) => onUpdate({ status: e.target.value as Status })}
-                  onPointerDown={(e) => e.stopPropagation()} // prevents dragging when changing status
+                  onPointerDown={(e) => e.stopPropagation()}
                   className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[1px] text-xs outline-none focus:border-neutral-500"
                 >
                   <option value="completed">Completed</option>
@@ -1072,9 +1007,9 @@ function MediaCard({
                 e.stopPropagation();
                 onDelete();
               }}
+              onPointerDown={(e) => e.stopPropagation()}
               className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 shrink-0"
               title="Delete"
-              onPointerDown={(e) => e.stopPropagation()}
             >
               Delete
             </button>
@@ -1092,7 +1027,7 @@ function MediaCard({
                 if (v === "") onUpdate({ rating: undefined });
                 else onUpdate({ rating: Math.max(0, Math.min(10, Number(v))) });
               }}
-              onPointerDown={(e) => e.stopPropagation()} // prevents dragging when editing rating
+              onPointerDown={(e) => e.stopPropagation()}
               className="w-16 rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
             />
             <span className="text-[11px] text-neutral-600">/ 10</span>
@@ -1123,7 +1058,6 @@ function Toggle({ label, checked, onChange }: { label: string; checked: boolean;
   return (
     <label className="flex items-center justify-between gap-3 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
       <span className="text-sm text-neutral-300">{label}</span>
-
       <button
         type="button"
         role="switch"
