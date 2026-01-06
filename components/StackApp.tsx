@@ -31,7 +31,7 @@ type MediaItem = {
   dateFinished?: string; // YYYY-MM-DD
   notes?: string;
   rewatchCount?: number; // 0 = not a rewatch, >=1 = rewatch count
-  runtime?: number;
+  runtime?: number; // minutes
   status: Status;
   tags: string[];
   createdAt: string; // ISO
@@ -63,6 +63,8 @@ const STATUSES: Array<{ id: Status; label: string }> = [
   { id: "dropped", label: "Dropped" },
 ];
 
+const ALL_TYPES: MediaType[] = ["movie", "tv", "anime", "manga", "book", "game"];
+
 function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
@@ -77,6 +79,17 @@ function toGroupKey(mode: GroupMode, dateStr?: string) {
   if (mode === "month") return dateStr.slice(0, 7); // YYYY-MM
   if (mode === "year") return dateStr.slice(0, 4); // YYYY
   return "All";
+}
+
+function safeLower(s: string) {
+  return (s || "").trim().toLowerCase();
+}
+
+function formatMinutesToHours(mins: number) {
+  if (!Number.isFinite(mins) || mins <= 0) return "0h";
+  const hours = mins / 60;
+  if (hours < 10) return `${hours.toFixed(1)}h`;
+  return `${Math.round(hours)}h`;
 }
 
 /* ================= TMDB ================= */
@@ -132,7 +145,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [groupMode, setGroupMode] = useState<GroupMode>("month");
   const [sortMode, setSortMode] = useState<SortMode>("newest");
 
-  // Board view only really matters on All
   const [boardView, setBoardView] = useState(true);
 
   const [autofillStatus, setAutofillStatus] = useState("");
@@ -148,7 +160,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const [excludeTypes, setExcludeTypes] = useState<Set<MediaType>>(new Set());
 
-  // Default status "completed"
   const [form, setForm] = useState<Partial<MediaItem>>({
     title: "",
     type: "movie",
@@ -163,6 +174,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     posterUrl: "",
     tmdbId: undefined,
     tmdbType: undefined,
+    runtime: undefined,
   });
 
   /* ================= NAV + PAGE META ================= */
@@ -186,12 +198,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       watching: { title: "Watching", subtitle: "Currently in progress" },
       watchlist: { title: "Watchlist", subtitle: "Planned — for later" },
       dropped: { title: "Dropped", subtitle: "Paused or abandoned" },
-      stats: { title: "Stats", subtitle: "Your totals, averages, and breakdowns" },
+      stats: { title: "Stats", subtitle: "Your totals, time, and breakdowns" },
     }),
     []
   );
 
-  // Phase 2: page-specific defaults (feel more MAL-like)
+  // Phase 2 defaults per page
   useEffect(() => {
     if (view === "watchlist") {
       setGroupMode("none");
@@ -213,8 +225,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       setGroupMode("month");
       setSortMode("newest");
       setBoardView(true);
-    } else if (view === "stats") {
-      // nothing special
     }
   }, [view]);
 
@@ -360,7 +370,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       posterUrl: (form.posterUrl || "").trim() || undefined,
       runtime: typeof form.runtime === "number" ? form.runtime : undefined,
       notes: (form.notes || "").trim() || undefined,
-      tags: form.tags ?? [],
+      tags: (form.tags ?? []).map((t) => t.trim()).filter(Boolean),
       rewatchCount: Math.max(0, Number(form.rewatchCount ?? 0) || 0),
       createdAt: new Date().toISOString(),
 
@@ -412,7 +422,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         return;
       }
 
-      const existingTitles = new Set(items.map((i) => i.title.toLowerCase()));
+      const existingTitles = new Set(items.map((i) => safeLower(i.title)));
       const all: string[] = [];
 
       for (const i of liked) {
@@ -424,7 +434,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         for (const r of rec.results ?? []) {
           const t = (r.title || r.name || "").trim();
           if (!t) continue;
-          if (existingTitles.has(t.toLowerCase())) continue;
+          if (existingTitles.has(safeLower(t))) continue;
           all.push(t);
         }
       }
@@ -483,7 +493,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     autofillTimer.current = window.setTimeout(async () => {
       try {
         setAutofillStatus("Searching TMDB…");
-        const tmdbType: "movie" | "tv" = type; // ✅ keep correct union
+        const tmdbType: "movie" | "tv" = type;
 
         const s = await tmdbSearch(title, tmdbType);
         const hit = s?.results?.[0];
@@ -523,7 +533,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const filtered = useMemo(() => {
     let out = items.slice();
 
-    // Route-based filtering
     if (view === "completed") out = out.filter((i) => i.status === "completed");
     if (view === "watching") out = out.filter((i) => i.status === "in_progress");
     if (view === "watchlist") out = out.filter((i) => i.status === "planned");
@@ -563,7 +572,50 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     return Array.from(map.entries()).sort((a, b) => (a[0] < b[0] ? 1 : -1));
   }, [filtered, groupMode]);
 
-  /* ================= STATS ================= */
+  /* ================= PHASE 3: STATS ================= */
+
+  const countsByStatus = useMemo(() => {
+    const base: Record<Status, number> = { completed: 0, in_progress: 0, planned: 0, dropped: 0 };
+    for (const i of items) base[i.status] += 1;
+    return base;
+  }, [items]);
+
+  const countsByType = useMemo(() => {
+    const base: Record<MediaType, number> = {
+      movie: 0,
+      tv: 0,
+      anime: 0,
+      manga: 0,
+      book: 0,
+      game: 0,
+    };
+    for (const i of items) base[i.type] += 1;
+    return base;
+  }, [items]);
+
+  const completedItems = useMemo(() => {
+    return items.filter((i) => i.status === "completed");
+  }, [items]);
+
+  const completedTimeMinutes = useMemo(() => {
+    // Only count runtime when present
+    let mins = 0;
+    for (const i of completedItems) {
+      if (excludeTypes.has(i.type)) continue;
+      if (typeof i.runtime === "number" && Number.isFinite(i.runtime) && i.runtime > 0) mins += i.runtime;
+    }
+    return mins;
+  }, [completedItems, excludeTypes]);
+
+  const avgRuntimeCompleted = useMemo(() => {
+    const runtimes: number[] = [];
+    for (const i of completedItems) {
+      if (excludeTypes.has(i.type)) continue;
+      if (typeof i.runtime === "number" && Number.isFinite(i.runtime) && i.runtime > 0) runtimes.push(i.runtime);
+    }
+    if (!runtimes.length) return 0;
+    return runtimes.reduce((a, b) => a + b, 0) / runtimes.length;
+  }, [completedItems, excludeTypes]);
 
   const avgByType = useMemo(() => {
     const map = new Map<MediaType, { sum: number; count: number }>();
@@ -581,12 +633,41 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     }));
   }, [items]);
 
+  const topTags = useMemo(() => {
+    // Tags = your genres / manual tags
+    const freq = new Map<string, number>();
+    for (const i of items) {
+      for (const raw of i.tags ?? []) {
+        const t = raw.trim();
+        if (!t) continue;
+        freq.set(t, (freq.get(t) ?? 0) + 1);
+      }
+    }
+    return Array.from(freq.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([tag, count]) => ({ tag, count }));
+  }, [items]);
+
+  const recentCompleted = useMemo(() => {
+    const out = completedItems.slice();
+    out.sort((a, b) => {
+      const ad = new Date((a.dateFinished ?? a.createdAt) as string).getTime();
+      const bd = new Date((b.dateFinished ?? b.createdAt) as string).getTime();
+      return bd - ad;
+    });
+    return out.slice(0, 10);
+  }, [completedItems]);
+
   const totalCompleted = useMemo(() => {
-    return items.filter((i) => {
-      if (excludeTypes.has(i.type)) return false;
-      return i.status === "completed";
-    }).length;
-  }, [items, excludeTypes]);
+    return completedItems.filter((i) => !excludeTypes.has(i.type)).length;
+  }, [completedItems, excludeTypes]);
+
+  const totalRewatches = useMemo(() => {
+    let total = 0;
+    for (const i of items) total += Math.max(0, Number(i.rewatchCount ?? 0) || 0);
+    return total;
+  }, [items]);
 
   /* ================= UI ================= */
 
@@ -604,7 +685,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             <div className="text-xs text-neutral-500">{saveStatus}</div>
           </div>
 
-          {/* Top nav */}
           <nav className="flex flex-wrap gap-2">
             {nav.map((n) => (
               <Link
@@ -620,10 +700,88 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           </nav>
         </header>
 
-        {/* STATS PAGE */}
+        {/* ================= STATS PAGE (PHASE 3) ================= */}
         {view === "stats" ? (
           <div className="space-y-4">
+            {/* Top numbers */}
+            <div className="grid md:grid-cols-4 gap-4">
+              <StatCard title="Total items" value={String(items.length)} sub="Everything in your Stack" />
+              <StatCard title="Completed" value={String(totalCompleted)} sub="Excludes selected types below" />
+              <StatCard title="Total time (completed)" value={formatMinutesToHours(completedTimeMinutes)} sub="Counts runtime when available" />
+              <StatCard title="Rewatches" value={String(totalRewatches)} sub="Sum of rewatch counts" />
+            </div>
+
+            {/* Exclude types for time/completed */}
+            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium">Exclude types from “Completed” + “Time”</div>
+                  <div className="text-xs text-neutral-400 mt-1">
+                    Useful if you don’t want books/manga counting toward your completion totals.
+                  </div>
+                </div>
+                <div className="text-xs text-neutral-400">
+                  Avg runtime (completed):{" "}
+                  <span className="text-neutral-200">{avgRuntimeCompleted ? `${Math.round(avgRuntimeCompleted)}m` : "—"}</span>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2 mt-3">
+                {ALL_TYPES.map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => toggleExclude(t)}
+                    className={`px-3 py-1 rounded-xl border text-xs ${
+                      excludeTypes.has(t)
+                        ? "bg-red-500/15 border-red-500/20"
+                        : "bg-white/5 border-white/10 hover:bg-white/10"
+                    }`}
+                  >
+                    {excludeTypes.has(t) ? `Excluded: ${t}` : t}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Status breakdown */}
+            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+              <div className="text-sm font-medium mb-3">By status</div>
+              <div className="grid sm:grid-cols-4 gap-3">
+                {STATUSES.map((s) => (
+                  <MiniCard key={s.id} title={s.label} value={String(countsByStatus[s.id])} />
+                ))}
+              </div>
+            </div>
+
+            {/* Type breakdown + ratings */}
             <div className="grid md:grid-cols-2 gap-4">
+              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+                <div className="text-sm font-medium mb-3">By type</div>
+                <div className="space-y-2">
+                  {ALL_TYPES.map((t) => {
+                    const count = countsByType[t];
+                    const pct = items.length ? Math.round((count / items.length) * 100) : 0;
+                    return (
+                      <div key={t} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+                        <div className="flex items-center justify-between text-sm">
+                          <div className="text-neutral-200 capitalize">{t}</div>
+                          <div className="text-neutral-400">
+                            {count} <span className="text-neutral-600">({pct}%)</span>
+                          </div>
+                        </div>
+                        <div className="mt-2 h-2 rounded-full bg-neutral-900 overflow-hidden">
+                          <div
+                            className="h-full bg-white/30"
+                            style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
               <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
                 <div className="text-sm font-medium mb-3">Average rating</div>
                 <div className="grid sm:grid-cols-2 gap-2 text-sm text-neutral-300">
@@ -632,7 +790,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       <div key={x.type} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
                         <div className="text-xs text-neutral-400">{x.type}</div>
                         <div>
-                          {x.avg.toFixed(1)} <span className="text-xs text-neutral-500">({x.count} rated)</span>
+                          {x.avg.toFixed(1)}{" "}
+                          <span className="text-xs text-neutral-500">({x.count} rated)</span>
                         </div>
                       </div>
                     ))
@@ -641,36 +800,51 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   )}
                 </div>
               </div>
-
-              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-                <div className="text-sm font-medium">Total completed</div>
-                <div className="text-3xl font-semibold mt-1">{totalCompleted}</div>
-
-                <div className="text-xs text-neutral-400 mt-3">Exclude types:</div>
-                <div className="flex flex-wrap gap-2 mt-2">
-                  {(["movie", "tv", "anime", "manga", "book", "game"] as MediaType[]).map((t) => (
-                    <button
-                      key={t}
-                      type="button"
-                      onClick={() => toggleExclude(t)}
-                      className={`px-3 py-1 rounded-xl border text-xs ${
-                        excludeTypes.has(t)
-                          ? "bg-red-500/15 border-red-500/20"
-                          : "bg-white/5 border-white/10 hover:bg-white/10"
-                      }`}
-                    >
-                      {excludeTypes.has(t) ? `Excluded: ${t}` : t}
-                    </button>
-                  ))}
-                </div>
-              </div>
             </div>
 
+            {/* Tags */}
             <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-              <div className="text-sm font-medium mb-2">More stats coming next</div>
-              <div className="text-xs text-neutral-400">
-                Genre breakdown, total time watched, most watched/played, charts, etc. (Phase 3+)
-              </div>
+              <div className="text-sm font-medium mb-2">Top tags / genres</div>
+              {topTags.length ? (
+                <div className="flex flex-wrap gap-2">
+                  {topTags.map((t) => (
+                    <span
+                      key={t.tag}
+                      className="text-xs px-3 py-1 rounded-xl bg-white/5 border border-white/10"
+                      title={`${t.count} items`}
+                    >
+                      {t.tag} <span className="text-neutral-500">({t.count})</span>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-neutral-400">No tags yet. Auto-fill Movie/TV to generate genres.</div>
+              )}
+            </div>
+
+            {/* Recently completed */}
+            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+              <div className="text-sm font-medium mb-2">Recently completed</div>
+              {recentCompleted.length ? (
+                <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {recentCompleted.map((i) => (
+                    <div key={i.id} className="rounded-xl bg-neutral-950 border border-neutral-800 p-3">
+                      <div className="text-sm font-medium truncate">{i.title}</div>
+                      <div className="text-xs text-neutral-400 mt-1">
+                        {i.type}
+                        {i.dateFinished ? ` • ${i.dateFinished}` : ""}
+                        {typeof i.rating === "number" ? ` • ★ ${i.rating.toFixed(1)}` : ""}
+                        {typeof i.runtime === "number" ? ` • ${i.runtime}m` : ""}
+                      </div>
+                      {i.tags?.length ? (
+                        <div className="text-[11px] text-neutral-500 mt-2 truncate">{i.tags.join(" • ")}</div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-neutral-400">Nothing completed yet.</div>
+              )}
             </div>
           </div>
         ) : (
@@ -719,6 +893,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   <img src={form.posterUrl} alt="Poster" className="w-12 h-16 rounded-lg object-cover bg-neutral-900" />
                   <div className="text-xs text-neutral-400">
                     Poster loaded • Tags: {(form.tags || []).slice(0, 4).join(", ") || "—"}
+                    {typeof form.runtime === "number" ? ` • ${form.runtime}m` : ""}
                   </div>
                   <div className="flex-1" />
                   <button
@@ -730,6 +905,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                         tags: f.tags ?? [],
                         tmdbId: undefined,
                         tmdbType: undefined,
+                        runtime: undefined,
                       }))
                     }
                     className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
@@ -826,7 +1002,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
               />
 
-              {/* Only show board toggle on All */}
               {view === "all" ? (
                 <div className="flex items-center justify-between">
                   <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
@@ -873,12 +1048,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       <h3 className="text-sm text-neutral-400">{k}</h3>
                       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
                         {list.map((i) => (
-                          <MediaCard
-                            key={i.id}
-                            item={i}
-                            onDelete={() => removeItem(i.id)}
-                            onUpdate={(patch) => updateItem(i.id, patch)}
-                          />
+                          <MediaCard key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
                         ))}
                       </div>
                     </section>
@@ -887,12 +1057,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               ) : (
                 <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   {filtered.map((i) => (
-                    <MediaCard
-                      key={i.id}
-                      item={i}
-                      onDelete={() => removeItem(i.id)}
-                      onUpdate={(patch) => updateItem(i.id, patch)}
-                    />
+                    <MediaCard key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
                   ))}
                 </div>
               )}
@@ -935,12 +1100,7 @@ function BoardView({
         <StatusColumn key={s.id} status={s.id} title={s.label}>
           <div className="space-y-3">
             {byStatus[s.id].map((i) => (
-              <MediaCard
-                key={i.id}
-                item={i}
-                onDelete={() => onDelete(i.id)}
-                onUpdate={(patch) => onUpdate(i.id, patch)}
-              />
+              <MediaCard key={i.id} item={i} onDelete={() => onDelete(i.id)} onUpdate={(patch) => onUpdate(i.id, patch)} />
             ))}
             {!byStatus[s.id].length ? <div className="text-xs text-neutral-600 text-center py-8">Drop here</div> : null}
           </div>
@@ -967,7 +1127,7 @@ function StatusColumn({ status, title, children }: { status: Status; title: stri
   );
 }
 
-/* ================= COMPONENTS ================= */
+/* ================= CARDS + UI ================= */
 
 function MediaCard({
   item,
@@ -1027,6 +1187,7 @@ function MediaCard({
                 {item.inTheaters ? "• in theaters" : ""}
                 {item.dateFinished ? `• ${item.dateFinished}` : ""}
                 {(item.rewatchCount ?? 0) > 0 ? `• rewatch x${item.rewatchCount}` : ""}
+                {typeof item.runtime === "number" ? `• ${item.runtime}m` : ""}
                 {typeof item.rating === "number" ? `• ★ ${item.rating.toFixed(1)}` : ""}
               </div>
             </div>
@@ -1036,9 +1197,9 @@ function MediaCard({
                 e.stopPropagation();
                 onDelete();
               }}
+              onPointerDown={(e) => e.stopPropagation()}
               className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 shrink-0"
               title="Delete"
-              onPointerDown={(e) => e.stopPropagation()}
             >
               Delete
             </button>
@@ -1063,9 +1224,7 @@ function MediaCard({
           </div>
 
           {item.notes ? <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div> : null}
-          {item.tags?.length ? (
-            <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div>
-          ) : null}
+          {item.tags?.length ? <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div> : null}
         </div>
       </div>
     </article>
@@ -1206,5 +1365,26 @@ function Toggle({ label, checked, onChange }: { label: string; checked: boolean;
         />
       </button>
     </label>
+  );
+}
+
+/* ================= STATS UI HELPERS ================= */
+
+function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
+  return (
+    <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+      <div className="text-xs text-neutral-400">{title}</div>
+      <div className="text-3xl font-semibold mt-1">{value}</div>
+      {sub ? <div className="text-xs text-neutral-500 mt-2">{sub}</div> : null}
+    </div>
+  );
+}
+
+function MiniCard({ title, value }: { title: string; value: string }) {
+  return (
+    <div className="rounded-2xl bg-neutral-950 border border-neutral-800 p-4">
+      <div className="text-xs text-neutral-500">{title}</div>
+      <div className="text-2xl font-semibold mt-1">{value}</div>
+    </div>
   );
 }
