@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { supabase } from "../lib/supabaseClient";
-
 import { DndContext, DragEndEvent, useDraggable, useDroppable } from "@dnd-kit/core";
 
 /* ================= TYPES ================= */
@@ -24,16 +23,15 @@ type MediaItem = {
   rating?: number; // 0-10
   posterUrl?: string;
 
-  // Only for Movie/TV TMDB linking
+  // For "Pick something for me" (only for Movie/TV)
   tmdbId?: number;
   tmdbType?: "movie" | "tv";
 
   inTheaters?: boolean;
   dateFinished?: string; // YYYY-MM-DD
   notes?: string;
-  rewatchCount?: number;
+  rewatchCount?: number; // 0 = not a rewatch, >=1 = rewatch count
   runtime?: number;
-
   status: Status;
   tags: string[];
   createdAt: string; // ISO
@@ -75,9 +73,9 @@ function todayYMD() {
 
 function toGroupKey(mode: GroupMode, dateStr?: string) {
   if (!dateStr) return "Undated";
-  if (mode === "day") return dateStr.slice(0, 10);
-  if (mode === "month") return dateStr.slice(0, 7);
-  if (mode === "year") return dateStr.slice(0, 4);
+  if (mode === "day") return dateStr.slice(0, 10); // YYYY-MM-DD
+  if (mode === "month") return dateStr.slice(0, 7); // YYYY-MM
+  if (mode === "year") return dateStr.slice(0, 4); // YYYY
   return "All";
 }
 
@@ -134,7 +132,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [groupMode, setGroupMode] = useState<GroupMode>("month");
   const [sortMode, setSortMode] = useState<SortMode>("newest");
 
-  // Board view only makes sense on All view
+  // Board view only really matters on All
   const [boardView, setBoardView] = useState(true);
 
   const [autofillStatus, setAutofillStatus] = useState("");
@@ -167,9 +165,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     tmdbType: undefined,
   });
 
-  const isRewatch = (form.rewatchCount ?? 0) > 0;
-
-  /* ================= NAV ================= */
+  /* ================= NAV + PAGE META ================= */
 
   const nav = useMemo(
     () => [
@@ -182,6 +178,45 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     ],
     []
   );
+
+  const pageMeta: Record<StackView, { title: string; subtitle: string }> = useMemo(
+    () => ({
+      all: { title: "All", subtitle: "Everything you’ve added to Stack" },
+      completed: { title: "Completed", subtitle: "Finished movies, shows, games, and more" },
+      watching: { title: "Watching", subtitle: "Currently in progress" },
+      watchlist: { title: "Watchlist", subtitle: "Planned — for later" },
+      dropped: { title: "Dropped", subtitle: "Paused or abandoned" },
+      stats: { title: "Stats", subtitle: "Your totals, averages, and breakdowns" },
+    }),
+    []
+  );
+
+  // Phase 2: page-specific defaults (feel more MAL-like)
+  useEffect(() => {
+    if (view === "watchlist") {
+      setGroupMode("none");
+      setSortMode("title");
+      setBoardView(false);
+    } else if (view === "completed") {
+      setGroupMode("month");
+      setSortMode("newest");
+      setBoardView(false);
+    } else if (view === "watching") {
+      setGroupMode("none");
+      setSortMode("newest");
+      setBoardView(false);
+    } else if (view === "dropped") {
+      setGroupMode("none");
+      setSortMode("newest");
+      setBoardView(false);
+    } else if (view === "all") {
+      setGroupMode("month");
+      setSortMode("newest");
+      setBoardView(true);
+    } else if (view === "stats") {
+      // nothing special
+    }
+  }, [view]);
 
   /* ================= LOCAL BACKUP ================= */
 
@@ -448,7 +483,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     autofillTimer.current = window.setTimeout(async () => {
       try {
         setAutofillStatus("Searching TMDB…");
-        const tmdbType: "movie" | "tv" = type;
+        const tmdbType: "movie" | "tv" = type; // ✅ keep correct union
 
         const s = await tmdbSearch(title, tmdbType);
         const hit = s?.results?.[0];
@@ -488,6 +523,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const filtered = useMemo(() => {
     let out = items.slice();
 
+    // Route-based filtering
     if (view === "completed") out = out.filter((i) => i.status === "completed");
     if (view === "watching") out = out.filter((i) => i.status === "in_progress");
     if (view === "watchlist") out = out.filter((i) => i.status === "planned");
@@ -495,7 +531,9 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
     if (query) {
       const q = query.toLowerCase();
-      out = out.filter((i) => [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q)));
+      out = out.filter((i) =>
+        [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q))
+      );
     }
 
     out.sort((a, b) => {
@@ -559,11 +597,14 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           <div className="flex items-end justify-between gap-4">
             <div>
               <h1 className="text-3xl font-semibold">Stack</h1>
-              <p className="text-sm text-neutral-400">Your personal media website</p>
+              <p className="text-sm text-neutral-400">
+                {pageMeta[view].title} • {pageMeta[view].subtitle}
+              </p>
             </div>
             <div className="text-xs text-neutral-500">{saveStatus}</div>
           </div>
 
+          {/* Top nav */}
           <nav className="flex flex-wrap gap-2">
             {nav.map((n) => (
               <Link
@@ -579,6 +620,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           </nav>
         </header>
 
+        {/* STATS PAGE */}
         {view === "stats" ? (
           <div className="space-y-4">
             <div className="grid md:grid-cols-2 gap-4">
@@ -625,14 +667,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             </div>
 
             <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-              <div className="text-sm font-medium mb-2">More stats later</div>
+              <div className="text-sm font-medium mb-2">More stats coming next</div>
               <div className="text-xs text-neutral-400">
-                Genre breakdown, total time watched, charts, etc. (Phase 3/4)
+                Genre breakdown, total time watched, most watched/played, charts, etc. (Phase 3+)
               </div>
             </div>
           </div>
         ) : (
           <>
+            {/* Recommender */}
             <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-3">
               <div className="flex items-center gap-3">
                 <button
@@ -654,6 +697,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               ) : null}
             </div>
 
+            {/* Add */}
             <form
               onSubmit={addItem}
               className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-4"
@@ -683,6 +727,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       setForm((f) => ({
                         ...f,
                         posterUrl: "",
+                        tags: f.tags ?? [],
                         tmdbId: undefined,
                         tmdbType: undefined,
                       }))
@@ -734,6 +779,23 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 />
               </div>
 
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <Text
+                  label="Date watched (optional)"
+                  type="date"
+                  value={String(form.dateFinished || "")}
+                  onChange={(v) => setForm({ ...form, dateFinished: v })}
+                  helper="If blank: Completed auto-sets to today."
+                />
+
+                <Text
+                  label="Poster image URL (optional)"
+                  value={String(form.posterUrl || "")}
+                  onChange={(v) => setForm({ ...form, posterUrl: v })}
+                  helper="Paste any image URL, or auto-fill will set it for Movie/TV."
+                />
+              </div>
+
               <TextArea
                 label="Notes"
                 value={String(form.notes || "")}
@@ -750,11 +812,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 </button>
 
                 <div className="flex gap-3 flex-wrap">
-                  <Toggle label="Auto-fill as you type (Movie/TV)" checked={autoAutofill} onChange={setAutoAutofill} />
+                  <Toggle label="Auto-fill as you type" checked={autoAutofill} onChange={setAutoAutofill} />
                 </div>
               </div>
             </form>
 
+            {/* Search + view controls */}
             <section className="space-y-3">
               <input
                 value={query}
@@ -763,6 +826,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
               />
 
+              {/* Only show board toggle on All */}
               {view === "all" ? (
                 <div className="flex items-center justify-between">
                   <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
@@ -798,6 +862,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               </div>
             </section>
 
+            {/* List / Board */}
             <DndContext onDragEnd={handleDragEnd}>
               {view === "all" && boardView ? (
                 <BoardView items={filtered} onDelete={removeItem} onUpdate={updateItem} />
@@ -808,7 +873,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       <h3 className="text-sm text-neutral-400">{k}</h3>
                       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
                         {list.map((i) => (
-                          <MediaCard key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
+                          <MediaCard
+                            key={i.id}
+                            item={i}
+                            onDelete={() => removeItem(i.id)}
+                            onUpdate={(patch) => updateItem(i.id, patch)}
+                          />
                         ))}
                       </div>
                     </section>
@@ -817,7 +887,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               ) : (
                 <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   {filtered.map((i) => (
-                    <MediaCard key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
+                    <MediaCard
+                      key={i.id}
+                      item={i}
+                      onDelete={() => removeItem(i.id)}
+                      onUpdate={(patch) => updateItem(i.id, patch)}
+                    />
                   ))}
                 </div>
               )}
@@ -860,7 +935,12 @@ function BoardView({
         <StatusColumn key={s.id} status={s.id} title={s.label}>
           <div className="space-y-3">
             {byStatus[s.id].map((i) => (
-              <MediaCard key={i.id} item={i} onDelete={() => onDelete(i.id)} onUpdate={(patch) => onUpdate(i.id, patch)} />
+              <MediaCard
+                key={i.id}
+                item={i}
+                onDelete={() => onDelete(i.id)}
+                onUpdate={(patch) => onUpdate(i.id, patch)}
+              />
             ))}
             {!byStatus[s.id].length ? <div className="text-xs text-neutral-600 text-center py-8">Drop here</div> : null}
           </div>
@@ -887,7 +967,7 @@ function StatusColumn({ status, title, children }: { status: Status; title: stri
   );
 }
 
-/* ================= CARD ================= */
+/* ================= COMPONENTS ================= */
 
 function MediaCard({
   item,
@@ -944,7 +1024,9 @@ function MediaCard({
                   <option value="dropped">Dropped</option>
                 </select>
 
+                {item.inTheaters ? "• in theaters" : ""}
                 {item.dateFinished ? `• ${item.dateFinished}` : ""}
+                {(item.rewatchCount ?? 0) > 0 ? `• rewatch x${item.rewatchCount}` : ""}
                 {typeof item.rating === "number" ? `• ★ ${item.rating.toFixed(1)}` : ""}
               </div>
             </div>
@@ -954,9 +1036,9 @@ function MediaCard({
                 e.stopPropagation();
                 onDelete();
               }}
-              onPointerDown={(e) => e.stopPropagation()}
               className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 shrink-0"
               title="Delete"
+              onPointerDown={(e) => e.stopPropagation()}
             >
               Delete
             </button>
@@ -981,14 +1063,14 @@ function MediaCard({
           </div>
 
           {item.notes ? <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div> : null}
-          {item.tags?.length ? <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div> : null}
+          {item.tags?.length ? (
+            <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div>
+          ) : null}
         </div>
       </div>
     </article>
   );
 }
-
-/* ================= SMALL UI ================= */
 
 function Select({
   label,
@@ -1015,6 +1097,33 @@ function Select({
           </option>
         ))}
       </select>
+    </label>
+  );
+}
+
+function Text({
+  label,
+  value,
+  onChange,
+  type = "text",
+  helper,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  type?: string;
+  helper?: string;
+}) {
+  return (
+    <label className="block">
+      <div className="text-xs mb-1 text-neutral-400">{label}</div>
+      <input
+        type={type}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+      />
+      {helper ? <div className="text-[11px] text-neutral-500 mt-1">{helper}</div> : null}
     </label>
   );
 }
@@ -1078,6 +1187,7 @@ function Toggle({ label, checked, onChange }: { label: string; checked: boolean;
   return (
     <label className="flex items-center justify-between gap-3 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
       <span className="text-sm text-neutral-300">{label}</span>
+
       <button
         type="button"
         role="switch"
