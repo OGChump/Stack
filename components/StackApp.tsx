@@ -21,7 +21,8 @@ type MediaItem = {
   type: MediaType;
 
   rating?: number; // 0-10
-  posterUrl?: string;
+  posterUrl?: string; // autofill/base
+  posterOverrideUrl?: string; // user override (keeps db info intact)
 
   // TMDB fields (movie/tv only)
   tmdbId?: number;
@@ -38,14 +39,21 @@ type MediaItem = {
   dateFinished?: string; // YYYY-MM-DD
   notes?: string;
   rewatchCount?: number;
-  runtime?: number;
+  runtime?: number; // minutes (movie=full runtime; tv/anime=per-episode approx)
   status: Status;
   tags: string[];
   createdAt: string; // ISO
 
-  // Optional progress (anime/manga/books/games)
+  // Optional progress
   progressCur?: number;
   progressTotal?: number;
+
+  // optional manual override
+  progressCurOverride?: number;
+  progressTotalOverride?: number;
+
+  // ✅ FIX: you referenced this in stats but it wasn't typed
+  hoursPlayed?: number; // games (manual hours played)
 };
 
 type TmdbSearchResult = {
@@ -59,6 +67,7 @@ type TmdbDetailsResult = {
   runtime?: number | null;
   episode_run_time?: number[] | null;
   genres?: TmdbGenre[] | null;
+  number_of_episodes?: number | null;
 };
 
 type TmdbRecommendationsResult = {
@@ -77,12 +86,38 @@ type AnilistSearchResponse = {
 
 type Pick = { title: string; posterUrl?: string; tmdbId?: number; tmdbType?: "movie" | "tv" };
 
+type Suggestion = {
+  key: string; // unique key for list rendering
+  provider: "tmdb" | "igdb" | "anilist";
+  title: string;
+  subtitle?: string;
+  posterUrl?: string;
+  tags?: string[];
+  runtime?: number;
+  progressTotal?: number;
+  // ids
+  tmdbId?: number;
+  tmdbType?: "movie" | "tv";
+  igdbId?: number;
+  anilistId?: number;
+  anilistType?: "ANIME" | "MANGA";
+};
+
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
+
+const TYPE_LABEL: Record<MediaType, string> = {
+  movie: "Movie",
+  tv: "TV",
+  anime: "Anime",
+  manga: "Manga",
+  book: "Book",
+  game: "Game",
+};
 
 const STATUSES: Array<{ id: Status; label: string }> = [
   { id: "completed", label: "Completed" },
-  { id: "in_progress", label: "Watching" },
-  { id: "planned", label: "Watchlist" },
+  { id: "in_progress", label: "In Progress" },
+  { id: "planned", label: "Planned" },
   { id: "dropped", label: "Dropped" },
 ];
 
@@ -100,6 +135,87 @@ function toGroupKey(mode: GroupMode, dateStr?: string) {
   if (mode === "month") return dateStr.slice(0, 7);
   if (mode === "year") return dateStr.slice(0, 4);
   return "All";
+}
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function uniqTags(tags: string[]) {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const t of tags) {
+    const k = String(t || "").trim();
+    if (!k) continue;
+    const key = k.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(k);
+  }
+  return out;
+}
+
+function normTitle(s: string) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[\u2019']/g, "'")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+/** Levenshtein distance */
+function levenshtein(a: string, b: string) {
+  const s = a;
+  const t = b;
+  const m = s.length;
+  const n = t.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+
+  const dp = new Array(n + 1);
+  for (let j = 0; j <= n; j++) dp[j] = j;
+
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const temp = dp[j];
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + cost);
+      prev = temp;
+    }
+  }
+  return dp[n];
+}
+
+/** Similarity score 0..1 (1 = identical) */
+function similarityScore(aRaw: string, bRaw: string) {
+  const a = normTitle(aRaw);
+  const b = normTitle(bRaw);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+
+  // prefix boost for tab-to-complete
+  if (b.startsWith(a)) {
+    const prefixBoost = 0.15 * Math.min(1, a.length / Math.max(1, b.length));
+    return Math.min(1, 0.85 + prefixBoost);
+  }
+
+  const dist = levenshtein(a, b);
+  const denom = Math.max(a.length, b.length);
+  return denom ? 1 - dist / denom : 0;
+}
+
+function getMovieProgressDefaults(item: MediaItem) {
+  const total = typeof item.progressTotalOverride === "number" ? item.progressTotalOverride : item.progressTotal;
+  const cur = typeof item.progressCurOverride === "number" ? item.progressCurOverride : item.progressCur;
+
+  if (item.type !== "movie") return { cur, total };
+
+  const finalTotal = typeof total === "number" ? total : 1;
+  const finalCur = typeof cur === "number" ? cur : item.status === "completed" ? 1 : 0;
+
+  return { cur: finalCur, total: finalTotal };
 }
 
 /* ================= TMDB ================= */
@@ -142,6 +258,173 @@ async function tmdbRecommendations(id: number, type: "movie" | "tv"): Promise<Tm
   return (await res.json()) as TmdbRecommendationsResult;
 }
 
+/* ================= ANILIST GRAPHQL (for progress totals) ================= */
+
+async function anilistDetails(
+  id: number,
+  type: "ANIME" | "MANGA"
+): Promise<{
+  coverUrl?: string;
+  genres?: string[];
+  episodes?: number | null;
+  chapters?: number | null;
+  volumes?: number | null;
+}> {
+  const query = `
+    query ($id: Int, $type: MediaType) {
+      Media(id: $id, type: $type) {
+        coverImage { extraLarge large medium }
+        genres
+        episodes
+        chapters
+        volumes
+      }
+    }
+  `;
+  const res = await fetch("https://graphql.anilist.co", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ query, variables: { id, type } }),
+  });
+
+  if (!res.ok) throw new Error(`AniList details failed (${res.status}).`);
+  type AniListDetailsResponse = {
+    data?: {
+      Media?: {
+        coverImage?: { extraLarge?: string; large?: string; medium?: string };
+        genres?: string[];
+        episodes?: number | null;
+        chapters?: number | null;
+        volumes?: number | null;
+      };
+    };
+    errors?: Array<{ message: string }>;
+  };
+
+  const json: AniListDetailsResponse = await res.json();
+  const m = json?.data?.Media;
+  const coverUrl = m?.coverImage?.extraLarge || m?.coverImage?.large || m?.coverImage?.medium || undefined;
+  const genres = Array.isArray(m?.genres) ? (m.genres as string[]) : undefined;
+
+  return {
+    coverUrl,
+    genres,
+    episodes: typeof m?.episodes === "number" ? m.episodes : null,
+    chapters: typeof m?.chapters === "number" ? m.chapters : null,
+    volumes: typeof m?.volumes === "number" ? m.volumes : null,
+  };
+}
+
+// ================= RECOMMENDER HELPERS (TMDB) =================
+
+type TmdbTrendingResult = {
+  results?: Array<{ id: number; title?: string; name?: string }>;
+};
+
+function normTag(s: string) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function uniq<T>(arr: T[]) {
+  return Array.from(new Set(arr));
+}
+
+function clamp01(n: number) {
+  return Math.max(0, Math.min(1, n));
+}
+
+function computeTasteProfile(items: MediaItem[]) {
+  // Use completed items, prioritize highly-rated ones
+  const completed = items.filter((i) => i.status === "completed");
+  const rated = completed
+    .filter((i) => typeof i.rating === "number")
+    .sort((a, b) => (b.rating ?? -1) - (a.rating ?? -1));
+
+  const seeds = rated.slice(0, 12);
+
+  // Top tags (genres) weighted by rating
+  const tagScore = new Map<string, number>();
+  for (const i of seeds) {
+    const w = (i.rating ?? 0) / 10; // 0..1
+    for (const t of i.tags ?? []) {
+      const k = normTag(t);
+      if (!k) continue;
+      tagScore.set(k, (tagScore.get(k) ?? 0) + w);
+    }
+  }
+
+  const topTags = Array.from(tagScore.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 12)
+    .map(([k]) => k);
+
+  // Type preference from last ~30 items (what you’ve been consuming)
+  const recent = items.slice(0, 30);
+  const typeCounts = new Map<MediaType, number>();
+  for (const i of recent) typeCounts.set(i.type, (typeCounts.get(i.type) ?? 0) + 1);
+  const total = Math.max(1, recent.length);
+
+  const typePref: Record<MediaType, number> = {
+    movie: (typeCounts.get("movie") ?? 0) / total,
+    tv: (typeCounts.get("tv") ?? 0) / total,
+    anime: (typeCounts.get("anime") ?? 0) / total,
+    manga: (typeCounts.get("manga") ?? 0) / total,
+    book: (typeCounts.get("book") ?? 0) / total,
+    game: (typeCounts.get("game") ?? 0) / total,
+  };
+
+  return { topTags, typePref };
+}
+
+async function tmdbTrending(mediaType: "movie" | "tv"): Promise<TmdbTrendingResult> {
+  const key = process.env.NEXT_PUBLIC_TMDB_KEY;
+  if (!key) throw new Error("Missing TMDB key (NEXT_PUBLIC_TMDB_KEY).");
+
+  const url = new URL(`https://api.themoviedb.org/3/trending/${mediaType}/week`);
+  url.searchParams.set("api_key", key);
+
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`TMDB trending failed (${res.status}).`);
+  return (await res.json()) as TmdbTrendingResult;
+}
+
+function scoreCandidate(opts: { candidateTags: string[]; userTopTags: string[]; typeBoost: number }) {
+  const cand = uniq(opts.candidateTags.map(normTag)).filter(Boolean);
+  const user = uniq(opts.userTopTags.map(normTag)).filter(Boolean);
+
+  if (!cand.length || !user.length) {
+    return 0.15 + 0.35 * clamp01(opts.typeBoost);
+  }
+
+  const candSet = new Set(cand);
+  let overlap = 0;
+  for (const t of user) if (candSet.has(t)) overlap += 1;
+
+  const overlapScore = overlap / Math.max(1, Math.min(user.length, 8));
+  return 0.65 * clamp01(overlapScore) + 0.35 * clamp01(opts.typeBoost);
+}
+
+function diversifyPicks(picks: Array<Pick & { score: number; tags: string[] }>, maxPerTopTag = 2) {
+  const out: Array<Pick & { score: number; tags: string[] }> = [];
+  const tagCounts = new Map<string, number>();
+
+  for (const p of picks) {
+    const primary = normTag(p.tags?.[0] ?? "");
+    if (primary) {
+      const c = tagCounts.get(primary) ?? 0;
+      if (c >= maxPerTopTag) continue;
+      tagCounts.set(primary, c + 1);
+    }
+    out.push(p);
+    if (out.length >= 8) break;
+  }
+
+  return out.length ? out : picks.slice(0, 8);
+}
+
 /* ================= APP ================= */
 
 export default function StackApp({ view = "all" }: { view?: StackView }) {
@@ -149,7 +432,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [userId, setUserId] = useState<string | null>(null);
 
   const [query, setQuery] = useState("");
-  const [groupMode, setGroupMode] = useState<GroupMode>("none");
+  const [groupMode] = useState<GroupMode>("none");
   const [sortMode, setSortMode] = useState<SortMode>("newest");
   const [boardView, setBoardView] = useState(true);
 
@@ -166,6 +449,22 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const [excludeTypes, setExcludeTypes] = useState<Set<MediaType>>(new Set());
 
+  // Autofill UX improvements
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [showSuggest, setShowSuggest] = useState(false);
+  const [ghostTitle, setGhostTitle] = useState<string>("");
+  const [activeSuggestIdx, setActiveSuggestIdx] = useState(0);
+
+  // For "delete 0 and type" UX
+  const [ratingText, setRatingText] = useState<string>(""); // decimal ok
+  const [rewatchText, setRewatchText] = useState<string>("0"); // integer
+  const [progressCurText, setProgressCurText] = useState<string>(""); // integer
+  const [progressTotalText, setProgressTotalText] = useState<string>(""); // integer
+
+  // Manual tags editor (keeps autofilled tags but allows extras)
+  const [autoTags, setAutoTags] = useState<string[]>([]);
+  const [manualTags, setManualTags] = useState<string[]>([]);
+
   // Add form lives only on /add
   const [form, setForm] = useState<Partial<MediaItem>>({
     title: "",
@@ -177,29 +476,45 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     dateFinished: "",
     rewatchCount: 0,
     rating: undefined,
+
     posterUrl: "",
+    posterOverrideUrl: "",
+
     tmdbId: undefined,
     tmdbType: undefined,
     igdbId: undefined,
     anilistId: undefined,
     anilistType: undefined,
+
     progressCur: undefined,
     progressTotal: undefined,
   });
 
-  const isRewatch = (form.rewatchCount ?? 0) > 0;
+  // ✅ FIX: keep latest form in a ref (prevents stale status/type inside applySuggestion)
+  const formRef = useRef<Partial<MediaItem>>(form);
+  useEffect(() => {
+    formRef.current = form;
+  }, [form]);
+
+  const isRewatch = (Number(rewatchText || "0") || 0) > 0;
 
   /* ================= NAV ================= */
 
-  const nav = useMemo(
+  const navMain = useMemo(
     () => [
       { href: "/", label: "All", key: "all" as StackView },
-      { href: "/watching", label: "Currently Watching", key: "watching" as StackView },
       { href: "/completed", label: "Completed", key: "completed" as StackView },
-      { href: "/watchlist", label: "Plan to Watch", key: "watchlist" as StackView },
+      { href: "/watching", label: "In Progress", key: "watching" as StackView },
+      { href: "/watchlist", label: "Planned", key: "watchlist" as StackView },
       { href: "/dropped", label: "Dropped", key: "dropped" as StackView },
-      { href: "/stats", label: "Stats", key: "stats" as StackView },
-      { href: "/add", label: "Add", key: "add" as StackView },
+    ],
+    []
+  );
+
+  const navActions = useMemo(
+    () => [
+      { href: "/stats", label: "Stats", key: "stats" as StackView, icon: "pie" as const },
+      { href: "/add", label: "Add", key: "add" as StackView, icon: "plus" as const },
     ],
     []
   );
@@ -332,10 +647,24 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     const autoDate = status === "completed" ? todayYMD() : "";
     const finalDate = manualDate || autoDate || undefined;
 
-    const rating =
-      typeof form.rating === "number" && Number.isFinite(form.rating)
-        ? Math.max(0, Math.min(10, form.rating))
+    const ratingNum = ratingText.trim() === "" ? undefined : Number(ratingText);
+    const rating = typeof ratingNum === "number" && Number.isFinite(ratingNum) ? clamp(ratingNum, 0, 10) : undefined;
+
+    const rewatchCount = rewatchText.trim() === "" ? 0 : Math.max(0, Number(rewatchText) || 0);
+
+    const pc = progressCurText.trim() === "" ? undefined : Math.max(0, Number(progressCurText) || 0);
+    const pt = progressTotalText.trim() === "" ? undefined : Math.max(0, Number(progressTotalText) || 0);
+
+    // Progress defaults:
+    const inferredTotal = (form.type as MediaType) === "movie" ? (typeof pt === "number" ? pt : 1) : pt;
+    const inferredCur =
+      typeof pc === "number"
+        ? pc
+        : status === "completed" && typeof inferredTotal === "number"
+        ? inferredTotal
         : undefined;
+
+    const tags = uniqTags([...(autoTags ?? []), ...(manualTags ?? [])]);
 
     const item: MediaItem = {
       id: uid(),
@@ -344,25 +673,39 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       status,
       inTheaters: !!form.inTheaters,
       dateFinished: finalDate,
+
       posterUrl: (form.posterUrl || "").trim() || undefined,
+      posterOverrideUrl: (form.posterOverrideUrl || "").trim() || undefined,
+
       runtime: typeof form.runtime === "number" ? form.runtime : undefined,
       notes: (form.notes || "").trim() || undefined,
-      tags: form.tags ?? [],
-      rewatchCount: Math.max(0, Number(form.rewatchCount ?? 0) || 0),
+      tags,
+      rewatchCount,
       createdAt: new Date().toISOString(),
       rating,
+
       tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
       tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
       igdbId: typeof form.igdbId === "number" ? form.igdbId : undefined,
       anilistId: typeof form.anilistId === "number" ? form.anilistId : undefined,
       anilistType: form.anilistType === "ANIME" || form.anilistType === "MANGA" ? form.anilistType : undefined,
-      progressCur: typeof form.progressCur === "number" ? form.progressCur : undefined,
-      progressTotal: typeof form.progressTotal === "number" ? form.progressTotal : undefined,
+
+      progressCur: typeof inferredCur === "number" ? inferredCur : undefined,
+      progressTotal: typeof inferredTotal === "number" ? inferredTotal : undefined,
+
+      // hoursPlayed intentionally not set from add form right now (you can add later)
+      hoursPlayed: typeof form.hoursPlayed === "number" ? form.hoursPlayed : undefined,
     };
 
     setItems((p) => [item, ...p]);
 
+    // reset
     setAutofillStatus("");
+    setSuggestions([]);
+    setShowSuggest(false);
+    setGhostTitle("");
+    setActiveSuggestIdx(0);
+
     setForm((prev) => ({
       title: "",
       type: prev.type ?? "movie",
@@ -372,6 +715,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       notes: "",
       dateFinished: "",
       posterUrl: "",
+      posterOverrideUrl: "",
       runtime: undefined,
       rewatchCount: 0,
       rating: undefined,
@@ -382,7 +726,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       anilistType: undefined,
       progressCur: undefined,
       progressTotal: undefined,
+      hoursPlayed: undefined,
     }));
+
+    setAutoTags([]);
+    setManualTags([]);
+
+    setRatingText("");
+    setRewatchText("0");
+    setProgressCurText("");
+    setProgressTotalText("");
   }
 
   function removeItem(id: string) {
@@ -393,36 +746,54 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     setItems((prev) => prev.map((x) => (x.id === id ? { ...x, ...patch } : x)));
   }
 
-  async function pickForMe() {
+  async function pickForMe(mode: "best" | "random" = "best") {
     try {
-      setPickStatus("Finding picks…");
+      setPickStatus(mode === "random" ? "Finding something random…" : "Finding picks…");
       setPicks([]);
 
-      const liked = items
-        .filter((i) => i.tmdbId && (i.tmdbType === "movie" || i.tmdbType === "tv"))
-        .sort((a, b) => (b.rating ?? -1) - (a.rating ?? -1))
-        .slice(0, 5);
-
-      if (!liked.length) {
-        setPickStatus("Rate + auto-fill at least one Movie/TV item first.");
-        return;
-      }
-
       const existingTitles = new Set(items.map((i) => i.title.toLowerCase()));
+      const taste = computeTasteProfile(items);
+
+      const seed = items
+        .filter((i) => i.tmdbId && (i.tmdbType === "movie" || i.tmdbType === "tv") && typeof i.rating === "number")
+        .sort((a, b) => (b.rating ?? -1) - (a.rating ?? -1))
+        .slice(0, 10);
+
+      const fallbackSeed = items
+        .filter((i) => i.tmdbId && (i.tmdbType === "movie" || i.tmdbType === "tv"))
+        .slice(0, 8);
+
+      const seeds = seed.length ? seed : fallbackSeed;
+
       const pool: Array<{ title: string; tmdbId: number; tmdbType: "movie" | "tv" }> = [];
 
-      for (const i of liked) {
-        const type = i.tmdbType;
-        const tmdbId = i.tmdbId;
-        if (!type || !tmdbId) continue;
+      for (const i of seeds) {
+        const tmdbId = i.tmdbId!;
+        const tmdbType = i.tmdbType!;
+        const rec = await tmdbRecommendations(tmdbId, tmdbType);
 
-        const rec = await tmdbRecommendations(tmdbId, type);
         for (const r of rec.results ?? []) {
           const t = (r.title || r.name || "").trim();
           if (!t) continue;
           if (existingTitles.has(t.toLowerCase())) continue;
-          pool.push({ title: t, tmdbId: r.id, tmdbType: type });
+          pool.push({ title: t, tmdbId: r.id, tmdbType });
         }
+      }
+
+      const [trendMovie, trendTv] = await Promise.all([tmdbTrending("movie"), tmdbTrending("tv")]);
+
+      for (const r of trendMovie.results ?? []) {
+        const t = (r.title || r.name || "").trim();
+        if (!t) continue;
+        if (existingTitles.has(t.toLowerCase())) continue;
+        pool.push({ title: t, tmdbId: r.id, tmdbType: "movie" });
+      }
+
+      for (const r of trendTv.results ?? []) {
+        const t = (r.title || r.name || "").trim();
+        if (!t) continue;
+        if (existingTitles.has(t.toLowerCase())) continue;
+        pool.push({ title: t, tmdbId: r.id, tmdbType: "tv" });
       }
 
       const seen = new Set<string>();
@@ -433,21 +804,85 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         return true;
       });
 
-      const top = unique.slice(0, 8);
+      if (!unique.length) {
+        setPickStatus("No new picks found (try rating more items).");
+        return;
+      }
 
-      const withPosters: Pick[] = [];
-      for (const p of top) {
+      const candidates = unique.slice(0, 80);
+
+      const enriched: Array<Pick & { score: number; tags: string[] }> = [];
+
+      for (const c of candidates) {
         try {
-          const d = await tmdbDetails(p.tmdbId, p.tmdbType);
+          const d = await tmdbDetails(c.tmdbId, c.tmdbType);
           const posterUrl = d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : undefined;
-          withPosters.push({ title: p.title, tmdbId: p.tmdbId, tmdbType: p.tmdbType, posterUrl });
+          const tags = (d.genres ?? []).map((g) => g.name);
+
+          const typeBoost = c.tmdbType === "movie" ? taste.typePref.movie : taste.typePref.tv;
+
+          const score = scoreCandidate({
+            candidateTags: tags,
+            userTopTags: taste.topTags,
+            typeBoost,
+          });
+
+          enriched.push({
+            title: c.title,
+            tmdbId: c.tmdbId,
+            tmdbType: c.tmdbType,
+            posterUrl,
+            score,
+            tags,
+          });
         } catch {
-          withPosters.push({ title: p.title, tmdbId: p.tmdbId, tmdbType: p.tmdbType });
+          enriched.push({
+            title: c.title,
+            tmdbId: c.tmdbId,
+            tmdbType: c.tmdbType,
+            posterUrl: undefined,
+            score: 0.1,
+            tags: [],
+          });
         }
       }
 
-      setPicks(withPosters);
-      setPickStatus(withPosters.length ? "Here you go." : "No new picks found (try rating more items).");
+      enriched.sort((a, b) => b.score - a.score);
+
+      if (mode === "random") {
+        // ✅ FIX: weighted random (better than uniform)
+        const top = enriched.slice(0, 30);
+        const weights = top.map((x) => Math.max(0.0001, x.score));
+        const total = weights.reduce((a, b) => a + b, 0);
+
+        let r = Math.random() * total;
+        let chosen = top[top.length - 1];
+
+        for (let i = 0; i < top.length; i++) {
+          r -= weights[i];
+          if (r <= 0) {
+            chosen = top[i];
+            break;
+          }
+        }
+
+        setPicks([{ title: chosen.title, tmdbId: chosen.tmdbId, tmdbType: chosen.tmdbType, posterUrl: chosen.posterUrl }]);
+        setPickStatus("Random pick selected.");
+        return;
+      }
+
+      const diversified = diversifyPicks(enriched, 2);
+
+      setPicks(
+        diversified.map((p) => ({
+          title: p.title,
+          tmdbId: p.tmdbId,
+          tmdbType: p.tmdbType,
+          posterUrl: p.posterUrl,
+        }))
+      );
+
+      setPickStatus("Here you go.");
     } catch (e: unknown) {
       setPickStatus(e instanceof Error ? e.message : "Pick failed");
     }
@@ -480,144 +915,327 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     updateItem(itemId, { status: newStatus });
   }
 
-  /* ================= AUTO AUTOFILL (TMDB + IGDB + ANILIST) ================= */
+  /* ================= APPLY SUGGESTION ================= */
+
+  const applySuggestion = useCallback(async (s: Suggestion, opts?: { keepManualTags?: boolean }) => {
+    const keepManual = opts?.keepManualTags ?? true;
+
+    setAutofillStatus(`Applying: ${s.title}…`);
+
+    setForm((f) => {
+  const base = {
+    ...f,
+    title: s.title,
+    posterUrl: s.posterUrl || f.posterUrl,
+    runtime: typeof s.runtime === "number" ? s.runtime : f.runtime,
+  };
+
+  if (s.provider === "tmdb") {
+    return {
+      ...base,
+      tmdbId: s.tmdbId,
+      tmdbType: s.tmdbType,
+      igdbId: undefined,
+      anilistId: undefined,
+      anilistType: undefined,
+    };
+  }
+
+  if (s.provider === "igdb") {
+    return {
+      ...base,
+      igdbId: s.igdbId,
+      tmdbId: undefined,
+      tmdbType: undefined,
+      anilistId: undefined,
+      anilistType: undefined,
+    };
+  }
+
+  // anilist
+  return {
+    ...base,
+    anilistId: s.anilistId,
+    anilistType: s.anilistType,
+    tmdbId: undefined,
+    tmdbType: undefined,
+    igdbId: undefined,
+  };
+});
+
+    const newAuto = uniqTags([...(s.tags ?? [])]);
+    setAutoTags(newAuto);
+    if (!keepManual) setManualTags([]);
+
+    // ✅ FIX: use formRef (latest status/type), not stale closure
+    const currentType = (formRef.current?.type as MediaType) ?? "movie";
+    const currentStatus = (formRef.current?.status as Status) ?? "completed";
+
+    if (typeof s.progressTotal === "number" && s.progressTotal > 0) {
+      setProgressTotalText((prev) => (prev.trim() === "" ? String(s.progressTotal) : prev));
+      setProgressCurText((prev) => {
+        if (prev.trim() !== "") return prev;
+        if (currentStatus === "completed") return String(s.progressTotal);
+        return prev;
+      });
+    } else {
+      if (currentType === "movie") {
+        setProgressTotalText((prev) => (prev.trim() === "" ? "1" : prev));
+        if (currentStatus === "completed") setProgressCurText((prev) => (prev.trim() === "" ? "1" : prev));
+      }
+    }
+
+    setAutofillStatus("Auto-fill complete.");
+  }, []);
+
+  /* ================= AUTO AUTOFILL ================= */
 
   useEffect(() => {
     if (!autoAutofill) return;
-
     const title = (form.title || "").trim();
-    const type = form.type;
+    const type = form.type as MediaType;
 
-    if (!title || title.length < 2) return;
+    if (!title || title.length < 2) {
+      setSuggestions([]);
+      setGhostTitle("");
+      setShowSuggest(false);
+      setActiveSuggestIdx(0);
+      return;
+    }
 
     const key = `${type}:${title.toLowerCase()}`;
-    if (lastAutofillKey.current === key) return;
 
     if (autofillTimer.current) window.clearTimeout(autofillTimer.current);
 
     autofillTimer.current = window.setTimeout(async () => {
       try {
-        // MOVIE / TV (TMDB)
-        if (type === "movie" || type === "tv") {
-          setAutofillStatus("Searching TMDB…");
-          const tmdbType: "movie" | "tv" = type;
+        setAutofillStatus("Searching…");
 
+        const pushSuggestions = async (list: Suggestion[]) => {
+          const q = title;
+          const scored = list
+            .map((x) => ({ x, score: similarityScore(q, x.title) }))
+            .sort((a, b) => b.score - a.score);
+
+          const top = scored.map((sug) => sug.x).slice(0, 7);
+          setSuggestions(top);
+          setShowSuggest(true);
+          setActiveSuggestIdx(0);
+
+          const top1 = scored[0];
+          const bestScore = top1?.score ?? 0;
+          const best = top1?.x;
+
+          const qNorm = normTitle(q);
+          const bNorm = best ? normTitle(best.title) : "";
+          const isCompletion = !!best && bNorm.startsWith(qNorm) && qNorm.length >= 2;
+          setGhostTitle(isCompletion ? best!.title : "");
+
+          const applyKey = `${key}:${best?.provider ?? "x"}:${best?.tmdbId ?? best?.igdbId ?? best?.anilistId ?? best?.title ?? ""}`;
+          if (best && bestScore >= 0.78 && lastAutofillKey.current !== applyKey) {
+            lastAutofillKey.current = applyKey;
+            await applySuggestion(best, { keepManualTags: true });
+          } else {
+            setAutofillStatus(best ? `Suggestions ready (${Math.round(bestScore * 100)}% match).` : "No match found.");
+          }
+        };
+
+        if (type === "movie" || type === "tv") {
+          const tmdbType: "movie" | "tv" = type;
           const s = await tmdbSearch(title, tmdbType);
-          const hit = s?.results?.[0];
-          if (!hit) {
+          const results = (s?.results ?? []).slice(0, 7);
+
+          if (!results.length) {
+            setSuggestions([]);
+            setGhostTitle("");
+            setShowSuggest(false);
             setAutofillStatus("No match found on TMDB.");
             return;
           }
 
-          lastAutofillKey.current = key;
-          setAutofillStatus(`Found: ${hit.title || hit.name || "Match"}`);
+          const list: Suggestion[] = results.map((r) => {
+            const t = (r.title || r.name || "").trim();
+            return {
+              key: `tmdb:${tmdbType}:${r.id}`,
+              provider: "tmdb",
+              title: t,
+              subtitle:
+                tmdbType === "movie"
+                  ? r.release_date
+                    ? r.release_date.slice(0, 4)
+                    : ""
+                  : r.first_air_date
+                  ? r.first_air_date.slice(0, 4)
+                  : "",
+              tmdbId: r.id,
+              tmdbType,
+            };
+          });
 
-          const d = await tmdbDetails(hit.id, tmdbType);
-
-          setForm((f) => ({
-            ...f,
-            tmdbId: hit.id,
-            tmdbType,
-            igdbId: undefined,
-            anilistId: undefined,
-            anilistType: undefined,
-            posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
-            runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
-            tags: (d.genres ?? []).map((g) => g.name),
-          }));
-
-          setAutofillStatus("Auto-fill complete.");
+          await pushSuggestions(list);
           return;
         }
 
-        // GAME (IGDB via your /api/igdb/search route)
         if (type === "game") {
-          setAutofillStatus("Searching IGDB…");
-
-          const res = await fetch(`/api/igdb/search?q=${encodeURIComponent(title)}&limit=5`, { method: "GET" });
+          const res = await fetch(`/api/igdb/search?q=${encodeURIComponent(title)}&limit=7`, { method: "GET" });
           const json = (await res.json()) as IgdbSearchResponse;
 
           if (!res.ok) {
             setAutofillStatus(`IGDB error: ${json.error || "Search failed"}`);
+            setSuggestions([]);
+            setGhostTitle("");
+            setShowSuggest(false);
             return;
           }
 
-          const hit = json.results?.[0];
-          if (!hit) {
+          const results = (json.results ?? []).slice(0, 7);
+          if (!results.length) {
+            setSuggestions([]);
+            setGhostTitle("");
+            setShowSuggest(false);
             setAutofillStatus("No match found on IGDB.");
             return;
           }
 
-          lastAutofillKey.current = key;
-          setAutofillStatus(`Found: ${hit.name}`);
-
-          setForm((f) => ({
-            ...f,
-            igdbId: hit.id,
-            tmdbId: undefined,
-            tmdbType: undefined,
-            anilistId: undefined,
-            anilistType: undefined,
-            posterUrl: hit.coverUrl || f.posterUrl,
-            tags: (hit.genres && hit.genres.length ? hit.genres : f.tags) ?? [],
+          const list: Suggestion[] = results.map((r) => ({
+            key: `igdb:${r.id}`,
+            provider: "igdb",
+            title: r.name,
+            posterUrl: r.coverUrl,
+            tags: r.genres,
+            igdbId: r.id,
           }));
 
-          setAutofillStatus("Auto-fill complete.");
+          await pushSuggestions(list);
           return;
         }
 
-        // ANIME / MANGA (AniList via /api/anilist/search)
         if (type === "anime" || type === "manga") {
-          setAutofillStatus("Searching AniList…");
           const anilistType = type === "manga" ? "MANGA" : "ANIME";
-
-          const res = await fetch(
-            `/api/anilist/search?q=${encodeURIComponent(title)}&limit=5&type=${anilistType}`,
-            { method: "GET" }
-          );
+          const res = await fetch(`/api/anilist/search?q=${encodeURIComponent(title)}&limit=7&type=${anilistType}`, {
+            method: "GET",
+          });
           const json = (await res.json()) as AnilistSearchResponse;
 
           if (!res.ok) {
             setAutofillStatus(`AniList error: ${json.error || "Search failed"}`);
+            setSuggestions([]);
+            setGhostTitle("");
+            setShowSuggest(false);
             return;
           }
 
-          const hit = json.results?.[0];
-          if (!hit) {
+          const results = (json.results ?? []).slice(0, 7);
+          if (!results.length) {
+            setSuggestions([]);
+            setGhostTitle("");
+            setShowSuggest(false);
             setAutofillStatus("No match found on AniList.");
             return;
           }
 
-          lastAutofillKey.current = key;
-          setAutofillStatus(`Found: ${hit.title}`);
-
-          setForm((f) => ({
-            ...f,
-            anilistId: hit.id,
+          const list: Suggestion[] = results.map((r) => ({
+            key: `anilist:${anilistType}:${r.id}`,
+            provider: "anilist",
+            title: r.title,
+            posterUrl: r.coverUrl,
+            tags: r.genres,
+            anilistId: r.id,
             anilistType,
-            tmdbId: undefined,
-            tmdbType: undefined,
-            igdbId: undefined,
-            posterUrl: hit.coverUrl || f.posterUrl,
-            tags: (hit.genres && hit.genres.length ? hit.genres : f.tags) ?? [],
           }));
 
-          setAutofillStatus("Auto-fill complete.");
+          await pushSuggestions(list);
           return;
         }
 
-        // Other types: do nothing
-        return;
+        setAutofillStatus("");
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Unknown error";
         setAutofillStatus(`Auto-fill error: ${msg}`);
       }
-    }, 650);
+    }, 450);
 
     return () => {
       if (autofillTimer.current) window.clearTimeout(autofillTimer.current);
     };
-  }, [form.title, form.type, autoAutofill]);
+  }, [form.title, form.type, autoAutofill, applySuggestion]);
+
+  const selectSuggestion = useCallback(
+    async (s: Suggestion) => {
+      try {
+        setShowSuggest(false);
+        setGhostTitle("");
+        setAutofillStatus(`Loading details for: ${s.title}…`);
+
+        if (s.provider === "tmdb" && s.tmdbId && (s.tmdbType === "movie" || s.tmdbType === "tv")) {
+          const d = await tmdbDetails(s.tmdbId, s.tmdbType);
+
+          const posterUrl = d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : undefined;
+          const tags = (d.genres ?? []).map((g) => g.name);
+
+          let progressTotal: number | undefined;
+          if (s.tmdbType === "movie") progressTotal = 1;
+          if (s.tmdbType === "tv" && typeof d.number_of_episodes === "number" && d.number_of_episodes > 0) {
+            progressTotal = d.number_of_episodes;
+          }
+
+          await applySuggestion(
+            {
+              ...s,
+              posterUrl,
+              tags: tags.length ? tags : s.tags,
+              runtime: d.runtime ?? d.episode_run_time?.[0] ?? undefined,
+              progressTotal,
+            },
+            { keepManualTags: true }
+          );
+          return;
+        }
+
+        if (s.provider === "anilist" && s.anilistId && (s.anilistType === "ANIME" || s.anilistType === "MANGA")) {
+          const d = await anilistDetails(s.anilistId, s.anilistType);
+          const tags = d.genres?.length ? d.genres : s.tags;
+
+          let progressTotal: number | undefined;
+          if (s.anilistType === "ANIME" && typeof d.episodes === "number" && d.episodes > 0) progressTotal = d.episodes;
+          if (s.anilistType === "MANGA") {
+            if (typeof d.chapters === "number" && d.chapters > 0) progressTotal = d.chapters;
+            else if (typeof d.volumes === "number" && d.volumes > 0) progressTotal = d.volumes;
+          }
+
+          await applySuggestion(
+            {
+              ...s,
+              posterUrl: d.coverUrl || s.posterUrl,
+              tags,
+              progressTotal,
+            },
+            { keepManualTags: true }
+          );
+          return;
+        }
+
+        if (s.provider === "igdb") {
+          await applySuggestion(
+            {
+              ...s,
+              tags: s.tags,
+              posterUrl: s.posterUrl,
+              progressTotal: undefined,
+            },
+            { keepManualTags: true }
+          );
+          return;
+        }
+
+        await applySuggestion(s, { keepManualTags: true });
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "Unknown error";
+        setAutofillStatus(`Auto-fill error: ${msg}`);
+      }
+    },
+    [applySuggestion]
+  );
 
   /* ================= FILTER ================= */
 
@@ -631,9 +1249,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
     if (query) {
       const q = query.toLowerCase();
-      out = out.filter((i) =>
-        [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q))
-      );
+      out = out.filter((i) => [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q)));
     }
 
     out.sort((a, b) => {
@@ -701,12 +1317,52 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const totalRuntimeMinutesCompleted = useMemo(() => {
     let sum = 0;
+
     for (const i of items) {
       if (i.status !== "completed") continue;
       if (excludeTypes.has(i.type)) continue;
-      if (typeof i.runtime === "number" && Number.isFinite(i.runtime) && i.runtime > 0) sum += i.runtime;
+
+      // Games: use hoursPlayed if available
+      if (i.type === "game") {
+        const h = typeof i.hoursPlayed === "number" ? i.hoursPlayed : undefined;
+        if (typeof h === "number" && Number.isFinite(h) && h > 0) sum += h * 60;
+        continue;
+      }
+
+      // Movie: runtime is full runtime
+      if (i.type === "movie") {
+        if (typeof i.runtime === "number" && Number.isFinite(i.runtime) && i.runtime > 0) sum += i.runtime;
+        continue;
+      }
+
+      // TV/Anime: runtime is minutes per episode (approx)
+      if (i.type === "tv" || i.type === "anime") {
+        const perEp = typeof i.runtime === "number" && i.runtime > 0 ? i.runtime : 0;
+
+        const cur =
+          typeof i.progressCurOverride === "number"
+            ? i.progressCurOverride
+            : typeof i.progressCur === "number"
+            ? i.progressCur
+            : undefined;
+
+        const total =
+          typeof i.progressTotalOverride === "number"
+            ? i.progressTotalOverride
+            : typeof i.progressTotal === "number"
+            ? i.progressTotal
+            : undefined;
+
+        const episodes = typeof cur === "number" ? cur : typeof total === "number" ? total : 0;
+
+        if (perEp > 0 && episodes > 0) sum += perEp * episodes;
+        continue;
+      }
+
+      // Everything else: ignore for watched time (for now)
     }
-    return sum;
+
+    return Math.round(sum);
   }, [items, excludeTypes]);
 
   const rewatchTotals = useMemo(() => {
@@ -726,6 +1382,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     const map = new Map<string, number>();
     for (const i of items) {
       if (i.status !== "completed") continue;
+      if (excludeTypes.has(i.type)) continue;
+
       for (const t of i.tags ?? []) {
         const k = String(t || "").trim();
         if (!k) continue;
@@ -736,7 +1394,25 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       .map(([tag, count]) => ({ tag, count }))
       .sort((a, b) => b.count - a.count)
       .slice(0, 12);
-  }, [items]);
+  }, [items, excludeTypes]);
+
+  const genreCounts = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const i of items) {
+      if (i.status !== "completed") continue;
+      if (excludeTypes.has(i.type)) continue;
+
+      for (const t of i.tags ?? []) {
+        const k = String(t || "").trim();
+        if (!k) continue;
+        map.set(k, (map.get(k) ?? 0) + 1);
+      }
+    }
+    return Array.from(map.entries())
+      .map(([label, value]) => ({ label, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 8);
+  }, [items, excludeTypes]);
 
   const monthlyCompleted = useMemo(() => {
     const now = new Date();
@@ -770,8 +1446,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   /* ================= UI ================= */
 
+  const displayCombinedTags = useMemo(() => {
+    return uniqTags([...(autoTags ?? []), ...(manualTags ?? [])]);
+  }, [autoTags, manualTags]);
+
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100">
+    <div className="min-h-screen text-neutral-100 bg-black">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-6">
         {/* Header */}
         <header className="space-y-3">
@@ -783,21 +1463,40 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             <div className="text-xs text-neutral-500">{saveStatus}</div>
           </div>
 
-          {/* Centered tabs */}
           <nav className="flex justify-center">
-            <div className="inline-flex flex-wrap justify-center gap-2 rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/80 px-2 py-2">
-              {nav.map((n) => (
-                <Link
-                  key={n.href}
-                  href={n.href}
-                  className={[
-                    "px-3 py-2 rounded-xl border text-sm transition",
-                    view === n.key ? "bg-white/15 border-white/20" : "bg-white/5 border-white/10 hover:bg-white/10",
-                  ].join(" ")}
-                >
-                  {n.label}
-                </Link>
-              ))}
+            <div className="flex items-center gap-2">
+              <div className="inline-flex flex-wrap justify-center gap-2 rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/80 px-2 py-2">
+                {navMain.map((n) => (
+                  <Link
+                    key={n.href}
+                    href={n.href}
+                    className={[
+                      "px-3 py-2 rounded-xl border text-sm transition",
+                      view === n.key ? "bg-white/15 border-white/20" : "bg-white/5 border-white/10 hover:bg-white/10",
+                    ].join(" ")}
+                  >
+                    {n.label}
+                  </Link>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-2">
+                {navActions.map((n) => (
+                  <Link
+                    key={n.href}
+                    href={n.href}
+                    title={n.label}
+                    aria-label={n.label}
+                    className={[
+                      "h-11 w-11 grid place-items-center rounded-2xl border transition",
+                      "bg-neutral-900/40 ring-1 ring-neutral-800/80",
+                      view === n.key ? "bg-white/15 border-white/20" : "bg-white/5 border-white/10 hover:bg-white/10",
+                    ].join(" ")}
+                  >
+                    {n.icon === "plus" ? <span className="text-xl leading-none">+</span> : <span className="text-lg leading-none">◔</span>}
+                  </Link>
+                ))}
+              </div>
             </div>
           </nav>
         </header>
@@ -810,8 +1509,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               <StatCard title="Completed" value={totalCompleted.toString()} sub="(after excludes)" />
               <StatCard
                 title="Time watched (runtime)"
-                value={`${Math.floor(totalRuntimeMinutesCompleted / 60)}h`}
-                sub={`${totalRuntimeMinutesCompleted} min tracked`}
+                value={`${(totalRuntimeMinutesCompleted / 60).toFixed(1)}h`}
+                sub={`${totalRuntimeMinutesCompleted} min (movies exact; TV/anime estimated; games use hours played)`}
               />
               <StatCard title="Rewatches" value={`${rewatchTotals.rewatches}`} sub={`${rewatchTotals.itemsRewatched} items`} />
             </div>
@@ -821,12 +1520,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 <div className="text-sm font-medium mb-3">Status breakdown</div>
                 <div className="space-y-2 text-sm">
                   <BarRow label="Completed" value={statusCounts.completed} total={items.length || 1} />
-                  <BarRow label="Watching" value={statusCounts.in_progress} total={items.length || 1} />
-                  <BarRow label="Watchlist" value={statusCounts.planned} total={items.length || 1} />
+                  <BarRow label="In Progress" value={statusCounts.in_progress} total={items.length || 1} />
+                  <BarRow label="Planned" value={statusCounts.planned} total={items.length || 1} />
                   <BarRow label="Dropped" value={statusCounts.dropped} total={items.length || 1} />
                 </div>
 
-                <div className="text-xs text-neutral-400 mt-4">Exclude types (affects some stats):</div>
+                <div className="text-xs text-neutral-400 mt-4">Exclude types (affects stats):</div>
                 <div className="flex flex-wrap gap-2 mt-2">
                   {(["movie", "tv", "anime", "manga", "book", "game"] as MediaType[]).map((t) => (
                     <button
@@ -834,12 +1533,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       type="button"
                       onClick={() => toggleExclude(t)}
                       className={`px-3 py-1 rounded-xl border text-xs ${
-                        excludeTypes.has(t)
-                          ? "bg-red-500/15 border-red-500/20"
-                          : "bg-white/5 border-white/10 hover:bg-white/10"
+                        excludeTypes.has(t) ? "bg-red-500/15 border-red-500/20" : "bg-white/5 border-white/10 hover:bg-white/10"
                       }`}
                     >
-                      {excludeTypes.has(t) ? `Excluded: ${t}` : t}
+                      {excludeTypes.has(t) ? `Excluded: ${TYPE_LABEL[t]}` : TYPE_LABEL[t]}
                     </button>
                   ))}
                 </div>
@@ -854,7 +1551,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                         key={x.type}
                         className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2"
                       >
-                        <div className="text-sm text-neutral-200">{x.type}</div>
+                        <div className="text-sm text-neutral-200">{TYPE_LABEL[x.type]}</div>
                         <div className="text-sm text-neutral-300">{x.count}</div>
                       </div>
                     ))
@@ -872,7 +1569,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   {avgByType.length ? (
                     avgByType.map((x) => (
                       <div key={x.type} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
-                        <div className="text-xs text-neutral-400">{x.type}</div>
+                        <div className="text-xs text-neutral-400">{TYPE_LABEL[x.type]}</div>
                         <div>
                           {x.avg.toFixed(1)} <span className="text-xs text-neutral-500">({x.count} rated)</span>
                         </div>
@@ -907,32 +1604,53 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               </div>
             </div>
 
-            <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-              <div className="text-sm font-medium mb-3">Top tags / genres (completed)</div>
-
-              {topTags.length ? (
-                <div className="flex flex-wrap gap-2">
-                  {topTags.map((t) => (
-                    <div
-                      key={t.tag}
-                      className="px-3 py-1 rounded-xl bg-neutral-950 border border-neutral-800 text-xs text-neutral-200"
-                      title={`${t.count} items`}
-                    >
-                      {t.tag} <span className="text-neutral-500">({t.count})</span>
+            <div className="grid lg:grid-cols-2 gap-4">
+              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+                <div className="text-sm font-medium mb-3">Genres (completed)</div>
+                {genreCounts.length ? (
+                  <div className="flex items-center gap-6">
+                    <PieChartSimple data={genreCounts} />
+                    <div className="space-y-2 text-sm w-full">
+                      {genreCounts.map((g) => (
+                        <div key={g.label} className="flex items-center justify-between gap-6">
+                          <div className="text-neutral-300 truncate">{g.label}</div>
+                          <div className="text-neutral-400">{g.value}</div>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-xs text-neutral-400">No tags yet (auto-fill adds genres for Movie/TV/Game/Anime/Manga).</div>
-              )}
+                  </div>
+                ) : (
+                  <div className="text-xs text-neutral-400">No genres yet.</div>
+                )}
+              </div>
+
+              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+                <div className="text-sm font-medium mb-3">Top tags / genres (completed)</div>
+
+                {topTags.length ? (
+                  <div className="flex flex-wrap gap-2">
+                    {topTags.map((t) => (
+                      <div
+                        key={t.tag}
+                        className="px-3 py-1 rounded-xl bg-neutral-950 border border-neutral-800 text-xs text-neutral-200"
+                        title={`${t.count} items`}
+                      >
+                        {t.tag} <span className="text-neutral-500">({t.count})</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-xs text-neutral-400">No tags yet (auto-fill adds genres for Movie/TV/Game/Anime/Manga).</div>
+                )}
+              </div>
             </div>
           </div>
         ) : null}
 
-        {/* ADD PAGE WITH LEFT/RIGHT MASCOTS + PICK AT BOTTOM + COVER RESULTS */}
+        {/* ADD PAGE */}
         {view === "add" ? (
-          <div className="relative overflow-hidden rounded-3xl ring-1 ring-neutral-800/70 bg-neutral-900/25">
-            {/* side “curtains” */}
+          <div className="relative overflow-hidden rounded-3xl ring-1 ring-neutral-800/70 bg-[#2a2f8f]/40">
+            {/* side curtains */}
             <div className="absolute inset-0 pointer-events-none">
               <div className="absolute inset-y-0 left-0 w-[18%] bg-[#2a2f8f]/90" />
               <div className="absolute inset-y-0 right-0 w-[18%] bg-[#2a2f8f]/90" />
@@ -943,56 +1661,136 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             {/* mascots */}
             <div className="absolute inset-y-0 left-0 w-[18%] hidden md:flex items-center justify-center pointer-events-none">
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/mascot-left.png"
-                alt="Mascot left"
-                className="max-h-[520px] w-auto object-contain opacity-95 drop-shadow-2xl"
-              />
+              <img src="/mascot-left.png" alt="Mascot left" className="max-h-[520px] w-auto object-contain opacity-95 drop-shadow-2xl" />
             </div>
             <div className="absolute inset-y-0 right-0 w-[18%] hidden md:flex items-center justify-center pointer-events-none">
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/mascot-right.png"
-                alt="Mascot right"
-                className="max-h-[520px] w-auto object-contain opacity-95 drop-shadow-2xl"
-              />
+              <img src="/mascot-right.png" alt="Mascot right" className="max-h-[520px] w-auto object-contain opacity-95 drop-shadow-2xl" />
             </div>
 
             {/* center content */}
             <div className="relative px-4 sm:px-6 py-6 md:px-10 md:py-10 mx-auto max-w-3xl space-y-4">
               <div className="text-center">
                 <div className="text-2xl font-semibold tracking-tight">Add to Stack</div>
-                <div className="text-sm text-neutral-400 mt-1">
+                <div className="text-sm text-neutral-200/70 mt-1">
                   Auto-fill: Movie/TV (TMDB) • Game (IGDB) • Anime/Manga (AniList). Everything else manual.
                 </div>
               </div>
 
-              <form
-                onSubmit={addItem}
-                className="bg-neutral-950/40 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-4"
-              >
-                <div className="flex gap-2">
-                  <input
-                    value={form.title || ""}
-                    onChange={(e) => setForm({ ...form, title: e.target.value })}
-                    placeholder="Title"
-                    className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
-                  />
+              <form onSubmit={addItem} className="bg-neutral-950/40 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-4">
+                <div className="space-y-2">
+                  <div className="relative">
+                    {ghostTitle && normTitle(ghostTitle).startsWith(normTitle(String(form.title || ""))) ? (
+                      <div className="absolute inset-0 pointer-events-none flex items-center px-3 py-2">
+                        <span className="text-transparent select-none">{String(form.title || "")}</span>
+                        <span className="text-neutral-500/60 select-none">{ghostTitle.slice(String(form.title || "").length)}</span>
+                      </div>
+                    ) : null}
+
+                    <input
+                      value={form.title || ""}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setForm({ ...form, title: v });
+                        setShowSuggest(true);
+                      }}
+                      onFocus={() => setShowSuggest(true)}
+                      onBlur={() => {
+                        window.setTimeout(() => setShowSuggest(false), 120);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Tab" && ghostTitle) {
+                          e.preventDefault();
+                          setForm((f) => ({ ...f, title: ghostTitle }));
+                          setGhostTitle("");
+                          setShowSuggest(false);
+                          const best = suggestions[0];
+                          if (best) selectSuggestion(best);
+                          return;
+                        }
+
+                        if (showSuggest && suggestions.length) {
+                          if (e.key === "ArrowDown") {
+                            e.preventDefault();
+                            setActiveSuggestIdx((i) => Math.min(suggestions.length - 1, i + 1));
+                            return;
+                          }
+                          if (e.key === "ArrowUp") {
+                            e.preventDefault();
+                            setActiveSuggestIdx((i) => Math.max(0, i - 1));
+                            return;
+                          }
+                          if (e.key === "Enter") {
+                            if (activeSuggestIdx >= 0 && activeSuggestIdx < suggestions.length) {
+                              const s = suggestions[activeSuggestIdx];
+                              if (s) {
+                                e.preventDefault();
+                                selectSuggestion(s);
+                              }
+                            }
+                            return;
+                          }
+                          if (e.key === "Escape") {
+                            setShowSuggest(false);
+                            return;
+                          }
+                        }
+                      }}
+                      placeholder="Title"
+                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+                    />
+
+                    {showSuggest && suggestions.length ? (
+                      <div className="absolute z-30 mt-2 w-full rounded-2xl border border-neutral-800 bg-neutral-950 shadow-xl overflow-hidden">
+                        <div className="px-3 py-2 text-[11px] text-neutral-500 border-b border-neutral-800">
+                          Suggestions (↑/↓ + Enter) • Tab accepts ghost preview
+                        </div>
+                        <div className="max-h-64 overflow-auto">
+                          {suggestions.map((s, idx) => (
+                            <button
+                              type="button"
+                              key={s.key}
+                              onMouseDown={(ev) => ev.preventDefault()}
+                              onClick={() => selectSuggestion(s)}
+                              className={[
+                                "w-full text-left px-3 py-2 flex items-center gap-3 border-b border-neutral-900/60",
+                                idx === activeSuggestIdx ? "bg-white/10" : "hover:bg-white/5",
+                              ].join(" ")}
+                            >
+                              <div className="w-8 h-10 rounded-lg bg-neutral-900 border border-neutral-800 overflow-hidden shrink-0">
+                                {s.posterUrl ? (
+                                  // eslint-disable-next-line @next/next/no-img-element
+                                  <img src={s.posterUrl} alt="" className="w-full h-full object-cover" />
+                                ) : (
+                                  <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">—</div>
+                                )}
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="text-sm text-neutral-200 truncate">{s.title}</div>
+                                <div className="text-[11px] text-neutral-500">
+                                  {s.provider.toUpperCase()}
+                                  {s.subtitle ? ` • ${s.subtitle}` : ""}
+                                </div>
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  {autofillStatus ? <div className="text-xs text-neutral-300">{autofillStatus}</div> : null}
                 </div>
 
-                {autofillStatus ? <div className="text-xs text-neutral-400">{autofillStatus}</div> : null}
-
-                {form.posterUrl ? (
+                {((form.posterOverrideUrl || "").trim() || (form.posterUrl || "").trim()) ? (
                   <div className="flex items-center gap-3 rounded-2xl bg-neutral-950 border border-neutral-800 p-3">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
-                      src={form.posterUrl}
+                      src={((form.posterOverrideUrl || "").trim() || (form.posterUrl || "").trim()) as string}
                       alt="Poster"
                       className="w-12 h-16 rounded-lg object-cover bg-neutral-900"
                     />
-                    <div className="text-xs text-neutral-400">
-                      Cover loaded • Tags: {(form.tags || []).slice(0, 4).join(", ") || "—"}
-                    </div>
+                    <div className="text-xs text-neutral-400">Cover loaded • Tags: {displayCombinedTags.slice(0, 4).join(", ") || "—"}</div>
                     <div className="flex-1" />
                     <button
                       type="button"
@@ -1000,12 +1798,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                         setForm((f) => ({
                           ...f,
                           posterUrl: "",
-                          tags: f.tags ?? [],
-                          tmdbId: undefined,
-                          tmdbType: undefined,
-                          igdbId: undefined,
-                          anilistId: undefined,
-                          anilistType: undefined,
+                          posterOverrideUrl: "",
                         }))
                       }
                       className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
@@ -1019,7 +1812,11 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   <Select
                     label="Type"
                     value={form.type || "movie"}
-                    onChange={(v) =>
+                    onChange={(v) => {
+                      setSuggestions([]);
+                      setGhostTitle("");
+                      setActiveSuggestIdx(0);
+
                       setForm({
                         ...form,
                         type: v as MediaType,
@@ -1028,8 +1825,19 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                         igdbId: undefined,
                         anilistId: undefined,
                         anilistType: undefined,
-                      })
-                    }
+                        posterUrl: "",
+                        runtime: undefined,
+                      });
+
+                      setAutoTags([]);
+                      setAutofillStatus("");
+
+                      setProgressTotalText((prev) => {
+                        const nextType = v as MediaType;
+                        if (nextType === "movie") return prev.trim() === "" ? "1" : prev;
+                        return prev;
+                      });
+                    }}
                     options={[
                       { value: "movie", label: "Movie" },
                       { value: "tv", label: "TV" },
@@ -1046,37 +1854,47 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                     onChange={(v) => setForm({ ...form, status: v as Status })}
                     options={[
                       { value: "completed", label: "Completed" },
-                      { value: "planned", label: "Watchlist / Plan to Watch" },
-                      { value: "in_progress", label: "Watching" },
+                      { value: "in_progress", label: "In Progress" },
+                      { value: "planned", label: "Planned" },
                       { value: "dropped", label: "Dropped" },
                     ]}
                   />
 
-                  <NumInput
+                  <TextNumberInput
                     label="Rating (0–10)"
-                    value={typeof form.rating === "number" ? form.rating : 0}
-                    onChange={(n) =>
-                      setForm((f) => ({
-                        ...f,
-                        rating: Number.isFinite(n) ? Math.max(0, Math.min(10, Number(n))) : undefined,
-                      }))
-                    }
-                    min={0}
+                    value={ratingText}
+                    onChange={setRatingText}
+                    placeholder="—"
+                    pattern={/^\d{0,2}(\.\d{0,1})?$/}
+                    helper="Rate the show."
                   />
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <NumInput
+                  <TextNumberInput
                     label="Progress current (optional)"
-                    value={Number(form.progressCur ?? 0)}
-                    onChange={(n) => setForm((f) => ({ ...f, progressCur: Math.max(0, Number(n ?? 0) || 0) }))}
-                    min={0}
+                    value={progressCurText}
+                    onChange={setProgressCurText}
+                    placeholder="—"
+                    pattern={/^\d{0,6}$/}
                   />
-                  <NumInput
+                  <TextNumberInput
                     label="Progress total (optional)"
-                    value={Number(form.progressTotal ?? 0)}
-                    onChange={(n) => setForm((f) => ({ ...f, progressTotal: Math.max(0, Number(n ?? 0) || 0) }))}
-                    min={0}
+                    value={progressTotalText}
+                    onChange={setProgressTotalText}
+                    placeholder={form.type === "movie" ? "1" : "—"}
+                    pattern={/^\d{0,6}$/}
+                    helper={
+                      form.type === "movie"
+                        ? "Movies default to 1 total if left blank."
+                        : form.type === "tv"
+                        ? "Auto-fill tries to set episode count."
+                        : form.type === "anime"
+                        ? "Auto-fill tries to set episodes."
+                        : form.type === "manga"
+                        ? "Auto-fill tries chapters (or volumes)."
+                        : undefined
+                    }
                   />
                 </div>
 
@@ -1089,36 +1907,43 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                     helper="If blank: Completed auto-sets to today."
                   />
 
-                  <Text
-                    label="Cover image URL (optional)"
-                    value={String(form.posterUrl || "")}
-                    onChange={(v) => setForm({ ...form, posterUrl: v })}
-                    helper="Paste any image URL, or auto-fill sets it for Movie/TV/Game/Anime/Manga."
-                  />
+                  {String(form.title || "").trim().length > 0 ? (
+                    <Text
+                      label="Cover image URL (optional)"
+                      value={String(form.posterOverrideUrl || "")}
+                      onChange={(v) => setForm({ ...form, posterOverrideUrl: v })}
+                      helper="Overrides auto-filled cover."
+                    />
+                  ) : null}
                 </div>
 
+                <TagEditor
+                  autoTags={autoTags}
+                  manualTags={manualTags}
+                  onChangeManual={setManualTags}
+                  helper="Auto-filled genres show below; add your own tags too."
+                />
+
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <Toggle
-                    label="In theaters"
-                    checked={!!form.inTheaters}
-                    onChange={(v) => setForm({ ...form, inTheaters: v })}
-                  />
+                  <Toggle label="In theaters" checked={!!form.inTheaters} onChange={(v) => setForm({ ...form, inTheaters: v })} />
 
                   <Toggle
                     label="Rewatch"
                     checked={isRewatch}
                     onChange={(v) => {
-                      if (v) setForm((f) => ({ ...f, rewatchCount: Math.max(1, Number(f.rewatchCount ?? 1) || 1) }));
-                      else setForm((f) => ({ ...f, rewatchCount: 0 }));
+                      if (v) setRewatchText((prev) => (prev.trim() === "" || Number(prev) === 0 ? "1" : prev));
+                      else setRewatchText("0");
                     }}
                   />
 
-                  <NumInput
+                  <TextNumberInput
                     label="Count"
-                    value={Number(form.rewatchCount ?? 0)}
-                    onChange={(n) => setForm((f) => ({ ...f, rewatchCount: Math.max(0, Number(n ?? 0) || 0) }))}
+                    value={rewatchText}
+                    onChange={setRewatchText}
+                    placeholder="0"
+                    pattern={/^\d{0,3}$/}
                     disabled={!isRewatch}
-                    min={0}
+                    helper="You can clear this field and type normally."
                   />
                 </div>
 
@@ -1143,16 +1968,29 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 </div>
               </form>
 
-              {/* PICK SECTION (BOTTOM) */}
+              {/* PICK SECTION */}
               <div className="bg-neutral-950/40 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-3">
-                <div className="flex items-center gap-3 flex-wrap">
-                  <button
-                    type="button"
-                    onClick={pickForMe}
-                    className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-                  >
-                    Pick something for me
-                  </button>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => pickForMe("best")}
+                      className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+                    >
+                      Pick something for me
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => pickForMe("random")}
+                      title="Random"
+                      aria-label="Random"
+                      className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+                    >
+                      🎲
+                    </button>
+                  </div>
+
                   <div className="text-xs text-neutral-400">{pickStatus}</div>
                 </div>
 
@@ -1165,9 +2003,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                             // eslint-disable-next-line @next/next/no-img-element
                             <img src={p.posterUrl} alt={p.title} className="w-full h-full object-cover" />
                           ) : (
-                            <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">
-                              No cover
-                            </div>
+                            <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">No cover</div>
                           )}
                         </div>
                         <div className="text-xs text-neutral-200 line-clamp-2">{p.title}</div>
@@ -1222,12 +2058,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       <h3 className="text-sm text-neutral-400">{k}</h3>
                       <div className="space-y-3">
                         {list.map((i) => (
-                          <MALRow
-                            key={i.id}
-                            item={i}
-                            onDelete={() => removeItem(i.id)}
-                            onUpdate={(patch) => updateItem(i.id, patch)}
-                          />
+                          <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
                         ))}
                       </div>
                     </section>
@@ -1244,12 +2075,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   </div>
 
                   {filtered.map((i) => (
-                    <MALRow
-                      key={i.id}
-                      item={i}
-                      onDelete={() => removeItem(i.id)}
-                      onUpdate={(patch) => updateItem(i.id, patch)}
-                    />
+                    <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
                   ))}
                 </div>
               )}
@@ -1324,26 +2150,57 @@ function MALRow({
   onDelete: () => void;
   onUpdate: (patch: Partial<MediaItem>) => void;
 }) {
-  const progressText =
-    typeof item.progressCur === "number" || typeof item.progressTotal === "number"
-      ? `${item.progressCur ?? 0} / ${item.progressTotal ?? "—"}`
-      : "—";
+  const displayPoster = item.posterOverrideUrl || item.posterUrl;
+
+  const movieProg = getMovieProgressDefaults(item);
+  const cur =
+    item.type === "movie"
+      ? movieProg.cur
+      : typeof item.progressCurOverride === "number"
+      ? item.progressCurOverride
+      : item.progressCur;
+  const total =
+    item.type === "movie"
+      ? movieProg.total
+      : typeof item.progressTotalOverride === "number"
+      ? item.progressTotalOverride
+      : item.progressTotal;
+
+  const hasCur = typeof cur === "number";
+  const hasTotal = typeof total === "number";
+
+  const progressText = hasCur || hasTotal ? (hasTotal ? `${cur ?? 0} / ${total}` : `${cur ?? 0}`) : "—";
+
+  const incCur = () => {
+    const base = typeof item.progressCur === "number" ? item.progressCur : 0;
+    const t = typeof total === "number" ? total : undefined;
+    const next = t ? Math.min(t, base + 1) : base + 1;
+    if (item.type === "movie") return onUpdate({ progressCur: Math.min(1, next), progressTotal: 1 });
+    onUpdate({ progressCur: next });
+  };
+
+  const decCur = () => {
+    const base = typeof item.progressCur === "number" ? item.progressCur : 0;
+    const next = Math.max(0, base - 1);
+    if (item.type === "movie") return onUpdate({ progressCur: Math.min(1, next), progressTotal: 1 });
+    onUpdate({ progressCur: next });
+  };
 
   return (
     <div className="rounded-2xl bg-neutral-900/50 ring-1 ring-neutral-800/80 overflow-hidden">
       <div className="grid grid-cols-1 sm:grid-cols-[72px_1fr_90px_90px_120px] gap-3 p-3 items-center">
         <div className="w-[72px] h-[96px] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
-          {item.posterUrl ? (
+          {displayPoster ? (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={item.posterUrl} alt={item.title} className="w-full h-full object-cover" />
+            <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
           ) : (
             <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">No cover</div>
           )}
         </div>
 
         <div className="min-w-0">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0 flex-1">
               <div className="font-semibold truncate">{item.title}</div>
               <div className="text-xs text-neutral-400 mt-1">
                 Status:{" "}
@@ -1353,17 +2210,15 @@ function MALRow({
                   className="ml-1 rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
                 >
                   <option value="completed">Completed</option>
-                  <option value="in_progress">Watching</option>
-                  <option value="planned">Watchlist</option>
+                  <option value="in_progress">In Progress</option>
+                  <option value="planned">Planned</option>
                   <option value="dropped">Dropped</option>
                 </select>
                 {item.dateFinished ? <span className="ml-2 text-neutral-500">• {item.dateFinished}</span> : null}
               </div>
 
               {item.notes ? <div className="text-xs text-neutral-300 mt-2 line-clamp-2">{item.notes}</div> : null}
-              {item.tags?.length ? (
-                <div className="text-[11px] text-neutral-500 mt-1 truncate">{item.tags.join(" • ")}</div>
-              ) : null}
+              {item.tags?.length ? <div className="text-[11px] text-neutral-500 mt-1 truncate">{item.tags.join(" • ")}</div> : null}
             </div>
 
             <button
@@ -1385,32 +2240,67 @@ function MALRow({
             onChange={(e) => {
               const v = e.target.value;
               if (v === "") onUpdate({ rating: undefined });
-              else onUpdate({ rating: Math.max(0, Math.min(10, Number(v))) });
-            }}
-            className="w-16 text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+              else onUpdate({ rating: clamp(Number(v), 0, 10) });
+                          }}
+            className="w-16 text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-sm outline-none focus:border-neutral-500"
             placeholder="—"
           />
+          <div className="text-[11px] text-neutral-500 mt-1">/ 10</div>
         </div>
 
-        <div className="text-center text-sm text-neutral-300">{item.type}</div>
+        <div className="text-center text-sm text-neutral-300">{TYPE_LABEL[item.type]}</div>
 
         <div className="text-center">
-          <div className="text-sm text-neutral-200">{progressText}</div>
-          <div className="mt-1 flex justify-center gap-2">
+          <div className="inline-flex items-center gap-2">
             <button
               type="button"
-              onClick={() => onUpdate({ progressCur: Math.max(0, (item.progressCur ?? 0) - 1) })}
-              className="text-xs px-2 py-1 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
+              onClick={decCur}
+              className="h-8 w-8 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
+              aria-label="Decrease progress"
+              title="Decrease progress"
             >
-              -
+              −
             </button>
+
+            <div className="min-w-[76px] text-sm text-neutral-200 tabular-nums">{progressText}</div>
+
             <button
               type="button"
-              onClick={() => onUpdate({ progressCur: (item.progressCur ?? 0) + 1 })}
-              className="text-xs px-2 py-1 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
+              onClick={incCur}
+              className="h-8 w-8 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
+              aria-label="Increase progress"
+              title="Increase progress"
             >
               +
             </button>
+          </div>
+
+          {/* Optional quick edit for total */}
+          <div className="mt-2 flex items-center justify-center gap-2">
+            <span className="text-[11px] text-neutral-500">Total</span>
+            <input
+              type="number"
+              min={0}
+              value={
+                item.type === "movie"
+                  ? 1
+                  : typeof item.progressTotalOverride === "number"
+                  ? item.progressTotalOverride
+                  : typeof item.progressTotal === "number"
+                  ? item.progressTotal
+                  : ""
+              }
+              onChange={(e) => {
+                if (item.type === "movie") return;
+                const v = e.target.value;
+                if (v === "") return onUpdate({ progressTotal: undefined, progressTotalOverride: undefined });
+                const n = Math.max(0, Number(v) || 0);
+                // store in override to preserve autofilled base
+                onUpdate({ progressTotalOverride: n });
+              }}
+              className="w-20 text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+              placeholder="—"
+            />
           </div>
         </div>
       </div>
@@ -1418,7 +2308,7 @@ function MALRow({
   );
 }
 
-/* ================= DRAG CARD ================= */
+/* ================= DRAGGABLE CARD (BOARD) ================= */
 
 function CardDraggable({
   item,
@@ -1431,95 +2321,165 @@ function CardDraggable({
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: item.id });
 
-  const style = transform ? { transform: `translate(${transform.x}px, ${transform.y}px)` } : undefined;
+  const style: React.CSSProperties = transform
+    ? {
+        transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`,
+      }
+    : {};
+
+  const displayPoster = item.posterOverrideUrl || item.posterUrl;
+
+  const movieProg = getMovieProgressDefaults(item);
+  const cur =
+    item.type === "movie"
+      ? movieProg.cur
+      : typeof item.progressCurOverride === "number"
+      ? item.progressCurOverride
+      : item.progressCur;
+  const total =
+    item.type === "movie"
+      ? movieProg.total
+      : typeof item.progressTotalOverride === "number"
+      ? item.progressTotalOverride
+      : item.progressTotal;
+
+  const progressText =
+    typeof cur === "number" || typeof total === "number"
+      ? typeof total === "number"
+        ? `${cur ?? 0} / ${total}`
+        : `${cur ?? 0}`
+      : "—";
 
   return (
-    <article
+    <div
       ref={setNodeRef}
       style={style}
-      {...listeners}
-      {...attributes}
       className={[
-        "bg-neutral-900/50 rounded-2xl overflow-hidden ring-1 ring-neutral-800/80 shadow-sm",
-        "cursor-grab active:cursor-grabbing select-none",
-        isDragging ? "opacity-70" : "",
+        "rounded-2xl bg-neutral-950/60 border border-neutral-800 shadow-sm overflow-hidden",
+        isDragging ? "opacity-70" : "opacity-100",
       ].join(" ")}
     >
-      <div className="flex gap-3 p-4">
-        <div className="w-14 h-20 rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800 shrink-0">
-          {item.posterUrl ? (
+      {/* drag handle row */}
+      <div
+        className="flex items-center justify-between gap-2 px-3 py-2 bg-neutral-950 border-b border-neutral-800"
+        {...listeners}
+        {...attributes}
+        style={{ cursor: "grab" }}
+      >
+        <div className="text-xs text-neutral-500">Drag</div>
+        <div className="text-xs text-neutral-400">{TYPE_LABEL[item.type]}</div>
+      </div>
+
+      <div className="p-3 flex gap-3">
+        <div className="w-12 h-16 rounded-xl overflow-hidden bg-neutral-900 border border-neutral-800 shrink-0">
+          {displayPoster ? (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={item.posterUrl} alt={item.title} className="w-full h-full object-cover" />
+            <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
           ) : (
-            <div className="w-full h-full grid place-items-center text-[10px] text-neutral-500">No cover</div>
+            <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">—</div>
           )}
         </div>
 
-        <div className="min-w-0 flex-1 space-y-1">
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0">
-              <div className="font-medium truncate">{item.title}</div>
+        <div className="min-w-0 flex-1">
+          <div className="font-semibold text-sm text-neutral-200 truncate">{item.title}</div>
+          <div className="text-[11px] text-neutral-500 mt-1">Progress: {progressText}</div>
 
-              <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-neutral-400">
-                <span>{item.type}</span>
-
-                <select
-                  value={item.status}
-                  onChange={(e) => onUpdate({ status: e.target.value as Status })}
-                  onPointerDown={(e) => e.stopPropagation()}
-                  className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[1px] text-xs outline-none focus:border-neutral-500"
-                >
-                  <option value="completed">Completed</option>
-                  <option value="in_progress">Watching</option>
-                  <option value="planned">Watchlist</option>
-                  <option value="dropped">Dropped</option>
-                </select>
-
-                {item.dateFinished ? `• ${item.dateFinished}` : ""}
-                {typeof item.rating === "number" ? `• ★ ${item.rating.toFixed(1)}` : ""}
-              </div>
-            </div>
+          <div className="flex items-center justify-between mt-3">
+            <select
+              value={item.status}
+              onChange={(e) => onUpdate({ status: e.target.value as Status })}
+              className="rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+            >
+              <option value="completed">Completed</option>
+              <option value="in_progress">In Progress</option>
+              <option value="planned">Planned</option>
+              <option value="dropped">Dropped</option>
+            </select>
 
             <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onDelete();
-              }}
-              className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 shrink-0"
-              title="Delete"
-              onPointerDown={(e) => e.stopPropagation()}
+              type="button"
+              onClick={onDelete}
+              className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
             >
               Delete
             </button>
           </div>
-
-          <div className="mt-2 flex items-center gap-2">
-            <span className="text-[11px] text-neutral-500">Rating</span>
-            <input
-              type="number"
-              min={0}
-              max={10}
-              value={item.rating ?? ""}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (v === "") onUpdate({ rating: undefined });
-                else onUpdate({ rating: Math.max(0, Math.min(10, Number(v))) });
-              }}
-              onPointerDown={(e) => e.stopPropagation()}
-              className="w-16 rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
-            />
-            <span className="text-[11px] text-neutral-600">/ 10</span>
-          </div>
-
-          {item.notes ? <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div> : null}
-          {item.tags?.length ? <div className="text-[11px] text-neutral-500 truncate">{item.tags.join(" • ")}</div> : null}
         </div>
       </div>
-    </article>
+    </div>
   );
 }
 
-/* ================= SMALL INPUT COMPONENTS ================= */
+/* ================= SMALL UI COMPONENTS ================= */
+
+function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
+  return (
+    <div className="bg-neutral-900/50 p-4 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+      <div className="text-xs text-neutral-400">{title}</div>
+      <div className="text-2xl font-semibold tracking-tight mt-1">{value}</div>
+      {sub ? <div className="text-[11px] text-neutral-500 mt-1">{sub}</div> : null}
+    </div>
+  );
+}
+
+function BarRow({ label, value, total }: { label: string; value: number; total: number }) {
+  const pct = total ? Math.round((value / total) * 100) : 0;
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between">
+        <div className="text-neutral-300">{label}</div>
+        <div className="text-neutral-400 tabular-nums">
+          {value} <span className="text-neutral-600">({pct}%)</span>
+        </div>
+      </div>
+      <div className="h-2 rounded-full bg-white/5 border border-white/10 overflow-hidden">
+        <div className="h-full bg-white/15" style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Simple pie chart (SVG) — no colors specified manually; uses opacity variations.
+ */
+function PieChartSimple({ data }: { data: Array<{ label: string; value: number }> }) {
+  const total = Math.max(1, data.reduce((a, b) => a + (b.value || 0), 0));
+  let acc = 0;
+
+  const r = 38;
+  const cx = 45;
+  const cy = 45;
+
+  const slices = data.map((d, idx) => {
+    const v = Math.max(0, d.value || 0);
+    const start = (acc / total) * Math.PI * 2;
+    acc += v;
+    const end = (acc / total) * Math.PI * 2;
+
+    const x1 = cx + r * Math.cos(start);
+    const y1 = cy + r * Math.sin(start);
+    const x2 = cx + r * Math.cos(end);
+    const y2 = cy + r * Math.sin(end);
+
+    const largeArc = end - start > Math.PI ? 1 : 0;
+
+    const path = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} Z`;
+
+    // opacity ladder for visual distinction without hardcoding colors
+    const opacity = 0.08 + (idx % 8) * 0.06;
+
+    return <path key={d.label} d={path} fill="white" fillOpacity={opacity} stroke="white" strokeOpacity={0.08} />;
+  });
+
+  return (
+    <div className="shrink-0">
+      <svg width={90} height={90} viewBox="0 0 90 90" className="block">
+        <circle cx={cx} cy={cy} r={r} fill="transparent" stroke="white" strokeOpacity={0.08} />
+        {slices}
+      </svg>
+    </div>
+  );
+}
 
 function Select({
   label,
@@ -1527,18 +2487,18 @@ function Select({
   onChange,
   options,
 }: {
-  label: string;
+  label?: string;
   value: string;
   onChange: (v: string) => void;
-  options: { value: string; label: string }[];
+  options: Array<{ value: string; label: string }>;
 }) {
   return (
     <label className="block">
-      <div className="text-xs mb-1 text-neutral-400">{label}</div>
+      {label ? <div className="text-xs text-neutral-400 mb-1">{label}</div> : null}
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500"
       >
         {options.map((o) => (
           <option key={o.value} value={o.value}>
@@ -1550,27 +2510,44 @@ function Select({
   );
 }
 
+function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!checked)}
+      className={[
+        "w-full sm:w-auto px-3 py-2 rounded-xl border text-sm transition text-left",
+        checked ? "bg-emerald-500/15 border-emerald-500/20" : "bg-white/5 border-white/10 hover:bg-white/10",
+      ].join(" ")}
+      aria-pressed={checked}
+    >
+      <span className="text-neutral-200">{label}</span>
+      <span className="ml-2 text-xs text-neutral-500">{checked ? "On" : "Off"}</span>
+    </button>
+  );
+}
+
 function Text({
   label,
   value,
   onChange,
-  type = "text",
   helper,
+  type = "text",
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
-  type?: string;
   helper?: string;
+  type?: React.HTMLInputTypeAttribute;
 }) {
   return (
     <label className="block">
-      <div className="text-xs mb-1 text-neutral-400">{label}</div>
+      <div className="text-xs text-neutral-400 mb-1">{label}</div>
       <input
         type={type}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500"
       />
       {helper ? <div className="text-[11px] text-neutral-500 mt-1">{helper}</div> : null}
     </label>
@@ -1590,98 +2567,136 @@ function TextArea({
 }) {
   return (
     <label className="block">
-      <div className="text-xs mb-1 text-neutral-400">{label}</div>
+      <div className="text-xs text-neutral-400 mb-1">{label}</div>
       <textarea
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        rows={3}
-        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+        rows={4}
+        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500 resize-none"
       />
     </label>
   );
 }
 
-function NumInput({
+function TextNumberInput({
   label,
   value,
   onChange,
+  placeholder,
+  pattern,
+  helper,
   disabled,
-  min,
 }: {
   label: string;
-  value: number;
-  onChange: (v: number) => void;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  pattern: RegExp;
+  helper?: string;
   disabled?: boolean;
-  min?: number;
 }) {
   return (
     <label className="block">
-      <div className="text-xs mb-1 text-neutral-400">{label}</div>
+      <div className="text-xs text-neutral-400 mb-1">{label}</div>
       <input
-        type="number"
-        value={Number.isFinite(value) ? value : 0}
-        onChange={(e) => onChange(Number(e.target.value))}
+        value={value}
+        onChange={(e) => {
+          const v = e.target.value;
+          if (v === "" || pattern.test(v)) onChange(v);
+        }}
+        placeholder={placeholder}
         disabled={disabled}
-        min={min}
-        className={`w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500 ${
-          disabled ? "opacity-50" : ""
-        }`}
-      />
-    </label>
-  );
-}
-
-function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <label className="flex items-center justify-between gap-3 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
-      <span className="text-sm text-neutral-300">{label}</span>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={checked}
-        onClick={() => onChange(!checked)}
         className={[
-          "relative inline-flex h-6 w-11 items-center rounded-full border transition",
-          checked ? "bg-emerald-500/20 border-emerald-500/30" : "bg-white/5 border-white/10",
+          "w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500",
+          disabled ? "opacity-50 cursor-not-allowed" : "",
         ].join(" ")}
-      >
-        <span
-          className={[
-            "inline-block h-5 w-5 transform rounded-full transition",
-            checked ? "translate-x-5 bg-emerald-200" : "translate-x-1 bg-neutral-200",
-          ].join(" ")}
-        />
-      </button>
+      />
+      {helper ? <div className="text-[11px] text-neutral-500 mt-1">{helper}</div> : null}
     </label>
   );
 }
 
-/* ================= STATS UI HELPERS ================= */
+function TagEditor({
+  autoTags,
+  manualTags,
+  onChangeManual,
+  helper,
+}: {
+  autoTags: string[];
+  manualTags: string[];
+  onChangeManual: (tags: string[]) => void;
+  helper?: string;
+}) {
+  const [text, setText] = useState("");
 
-function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
+  const add = () => {
+    const parts = text
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+
+    if (!parts.length) return;
+
+    const next = uniqTags([...(manualTags ?? []), ...parts]);
+    onChangeManual(next);
+    setText("");
+  };
+
+  const remove = (t: string) => {
+    onChangeManual((manualTags ?? []).filter((x) => x.toLowerCase() !== t.toLowerCase()));
+  };
+
   return (
-    <div className="bg-neutral-900/50 p-4 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-      <div className="text-xs text-neutral-400">{title}</div>
-      <div className="text-3xl font-semibold mt-1">{value}</div>
-      {sub ? <div className="text-xs text-neutral-500 mt-1">{sub}</div> : null}
+    <div className="space-y-2">
+      <div className="text-xs text-neutral-400">Tags</div>
+
+      <div className="flex flex-wrap gap-2">
+        {(autoTags ?? []).map((t) => (
+          <span
+            key={`a:${t}`}
+            className="px-3 py-1 rounded-xl bg-white/5 border border-white/10 text-xs text-neutral-200"
+            title="Auto-filled"
+          >
+            {t}
+          </span>
+        ))}
+
+        {(manualTags ?? []).map((t) => (
+          <button
+            key={`m:${t}`}
+            type="button"
+            onClick={() => remove(t)}
+            className="px-3 py-1 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-xs text-neutral-200 hover:bg-emerald-500/15"
+            title="Click to remove"
+          >
+            {t} <span className="text-neutral-400">×</span>
+          </button>
+        ))}
+
+        {!autoTags?.length && !manualTags?.length ? <div className="text-xs text-neutral-600">No tags yet.</div> : null}
+      </div>
+
+      <div className="flex gap-2">
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              add();
+            }
+          }}
+          placeholder="Add tags (comma separated)"
+          className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500"
+        />
+        <button type="button" onClick={add} className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15">
+          Add
+        </button>
+      </div>
+
+      {helper ? <div className="text-[11px] text-neutral-500">{helper}</div> : null}
     </div>
   );
 }
 
-function BarRow({ label, value, total }: { label: string; value: number; total: number }) {
-  const pct = Math.max(0, Math.min(100, Math.round((value / Math.max(1, total)) * 100)));
-  return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between text-xs text-neutral-400">
-        <div>{label}</div>
-        <div>
-          {value} <span className="text-neutral-600">({pct}%)</span>
-        </div>
-      </div>
-      <div className="h-2 rounded-full bg-white/5 border border-white/10 overflow-hidden">
-        <div className="h-full bg-white/15" style={{ width: `${pct}%` }} />
-      </div>
-    </div>
-  );
-}
