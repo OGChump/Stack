@@ -3,9 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { supabase } from "../lib/supabaseClient";
-import { DndContext, useDraggable, useDroppable } from "@dnd-kit/core";
-import type { DragEndEvent } from "@dnd-kit/core";
-
+import { DndContext, DragEndEvent, useDraggable, useDroppable } from "@dnd-kit/core";
 
 /* ================= TYPES ================= */
 
@@ -31,6 +29,10 @@ type MediaItem = {
 
   // IGDB fields (game only)
   igdbId?: number;
+
+  // AniList fields (anime/manga)
+  anilistId?: number;
+  anilistType?: "ANIME" | "MANGA";
 
   inTheaters?: boolean;
   dateFinished?: string; // YYYY-MM-DD
@@ -65,6 +67,11 @@ type TmdbRecommendationsResult = {
 
 type IgdbSearchResponse = {
   results: Array<{ id: number; name: string; coverUrl?: string; genres?: string[] }>;
+  error?: string;
+};
+
+type AnilistSearchResponse = {
+  results: Array<{ id: number; title: string; coverUrl?: string; genres?: string[] }>;
   error?: string;
 };
 
@@ -174,6 +181,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     tmdbId: undefined,
     tmdbType: undefined,
     igdbId: undefined,
+    anilistId: undefined,
+    anilistType: undefined,
     progressCur: undefined,
     progressTotal: undefined,
   });
@@ -345,6 +354,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
       tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
       igdbId: typeof form.igdbId === "number" ? form.igdbId : undefined,
+      anilistId: typeof form.anilistId === "number" ? form.anilistId : undefined,
+      anilistType: form.anilistType === "ANIME" || form.anilistType === "MANGA" ? form.anilistType : undefined,
       progressCur: typeof form.progressCur === "number" ? form.progressCur : undefined,
       progressTotal: typeof form.progressTotal === "number" ? form.progressTotal : undefined,
     };
@@ -367,6 +378,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       tmdbId: undefined,
       tmdbType: undefined,
       igdbId: undefined,
+      anilistId: undefined,
+      anilistType: undefined,
       progressCur: undefined,
       progressTotal: undefined,
     }));
@@ -412,7 +425,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         }
       }
 
-      // unique by tmdbId+type
       const seen = new Set<string>();
       const unique = pool.filter((x) => {
         const k = `${x.tmdbType}:${x.tmdbId}`;
@@ -423,7 +435,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
       const top = unique.slice(0, 8);
 
-      // Fetch posters for nicer UI
       const withPosters: Pick[] = [];
       for (const p of top) {
         try {
@@ -469,7 +480,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     updateItem(itemId, { status: newStatus });
   }
 
-  /* ================= AUTO AUTOFILL (TMDB + IGDB) ================= */
+  /* ================= AUTO AUTOFILL (TMDB + IGDB + ANILIST) ================= */
 
   useEffect(() => {
     if (!autoAutofill) return;
@@ -508,6 +519,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             tmdbId: hit.id,
             tmdbType,
             igdbId: undefined,
+            anilistId: undefined,
+            anilistType: undefined,
             posterUrl: d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : f.posterUrl,
             runtime: d.runtime ?? d.episode_run_time?.[0] ?? f.runtime,
             tags: (d.genres ?? []).map((g) => g.name),
@@ -543,6 +556,48 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             igdbId: hit.id,
             tmdbId: undefined,
             tmdbType: undefined,
+            anilistId: undefined,
+            anilistType: undefined,
+            posterUrl: hit.coverUrl || f.posterUrl,
+            tags: (hit.genres && hit.genres.length ? hit.genres : f.tags) ?? [],
+          }));
+
+          setAutofillStatus("Auto-fill complete.");
+          return;
+        }
+
+        // ANIME / MANGA (AniList via /api/anilist/search)
+        if (type === "anime" || type === "manga") {
+          setAutofillStatus("Searching AniList…");
+          const anilistType = type === "manga" ? "MANGA" : "ANIME";
+
+          const res = await fetch(
+            `/api/anilist/search?q=${encodeURIComponent(title)}&limit=5&type=${anilistType}`,
+            { method: "GET" }
+          );
+          const json = (await res.json()) as AnilistSearchResponse;
+
+          if (!res.ok) {
+            setAutofillStatus(`AniList error: ${json.error || "Search failed"}`);
+            return;
+          }
+
+          const hit = json.results?.[0];
+          if (!hit) {
+            setAutofillStatus("No match found on AniList.");
+            return;
+          }
+
+          lastAutofillKey.current = key;
+          setAutofillStatus(`Found: ${hit.title}`);
+
+          setForm((f) => ({
+            ...f,
+            anilistId: hit.id,
+            anilistType,
+            tmdbId: undefined,
+            tmdbType: undefined,
+            igdbId: undefined,
             posterUrl: hit.coverUrl || f.posterUrl,
             tags: (hit.genres && hit.genres.length ? hit.genres : f.tags) ?? [],
           }));
@@ -562,7 +617,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     return () => {
       if (autofillTimer.current) window.clearTimeout(autofillTimer.current);
     };
-  }, [form.title, form.type, autoAutofill]); // keep as-is
+  }, [form.title, form.type, autoAutofill]);
 
   /* ================= FILTER ================= */
 
@@ -868,7 +923,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   ))}
                 </div>
               ) : (
-                <div className="text-xs text-neutral-400">No tags yet (auto-fill adds genres for Movie/TV + Game).</div>
+                <div className="text-xs text-neutral-400">No tags yet (auto-fill adds genres for Movie/TV/Game/Anime/Manga).</div>
               )}
             </div>
           </div>
@@ -908,7 +963,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               <div className="text-center">
                 <div className="text-2xl font-semibold tracking-tight">Add to Stack</div>
                 <div className="text-sm text-neutral-400 mt-1">
-                  Auto-fill: Movie/TV (TMDB) + Game (IGDB). Everything else manual.
+                  Auto-fill: Movie/TV (TMDB) • Game (IGDB) • Anime/Manga (AniList). Everything else manual.
                 </div>
               </div>
 
@@ -949,6 +1004,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                           tmdbId: undefined,
                           tmdbType: undefined,
                           igdbId: undefined,
+                          anilistId: undefined,
+                          anilistType: undefined,
                         }))
                       }
                       className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
@@ -969,6 +1026,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                         tmdbId: undefined,
                         tmdbType: undefined,
                         igdbId: undefined,
+                        anilistId: undefined,
+                        anilistType: undefined,
                       })
                     }
                     options={[
@@ -1034,7 +1093,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                     label="Cover image URL (optional)"
                     value={String(form.posterUrl || "")}
                     onChange={(v) => setForm({ ...form, posterUrl: v })}
-                    helper="Paste any image URL, or auto-fill sets it for Movie/TV/Game."
+                    helper="Paste any image URL, or auto-fill sets it for Movie/TV/Game/Anime/Manga."
                   />
                 </div>
 
