@@ -1943,7 +1943,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                     placeholder="0"
                     pattern={/^\d{0,3}$/}
                     disabled={!isRewatch}
-                    helper="You can clear this field and type normally."
+                    helper="This still doesnt work as intended ngl"
                   />
                 </div>
 
