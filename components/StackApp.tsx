@@ -52,8 +52,8 @@ type MediaItem = {
   progressCurOverride?: number;
   progressTotalOverride?: number;
 
-  // ✅ FIX: you referenced this in stats but it wasn't typed
-  hoursPlayed?: number; // games (manual hours played)
+  // games
+  hoursPlayed?: number; // manual hours played
 };
 
 type TmdbSearchResult = {
@@ -465,6 +465,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [autoTags, setAutoTags] = useState<string[]>([]);
   const [manualTags, setManualTags] = useState<string[]>([]);
 
+  // ✅ Undo delete
+  const [undoState, setUndoState] = useState<{ item: MediaItem; index: number } | null>(null);
+  const undoTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+    };
+  }, []);
+
   // Add form lives only on /add
   const [form, setForm] = useState<Partial<MediaItem>>({
     title: "",
@@ -490,7 +500,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     progressTotal: undefined,
   });
 
-  // ✅ FIX: keep latest form in a ref (prevents stale status/type inside applySuggestion)
+  // ✅ keep latest form in a ref (prevents stale status/type inside applySuggestion)
   const formRef = useRef<Partial<MediaItem>>(form);
   useEffect(() => {
     formRef.current = form;
@@ -693,7 +703,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       progressCur: typeof inferredCur === "number" ? inferredCur : undefined,
       progressTotal: typeof inferredTotal === "number" ? inferredTotal : undefined,
 
-      // hoursPlayed intentionally not set from add form right now (you can add later)
       hoursPlayed: typeof form.hoursPlayed === "number" ? form.hoursPlayed : undefined,
     };
 
@@ -738,12 +747,96 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     setProgressTotalText("");
   }
 
+  // ✅ Undo delete
   function removeItem(id: string) {
-    setItems((prev) => prev.filter((i) => i.id !== id));
+    setItems((prev) => {
+      const idx = prev.findIndex((x) => x.id === id);
+      if (idx === -1) return prev;
+
+      const deleted = prev[idx];
+
+      if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+
+      setUndoState({ item: deleted, index: idx });
+
+      undoTimerRef.current = window.setTimeout(() => {
+        setUndoState(null);
+        undoTimerRef.current = null;
+      }, 7000);
+
+      return prev.filter((x) => x.id !== id);
+    });
   }
 
+  // ✅ Smart status + smart date + progress auto-complete
   function updateItem(id: string, patch: Partial<MediaItem>) {
-    setItems((prev) => prev.map((x) => (x.id === id ? { ...x, ...patch } : x)));
+    setItems((prev) =>
+      prev.map((x) => {
+        if (x.id !== id) return x;
+
+        const merged: MediaItem = { ...x, ...patch };
+
+        const hadCompleted = x.status === "completed";
+        const nowCompleted = merged.status === "completed";
+
+        const getEffectiveProgress = (it: MediaItem) => {
+          if (it.type === "movie") {
+            const d = getMovieProgressDefaults(it);
+            return { cur: d.cur, total: d.total };
+          }
+
+          const cur =
+            typeof it.progressCurOverride === "number" ? it.progressCurOverride : it.progressCur;
+
+          const total =
+            typeof it.progressTotalOverride === "number" ? it.progressTotalOverride : it.progressTotal;
+
+          return { cur, total };
+        };
+
+        // If status becomes completed and no date, set to today
+        if (!hadCompleted && nowCompleted && !merged.dateFinished) {
+          merged.dateFinished = todayYMD();
+        }
+
+        // If progress hits total, auto-complete (+ date)
+        const { cur, total } = getEffectiveProgress(merged);
+        const totalNum = typeof total === "number" && Number.isFinite(total) ? total : undefined;
+        const curNum = typeof cur === "number" && Number.isFinite(cur) ? cur : undefined;
+
+        if (
+          merged.status !== "completed" &&
+          typeof totalNum === "number" &&
+          totalNum > 0 &&
+          typeof curNum === "number" &&
+          curNum >= totalNum
+        ) {
+          merged.status = "completed";
+          if (!merged.dateFinished) merged.dateFinished = todayYMD();
+        }
+
+        // When completed, make progress "finished" where appropriate
+        if (merged.status === "completed") {
+          if (merged.type === "movie") {
+            merged.progressTotal = 1;
+            merged.progressCur = 1;
+          } else if (merged.type === "tv" || merged.type === "anime" || merged.type === "manga") {
+            if (typeof totalNum === "number" && totalNum > 0) {
+              const currentCur =
+                typeof merged.progressCurOverride === "number"
+                  ? merged.progressCurOverride
+                  : merged.progressCur;
+
+              if (typeof currentCur !== "number" || currentCur < totalNum) {
+                merged.progressCur = totalNum;
+              }
+            }
+          }
+        }
+
+        return merged;
+      })
+    );
   }
 
   async function pickForMe(mode: "best" | "random" = "best") {
@@ -850,7 +943,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       enriched.sort((a, b) => b.score - a.score);
 
       if (mode === "random") {
-        // ✅ FIX: weighted random (better than uniform)
         const top = enriched.slice(0, 30);
         const weights = top.map((x) => Math.max(0.0001, x.score));
         const total = weights.reduce((a, b) => a + b, 0);
@@ -923,51 +1015,49 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     setAutofillStatus(`Applying: ${s.title}…`);
 
     setForm((f) => {
-  const base = {
-    ...f,
-    title: s.title,
-    posterUrl: s.posterUrl || f.posterUrl,
-    runtime: typeof s.runtime === "number" ? s.runtime : f.runtime,
-  };
+      const base = {
+        ...f,
+        title: s.title,
+        posterUrl: s.posterUrl || f.posterUrl,
+        runtime: typeof s.runtime === "number" ? s.runtime : f.runtime,
+      };
 
-  if (s.provider === "tmdb") {
-    return {
-      ...base,
-      tmdbId: s.tmdbId,
-      tmdbType: s.tmdbType,
-      igdbId: undefined,
-      anilistId: undefined,
-      anilistType: undefined,
-    };
-  }
+      if (s.provider === "tmdb") {
+        return {
+          ...base,
+          tmdbId: s.tmdbId,
+          tmdbType: s.tmdbType,
+          igdbId: undefined,
+          anilistId: undefined,
+          anilistType: undefined,
+        };
+      }
 
-  if (s.provider === "igdb") {
-    return {
-      ...base,
-      igdbId: s.igdbId,
-      tmdbId: undefined,
-      tmdbType: undefined,
-      anilistId: undefined,
-      anilistType: undefined,
-    };
-  }
+      if (s.provider === "igdb") {
+        return {
+          ...base,
+          igdbId: s.igdbId,
+          tmdbId: undefined,
+          tmdbType: undefined,
+          anilistId: undefined,
+          anilistType: undefined,
+        };
+      }
 
-  // anilist
-  return {
-    ...base,
-    anilistId: s.anilistId,
-    anilistType: s.anilistType,
-    tmdbId: undefined,
-    tmdbType: undefined,
-    igdbId: undefined,
-  };
-});
+      return {
+        ...base,
+        anilistId: s.anilistId,
+        anilistType: s.anilistType,
+        tmdbId: undefined,
+        tmdbType: undefined,
+        igdbId: undefined,
+      };
+    });
 
     const newAuto = uniqTags([...(s.tags ?? [])]);
     setAutoTags(newAuto);
     if (!keepManual) setManualTags([]);
 
-    // ✅ FIX: use formRef (latest status/type), not stale closure
     const currentType = (formRef.current?.type as MediaType) ?? "movie";
     const currentStatus = (formRef.current?.status as Status) ?? "completed";
 
@@ -1359,7 +1449,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         continue;
       }
 
-      // Everything else: ignore for watched time (for now)
+      // Books/Manga: not counted in "time watched" (yet)
     }
 
     return Math.round(sum);
@@ -1444,6 +1534,119 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     return { months, max };
   }, [items, excludeTypes]);
 
+  // ✅ Fun stats
+  const bestMonth = useMemo(() => {
+    const best = monthlyCompleted.months.reduce(
+      (acc, m) => (m.count > acc.count ? m : acc),
+      { key: "—", label: "—", count: 0 }
+    );
+    return best;
+  }, [monthlyCompleted]);
+
+  const completionStreak = useMemo(() => {
+    const daysSet = new Set<string>();
+
+    for (const i of items) {
+      if (i.status !== "completed") continue;
+      if (excludeTypes.has(i.type)) continue;
+
+      const day = (i.dateFinished ?? i.createdAt ?? "").slice(0, 10);
+      if (day) daysSet.add(day);
+    }
+
+    const days = Array.from(daysSet).sort(); // ascending YYYY-MM-DD
+    if (!days.length) return { longest: 0, current: 0 };
+
+    const toDate = (s: string) => new Date(s + "T00:00:00");
+    const diffDays = (a: Date, b: Date) => Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24));
+
+    let longest = 1;
+    let run = 1;
+
+    for (let i = 1; i < days.length; i++) {
+      const prev = toDate(days[i - 1]);
+      const cur = toDate(days[i]);
+      if (diffDays(prev, cur) === 1) {
+        run += 1;
+        longest = Math.max(longest, run);
+      } else {
+        run = 1;
+      }
+    }
+
+    const today = todayYMD();
+    let current = 0;
+    const cursor = new Date(today + "T00:00:00");
+    while (true) {
+      const key = cursor.toISOString().slice(0, 10);
+      if (!daysSet.has(key)) break;
+      current += 1;
+      cursor.setDate(cursor.getDate() - 1);
+    }
+
+    return { longest, current };
+  }, [items, excludeTypes]);
+
+  const gameHoursStats = useMemo(() => {
+    const games = items.filter((i) => i.type === "game" && !excludeTypes.has(i.type));
+    const withHours = games.filter((g) => typeof g.hoursPlayed === "number" && (g.hoursPlayed ?? 0) > 0);
+
+    const totalHours = withHours.reduce((a, b) => a + (b.hoursPlayed ?? 0), 0);
+    const avgHours = withHours.length ? totalHours / withHours.length : 0;
+
+    const top = withHours.slice().sort((a, b) => (b.hoursPlayed ?? 0) - (a.hoursPlayed ?? 0))[0];
+
+    return {
+      totalHours,
+      avgHours,
+      topGameTitle: top?.title ?? "—",
+      topGameHours: top?.hoursPlayed ?? 0,
+    };
+  }, [items, excludeTypes]);
+
+  const mostRewatchedItem = useMemo(() => {
+    const best = items
+      .filter((i) => (Number(i.rewatchCount ?? 0) || 0) > 0)
+      .slice()
+      .sort((a, b) => (Number(b.rewatchCount ?? 0) || 0) - (Number(a.rewatchCount ?? 0) || 0))[0];
+
+    return best ? { title: best.title, count: Number(best.rewatchCount ?? 0) || 0 } : { title: "—", count: 0 };
+  }, [items]);
+
+  const yearGenreCompare = useMemo(() => {
+    const now = new Date();
+    const y = now.getFullYear();
+    const thisYearStart = `${y}-01-01`;
+    const lastYearStart = `${y - 1}-01-01`;
+    const lastYearEnd = `${y - 1}-12-31`;
+
+    const countTags = (start: string, end?: string) => {
+      const map = new Map<string, number>();
+      for (const i of items) {
+        if (i.status !== "completed") continue;
+        if (excludeTypes.has(i.type)) continue;
+
+        const d = (i.dateFinished ?? i.createdAt ?? "").slice(0, 10);
+        if (!d) continue;
+        if (d < start) continue;
+        if (end && d > end) continue;
+
+        for (const t of i.tags ?? []) {
+          const k = String(t || "").trim();
+          if (!k) continue;
+          map.set(k, (map.get(k) ?? 0) + 1);
+        }
+      }
+      const top = Array.from(map.entries()).sort((a, b) => b[1] - a[1])[0];
+      return top ? { tag: top[0], count: top[1] } : { tag: "—", count: 0 };
+    };
+
+    const thisYearTop = countTags(thisYearStart);
+    const lastYearTop = countTags(lastYearStart, lastYearEnd);
+
+    return { thisYearTop, lastYearTop, year: y };
+  }, [items, excludeTypes]);
+
   /* ================= UI ================= */
 
   const displayCombinedTags = useMemo(() => {
@@ -1465,13 +1668,13 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
           <nav className="flex justify-center">
             <div className="flex items-center gap-2">
-              <div className="inline-flex flex-wrap justify-center gap-2 rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/80 px-2 py-2">
+              <div className="inline-flex flex-wrap justify-center gap-[clamp(0.35rem,1.2vw,0.6rem)] rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/80 px-[clamp(0.4rem,1.6vw,0.7rem)] py-[clamp(0.35rem,1.2vw,0.6rem)] max-w-[92vw]">
                 {navMain.map((n) => (
                   <Link
                     key={n.href}
                     href={n.href}
                     className={[
-                      "px-3 py-2 rounded-xl border text-sm transition",
+                      "px-[clamp(0.55rem,1.6vw,0.9rem)] py-[clamp(0.45rem,1.2vw,0.65rem)] rounded-xl border text-[clamp(0.72rem,1.2vw,0.9rem)] transition",
                       view === n.key ? "bg-white/15 border-white/20" : "bg-white/5 border-white/10 hover:bg-white/10",
                     ].join(" ")}
                   >
@@ -1488,12 +1691,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                     title={n.label}
                     aria-label={n.label}
                     className={[
-                      "h-11 w-11 grid place-items-center rounded-2xl border transition",
+                      "h-[clamp(2.25rem,5vw,2.75rem)] w-[clamp(2.25rem,5vw,2.75rem)] grid place-items-center rounded-2xl border transition",
                       "bg-neutral-900/40 ring-1 ring-neutral-800/80",
                       view === n.key ? "bg-white/15 border-white/20" : "bg-white/5 border-white/10 hover:bg-white/10",
                     ].join(" ")}
                   >
-                    {n.icon === "plus" ? <span className="text-xl leading-none">+</span> : <span className="text-lg leading-none">◔</span>}
+                    {n.icon === "plus" ? (
+                      <span className="text-[clamp(1.0rem,2.4vw,1.35rem)] leading-none">+</span>
+                    ) : (
+                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">◔</span>
+                    )}
                   </Link>
                 ))}
               </div>
@@ -1513,6 +1720,14 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 sub={`${totalRuntimeMinutesCompleted} min (movies exact; TV/anime estimated; games use hours played)`}
               />
               <StatCard title="Rewatches" value={`${rewatchTotals.rewatches}`} sub={`${rewatchTotals.itemsRewatched} items`} />
+            </div>
+
+            {/* ✅ Fun stats row */}
+            <div className="grid md:grid-cols-4 gap-4">
+              <StatCard title="Best month" value={`${bestMonth.label}`} sub={`${bestMonth.count} completed`} />
+              <StatCard title="Current streak" value={`${completionStreak.current} days`} sub={`Longest: ${completionStreak.longest} days`} />
+              <StatCard title="Top game" value={gameHoursStats.topGameTitle} sub={`${gameHoursStats.topGameHours.toFixed(1)}h`} />
+              <StatCard title="Avg game hours" value={`${gameHoursStats.avgHours.toFixed(1)}h`} sub={`Total: ${gameHoursStats.totalHours.toFixed(1)}h`} />
             </div>
 
             <div className="grid lg:grid-cols-2 gap-4">
@@ -1604,7 +1819,35 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               </div>
             </div>
 
+            {/* ✅ Year highlights */}
             <div className="grid lg:grid-cols-2 gap-4">
+              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+                <div className="text-sm font-medium mb-3">Year highlights</div>
+                <div className="space-y-2 text-sm text-neutral-300">
+                  <div className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+                    <div>Top genre this year ({yearGenreCompare.year})</div>
+                    <div className="text-neutral-200">
+                      {yearGenreCompare.thisYearTop.tag}{" "}
+                      <span className="text-neutral-500">({yearGenreCompare.thisYearTop.count})</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+                    <div>Top genre last year ({yearGenreCompare.year - 1})</div>
+                    <div className="text-neutral-200">
+                      {yearGenreCompare.lastYearTop.tag}{" "}
+                      <span className="text-neutral-500">({yearGenreCompare.lastYearTop.count})</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+                    <div>Most rewatched</div>
+                    <div className="text-neutral-200">
+                      {mostRewatchedItem.title}{" "}
+                      <span className="text-neutral-500">({mostRewatchedItem.count})</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
                 <div className="text-sm font-medium mb-3">Genres (completed)</div>
                 {genreCounts.length ? (
@@ -1623,7 +1866,9 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   <div className="text-xs text-neutral-400">No genres yet.</div>
                 )}
               </div>
+            </div>
 
+            <div className="grid lg:grid-cols-2 gap-4">
               <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
                 <div className="text-sm font-medium mb-3">Top tags / genres (completed)</div>
 
@@ -1642,6 +1887,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 ) : (
                   <div className="text-xs text-neutral-400">No tags yet (auto-fill adds genres for Movie/TV/Game/Anime/Manga).</div>
                 )}
+              </div>
+
+              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+                <div className="text-sm font-medium mb-3">Notes</div>
+                <div className="text-xs text-neutral-400 space-y-2">
+                  <div> </div>
+                  <div> </div>
+                  <div> </div>
+                  <div> </div>
+                </div>
               </div>
             </div>
           </div>
@@ -2066,12 +2321,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <div className="hidden sm:grid grid-cols-[72px_1fr_90px_90px_120px] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
+                  <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
                     <div />
                     <div>Title</div>
                     <div className="text-center">Score</div>
                     <div className="text-center">Type</div>
-                    <div className="text-center">Progress</div>
+                    <div className="text-center">Progress / Hours</div>
                   </div>
 
                   {filtered.map((i) => (
@@ -2085,6 +2340,44 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
         <footer className="pt-6 text-xs text-neutral-500">Stack • Saves to Supabase + local backup</footer>
       </div>
+
+      {/* ✅ UNDO TOAST */}
+      {undoState ? (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50">
+          <div className="flex items-center gap-3 rounded-2xl bg-neutral-950 border border-neutral-800 shadow-2xl px-4 py-3">
+            <div className="text-sm text-neutral-200">
+              Deleted <span className="font-semibold">{undoState.item.title}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setItems((prev) => {
+                  const next = prev.slice();
+                  next.splice(undoState.index, 0, undoState.item);
+                  return next;
+                });
+                setUndoState(null);
+                if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+                undoTimerRef.current = null;
+              }}
+              className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+            >
+              Undo
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setUndoState(null);
+                if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+                undoTimerRef.current = null;
+              }}
+              className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2152,13 +2445,65 @@ function MALRow({
 }) {
   const displayPoster = item.posterOverrideUrl || item.posterUrl;
 
+  // ---------------- EDITING ----------------
+  const [isEditing, setIsEditing] = React.useState(false);
+  const [draftTitle, setDraftTitle] = React.useState(item.title);
+  const [draftDate, setDraftDate] = React.useState(item.dateFinished ?? "");
+  const [draftRating, setDraftRating] = React.useState(typeof item.rating === "number" ? String(item.rating) : "");
+  const [draftNotes, setDraftNotes] = React.useState(item.notes ?? "");
+
+  // full note modal
+  const [showFullNote, setShowFullNote] = React.useState(false);
+
+  // keep drafts in sync if item changes while not editing
+  React.useEffect(() => {
+    if (isEditing) return;
+    setDraftTitle(item.title);
+    setDraftDate(item.dateFinished ?? "");
+    setDraftRating(typeof item.rating === "number" ? String(item.rating) : "");
+    setDraftNotes(item.notes ?? "");
+  }, [item.id, item.title, item.dateFinished, item.rating, item.notes, isEditing]);
+
+  const cancelEdit = () => {
+    setIsEditing(false);
+    setDraftTitle(item.title);
+    setDraftDate(item.dateFinished ?? "");
+    setDraftRating(typeof item.rating === "number" ? String(item.rating) : "");
+    setDraftNotes(item.notes ?? "");
+  };
+
+  const saveEdit = () => {
+    const nextTitle = String(draftTitle || "").trim();
+    const nextDate = String(draftDate || "").trim();
+
+    const ratingRaw = String(draftRating || "").trim();
+    const ratingNum = ratingRaw === "" ? undefined : Number(ratingRaw);
+    const nextRating =
+      typeof ratingNum === "number" && Number.isFinite(ratingNum) ? clamp(ratingNum, 0, 10) : undefined;
+
+    const notesRaw = String(draftNotes || "").trim();
+    const nextNotes = notesRaw ? notesRaw : undefined;
+
+    onUpdate({
+      title: nextTitle || item.title,
+      dateFinished: nextDate ? nextDate : undefined,
+      rating: nextRating,
+      notes: nextNotes,
+    });
+
+    setIsEditing(false);
+  };
+
+  // ---------------- PROGRESS / HOURS ----------------
   const movieProg = getMovieProgressDefaults(item);
+
   const cur =
     item.type === "movie"
       ? movieProg.cur
       : typeof item.progressCurOverride === "number"
       ? item.progressCurOverride
       : item.progressCur;
+
   const total =
     item.type === "movie"
       ? movieProg.total
@@ -2168,7 +2513,6 @@ function MALRow({
 
   const hasCur = typeof cur === "number";
   const hasTotal = typeof total === "number";
-
   const progressText = hasCur || hasTotal ? (hasTotal ? `${cur ?? 0} / ${total}` : `${cur ?? 0}`) : "—";
 
   const incCur = () => {
@@ -2186,125 +2530,286 @@ function MALRow({
     onUpdate({ progressCur: next });
   };
 
-  return (
-    <div className="rounded-2xl bg-neutral-900/50 ring-1 ring-neutral-800/80 overflow-hidden">
-      <div className="grid grid-cols-1 sm:grid-cols-[72px_1fr_90px_90px_120px] gap-3 p-3 items-center">
-        <div className="w-[72px] h-[96px] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
-          {displayPoster ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
-          ) : (
-            <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">No cover</div>
-          )}
-        </div>
+  const isGame = item.type === "game";
+  const hoursText = typeof item.hoursPlayed === "number" ? `${item.hoursPlayed.toFixed(1)}h` : "—";
 
-        <div className="min-w-0">
-          <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0 flex-1">
-              <div className="font-semibold truncate">{item.title}</div>
-              <div className="text-xs text-neutral-400 mt-1">
-                Status:{" "}
-                <select
-                  value={item.status}
-                  onChange={(e) => onUpdate({ status: e.target.value as Status })}
-                  className="ml-1 rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
-                >
-                  <option value="completed">Completed</option>
-                  <option value="in_progress">In Progress</option>
-                  <option value="planned">Planned</option>
-                  <option value="dropped">Dropped</option>
-                </select>
-                {item.dateFinished ? <span className="ml-2 text-neutral-500">• {item.dateFinished}</span> : null}
+  const hasLongNote = !!item.notes && item.notes.length > 120;
+
+  return (
+    <>
+      {/* FULL NOTE MODAL */}
+      {showFullNote ? (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4"
+          onMouseDown={() => setShowFullNote(false)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <div
+            className="w-full max-w-2xl rounded-2xl bg-neutral-950 border border-neutral-800 shadow-2xl overflow-hidden"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-neutral-800">
+              <div className="text-sm text-neutral-200 font-medium truncate">{item.title}</div>
+              <button
+                type="button"
+                onClick={() => setShowFullNote(false)}
+                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+              >
+                Close
+              </button>
+            </div>
+            <div className="p-4">
+              <div className="text-xs text-neutral-500 mb-2">Full note</div>
+              <div className="text-sm text-neutral-200 whitespace-pre-wrap leading-relaxed">{item.notes || "—"}</div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="rounded-2xl bg-neutral-900/50 ring-1 ring-neutral-800/80 overflow-hidden">
+        <div className="grid grid-cols-1 sm:grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 p-3 items-center">
+          {/* Poster */}
+          <div className="w-[72px] h-[96px] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
+            {displayPoster ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
+            ) : (
+              <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">No cover</div>
+            )}
+          </div>
+
+          {/* Title + meta */}
+          <div className="min-w-0">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                {/* TITLE */}
+                {isEditing ? (
+                  <input
+                    value={draftTitle}
+                    onChange={(e) => setDraftTitle(e.target.value)}
+                    className="w-full rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-sm outline-none focus:border-neutral-500"
+                    placeholder="Title"
+                  />
+                ) : (
+                  <div className="font-semibold truncate">{item.title}</div>
+                )}
+
+                {/* STATUS + DATE */}
+                <div className="text-xs text-neutral-400 mt-1 flex flex-wrap items-center gap-2">
+                  <span>Status:</span>
+                  <select
+                    value={item.status}
+                    onChange={(e) => onUpdate({ status: e.target.value as Status })}
+                    className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
+                  >
+                    <option value="completed">Completed</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="planned">Planned</option>
+                    <option value="dropped">Dropped</option>
+                  </select>
+
+                  <span className="text-neutral-600">•</span>
+
+                  {isEditing ? (
+                    <input
+                      type="date"
+                      value={draftDate}
+                      onChange={(e) => setDraftDate(e.target.value)}
+                      className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
+                      title="Date watched"
+                    />
+                  ) : item.dateFinished ? (
+                    <span className="text-neutral-500">{item.dateFinished}</span>
+                  ) : (
+                    <span className="text-neutral-600">No date</span>
+                  )}
+                </div>
+
+                {/* NOTES */}
+                {isEditing ? (
+                  <div className="mt-2">
+                    <div className="text-[11px] text-neutral-500 mb-1">Note</div>
+                    <textarea
+                      value={draftNotes}
+                      onChange={(e) => setDraftNotes(e.target.value)}
+                      rows={3}
+                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500 resize-none"
+                      placeholder="Write a note…"
+                    />
+                  </div>
+                ) : item.notes ? (
+                  <div className="mt-2">
+                    <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div>
+                    <div className="mt-1 flex items-center gap-2">
+                      {hasLongNote ? (
+                        <button
+                          type="button"
+                          onClick={() => setShowFullNote(true)}
+                          className="text-[11px] px-2 py-1 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-200"
+                        >
+                          Read full note
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+
+                {/* TAGS */}
+                {item.tags?.length ? (
+                  <div className="text-[11px] text-neutral-500 mt-1 truncate">{item.tags.join(" • ")}</div>
+                ) : null}
               </div>
 
-              {item.notes ? <div className="text-xs text-neutral-300 mt-2 line-clamp-2">{item.notes}</div> : null}
-              {item.tags?.length ? <div className="text-[11px] text-neutral-500 mt-1 truncate">{item.tags.join(" • ")}</div> : null}
+              {/* ACTIONS */}
+              <div className="flex items-center gap-2 shrink-0">
+                {isEditing ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={saveEdit}
+                      className="text-xs px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
+                      title="Save"
+                    >
+                      Save
+                    </button>
+                    <button
+                      type="button"
+                      onClick={cancelEdit}
+                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                      title="Cancel"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setIsEditing(true)}
+                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                      title="Edit"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      onClick={onDelete}
+                      className="text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+                      title="Delete"
+                      type="button"
+                    >
+                      Delete
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
-
-            <button
-              onClick={onDelete}
-              className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 shrink-0"
-              title="Delete"
-            >
-              Delete
-            </button>
-          </div>
-        </div>
-
-        <div className="text-center">
-          <input
-            type="number"
-            min={0}
-            max={10}
-            value={item.rating ?? ""}
-            onChange={(e) => {
-              const v = e.target.value;
-              if (v === "") onUpdate({ rating: undefined });
-              else onUpdate({ rating: clamp(Number(v), 0, 10) });
-                          }}
-            className="w-16 text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-sm outline-none focus:border-neutral-500"
-            placeholder="—"
-          />
-          <div className="text-[11px] text-neutral-500 mt-1">/ 10</div>
-        </div>
-
-        <div className="text-center text-sm text-neutral-300">{TYPE_LABEL[item.type]}</div>
-
-        <div className="text-center">
-          <div className="inline-flex items-center gap-2">
-            <button
-              type="button"
-              onClick={decCur}
-              className="h-8 w-8 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
-              aria-label="Decrease progress"
-              title="Decrease progress"
-            >
-              −
-            </button>
-
-            <div className="min-w-[76px] text-sm text-neutral-200 tabular-nums">{progressText}</div>
-
-            <button
-              type="button"
-              onClick={incCur}
-              className="h-8 w-8 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
-              aria-label="Increase progress"
-              title="Increase progress"
-            >
-              +
-            </button>
           </div>
 
-          {/* Optional quick edit for total */}
-          <div className="mt-2 flex items-center justify-center gap-2">
-            <span className="text-[11px] text-neutral-500">Total</span>
-            <input
-              type="number"
-              min={0}
-              value={
-                item.type === "movie"
-                  ? 1
-                  : typeof item.progressTotalOverride === "number"
-                  ? item.progressTotalOverride
-                  : typeof item.progressTotal === "number"
-                  ? item.progressTotal
-                  : ""
-              }
-              onChange={(e) => {
-                if (item.type === "movie") return;
-                const v = e.target.value;
-                if (v === "") return onUpdate({ progressTotal: undefined, progressTotalOverride: undefined });
-                const n = Math.max(0, Number(v) || 0);
-                // store in override to preserve autofilled base
-                onUpdate({ progressTotalOverride: n });
-              }}
-              className="w-20 text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
-              placeholder="—"
-            />
+          {/* SCORE */}
+          <div className="text-center text-sm text-neutral-300 tabular-nums">
+            {isEditing ? (
+              <input
+                value={draftRating}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "" || /^\d{0,2}(\.\d{0,1})?$/.test(v)) setDraftRating(v);
+                }}
+                placeholder="—"
+                className="w-[5.5rem] text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+                title="Rating (0–10)"
+              />
+            ) : typeof item.rating === "number" ? (
+              item.rating.toFixed(1)
+            ) : (
+              "—"
+            )}
+          </div>
+
+          {/* TYPE */}
+          <div className="text-center text-sm text-neutral-300">{TYPE_LABEL[item.type]}</div>
+
+          {/* PROGRESS / HOURS */}
+          <div className="text-center w-full">
+            {isGame ? (
+              <>
+                <div className="text-sm text-neutral-200 tabular-nums whitespace-nowrap">{hoursText}</div>
+
+                <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
+                  <span className="text-[11px] text-neutral-500">Hours</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step="0.1"
+                    value={typeof item.hoursPlayed === "number" ? item.hoursPlayed : ""}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (v === "") return onUpdate({ hoursPlayed: undefined });
+                      const n = Math.max(0, Number(v) || 0);
+                      onUpdate({ hoursPlayed: n });
+                    }}
+                    className="w-[min(6rem,100%)] text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+                    placeholder="—"
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={decCur}
+                    className="h-[2.1rem] w-[2.1rem] rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
+                    aria-label="Decrease progress"
+                    title="Decrease progress"
+                  >
+                    −
+                  </button>
+
+                  <div className="min-w-0 px-2 text-sm text-neutral-200 tabular-nums whitespace-nowrap">{progressText}</div>
+
+                  <button
+                    type="button"
+                    onClick={incCur}
+                    className="h-[2.1rem] w-[2.1rem] rounded-lg bg-white/5 border border-white/10 hover:bg-white/10"
+                    aria-label="Increase progress"
+                    title="Increase progress"
+                  >
+                    +
+                  </button>
+                </div>
+
+                <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
+                  <span className="text-[11px] text-neutral-500">Total</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={
+                      item.type === "movie"
+                        ? 1
+                        : typeof item.progressTotalOverride === "number"
+                        ? item.progressTotalOverride
+                        : typeof item.progressTotal === "number"
+                        ? item.progressTotal
+                        : ""
+                    }
+                    onChange={(e) => {
+                      if (item.type === "movie") return;
+                      const v = e.target.value;
+                      if (v === "") return onUpdate({ progressTotal: undefined, progressTotalOverride: undefined });
+                      const n = Math.max(0, Number(v) || 0);
+                      onUpdate({ progressTotalOverride: n });
+                    }}
+                    className="w-[min(6rem,100%)] text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+                    placeholder="—"
+                  />
+                </div>
+              </>
+            )}
           </div>
         </div>
       </div>
-    </div>
+    </>
   );
 }
 
@@ -2382,7 +2887,11 @@ function CardDraggable({
 
         <div className="min-w-0 flex-1">
           <div className="font-semibold text-sm text-neutral-200 truncate">{item.title}</div>
-          <div className="text-[11px] text-neutral-500 mt-1">Progress: {progressText}</div>
+          <div className="text-[11px] text-neutral-500 mt-1">
+            {item.type === "game"
+              ? `Hours: ${typeof item.hoursPlayed === "number" ? `${item.hoursPlayed.toFixed(1)}h` : "—"}`
+              : `Progress: ${progressText}`}
+          </div>
 
           <div className="flex items-center justify-between mt-3">
             <select
@@ -2699,4 +3208,3 @@ function TagEditor({
     </div>
   );
 }
-
