@@ -779,18 +779,17 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         const hadCompleted = x.status === "completed";
         const nowCompleted = merged.status === "completed";
 
+        // ✅ Was status explicitly changed by the user in this update?
+        const statusExplicit = Object.prototype.hasOwnProperty.call(patch, "status");
+
         const getEffectiveProgress = (it: MediaItem) => {
           if (it.type === "movie") {
             const d = getMovieProgressDefaults(it);
             return { cur: d.cur, total: d.total };
           }
 
-          const cur =
-            typeof it.progressCurOverride === "number" ? it.progressCurOverride : it.progressCur;
-
-          const total =
-            typeof it.progressTotalOverride === "number" ? it.progressTotalOverride : it.progressTotal;
-
+          const cur = typeof it.progressCurOverride === "number" ? it.progressCurOverride : it.progressCur;
+          const total = typeof it.progressTotalOverride === "number" ? it.progressTotalOverride : it.progressTotal;
           return { cur, total };
         };
 
@@ -799,12 +798,13 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           merged.dateFinished = todayYMD();
         }
 
-        // If progress hits total, auto-complete (+ date)
         const { cur, total } = getEffectiveProgress(merged);
         const totalNum = typeof total === "number" && Number.isFinite(total) ? total : undefined;
         const curNum = typeof cur === "number" && Number.isFinite(cur) ? cur : undefined;
 
+        // ✅ Only auto-complete from progress when status was NOT manually changed
         if (
+          !statusExplicit &&
           merged.status !== "completed" &&
           typeof totalNum === "number" &&
           totalNum > 0 &&
@@ -823,9 +823,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           } else if (merged.type === "tv" || merged.type === "anime" || merged.type === "manga") {
             if (typeof totalNum === "number" && totalNum > 0) {
               const currentCur =
-                typeof merged.progressCurOverride === "number"
-                  ? merged.progressCurOverride
-                  : merged.progressCur;
+                typeof merged.progressCurOverride === "number" ? merged.progressCurOverride : merged.progressCur;
 
               if (typeof currentCur !== "number" || currentCur < totalNum) {
                 merged.progressCur = totalNum;
@@ -1121,13 +1119,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           const isCompletion = !!best && bNorm.startsWith(qNorm) && qNorm.length >= 2;
           setGhostTitle(isCompletion ? best!.title : "");
 
-          const applyKey = `${key}:${best?.provider ?? "x"}:${best?.tmdbId ?? best?.igdbId ?? best?.anilistId ?? best?.title ?? ""}`;
-          if (best && bestScore >= 0.78 && lastAutofillKey.current !== applyKey) {
-            lastAutofillKey.current = applyKey;
-            await applySuggestion(best, { keepManualTags: true });
-          } else {
-            setAutofillStatus(best ? `Suggestions ready (${Math.round(bestScore * 100)}% match).` : "No match found.");
-          }
+          // Do NOT auto-apply while typing.
+          // Only show suggestions + ghost preview. User must select (Enter/click) or Tab-accept.
+          setAutofillStatus(best ? `Suggestions ready (${Math.round(bestScore * 100)}% match).` : "No match found.");
+          lastAutofillKey.current = ""; // optional: prevents stale "locked" state
         };
 
         if (type === "movie" || type === "tv") {
@@ -1946,6 +1941,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       value={form.title || ""}
                       onChange={(e) => {
                         const v = e.target.value;
+                        lastAutofillKey.current = "";
                         setForm({ ...form, title: v });
                         setShowSuggest(true);
                       }}
@@ -2456,7 +2452,7 @@ function MALRow({
   const [showFullNote, setShowFullNote] = React.useState(false);
 
   // keep drafts in sync if item changes while not editing
-  React.useEffect(() => {
+  useEffect(() => {
     if (isEditing) return;
     setDraftTitle(item.title);
     setDraftDate(item.dateFinished ?? "");
@@ -3153,8 +3149,10 @@ function TagEditor({
   };
 
   const remove = (t: string) => {
-    onChangeManual((manualTags ?? []).filter((x) => x.toLowerCase() !== t.toLowerCase()));
+    const next = (manualTags ?? []).filter((x) => x.toLowerCase() !== t.toLowerCase());
+    onChangeManual(next);
   };
+
 
   return (
     <div className="space-y-2">
