@@ -1110,14 +1110,19 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     }
 
     const key = `${type}:${title.toLowerCase()}`;
+    lastAutofillKey.current = key;
+
 
     if (autofillTimer.current) window.clearTimeout(autofillTimer.current);
 
     autofillTimer.current = window.setTimeout(async () => {
       try {
         setAutofillStatus("Searching…");
+        if (lastAutofillKey.current !== key) return;
+
 
         const pushSuggestions = async (list: Suggestion[]) => {
+          if (lastAutofillKey.current !== key) return;
           const q = title;
           const scored = list
             .map((x) => ({ x, score: similarityScore(q, x.title) }))
@@ -1730,96 +1735,50 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
         {/* STATS PAGE */}
         {view === "stats" ? (
-          <div className="space-y-4">
-            <div className="grid md:grid-cols-4 gap-4">
+          <div className="space-y-6">
+            {/* Top KPIs */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
               <StatCard title="Total items" value={items.length.toString()} sub={`${statusCounts.completed} completed`} />
               <StatCard title="Completed" value={totalCompleted.toString()} sub="(after excludes)" />
               <StatCard
-                title="Time watched (runtime)"
+                title="Time watched"
                 value={`${(totalRuntimeMinutesCompleted / 60).toFixed(1)}h`}
-                sub={`${totalRuntimeMinutesCompleted} min (movies exact; TV/anime estimated; games use hours played)`}
+                sub={`${totalRuntimeMinutesCompleted} min`}
               />
               <StatCard title="Rewatches" value={`${rewatchTotals.rewatches}`} sub={`${rewatchTotals.itemsRewatched} items`} />
             </div>
 
-            {/* ✅ Fun stats row */}
-            <div className="grid md:grid-cols-4 gap-4">
-              <StatCard title="Best month" value={`${bestMonth.label}`} sub={`${bestMonth.count} completed`} />
-              <StatCard title="Current streak" value={`${completionStreak.current} days`} sub={`Longest: ${completionStreak.longest} days`} />
-              <StatCard title="Top game" value={gameHoursStats.topGameTitle} sub={`${gameHoursStats.topGameHours.toFixed(1)}h`} />
-              <StatCard title="Avg game hours" value={`${gameHoursStats.avgHours.toFixed(1)}h`} sub={`Total: ${gameHoursStats.totalHours.toFixed(1)}h`} />
-            </div>
-
-            <div className="grid lg:grid-cols-2 gap-4">
-              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-                <div className="text-sm font-medium mb-3">Status breakdown</div>
-                <div className="space-y-2 text-sm">
-                  <BarRow label="Completed" value={statusCounts.completed} total={items.length || 1} />
-                  <BarRow label="In Progress" value={statusCounts.in_progress} total={items.length || 1} />
-                  <BarRow label="Planned" value={statusCounts.planned} total={items.length || 1} />
-                  <BarRow label="Dropped" value={statusCounts.dropped} total={items.length || 1} />
+            {/* Highlights */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <Panel title="Highlights" right={<span className="text-xs text-neutral-500">Quick wins</span>}>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <MiniStat label="Best month" value={`${bestMonth.label}`} sub={`${bestMonth.count} completed`} />
+                  <MiniStat label="Current streak" value={`${completionStreak.current} days`} sub={`Longest: ${completionStreak.longest}`} />
+                  <MiniStat label="Top game" value={gameHoursStats.topGameTitle} sub={`${gameHoursStats.topGameHours.toFixed(1)}h`} />
+                  <MiniStat label="Avg game hours" value={`${gameHoursStats.avgHours.toFixed(1)}h`} sub={`Total: ${gameHoursStats.totalHours.toFixed(1)}h`} />
                 </div>
 
-                <div className="text-xs text-neutral-400 mt-4">Exclude types (affects stats):</div>
-                <div className="flex flex-wrap gap-2 mt-2">
-                  {(["movie", "tv", "anime", "manga", "book", "game"] as MediaType[]).map((t) => (
-                    <button
-                      key={t}
-                      type="button"
-                      onClick={() => toggleExclude(t)}
-                      className={`px-3 py-1 rounded-xl border text-xs ${
-                        excludeTypes.has(t) ? "bg-red-500/15 border-red-500/20" : "bg-white/5 border-white/10 hover:bg-white/10"
-                      }`}
-                    >
-                      {excludeTypes.has(t) ? `Excluded: ${TYPE_LABEL[t]}` : TYPE_LABEL[t]}
-                    </button>
-                  ))}
+                <div className="mt-4 grid grid-cols-1 gap-2">
+                  <MiniStat
+                    label={`Top genre this year (${yearGenreCompare.year})`}
+                    value={yearGenreCompare.thisYearTop.tag}
+                    sub={`${yearGenreCompare.thisYearTop.count}`}
+                  />
+                  <MiniStat
+                    label={`Top genre last year (${yearGenreCompare.year - 1})`}
+                    value={yearGenreCompare.lastYearTop.tag}
+                    sub={`${yearGenreCompare.lastYearTop.count}`}
+                  />
+                  <MiniStat label="Most rewatched" value={mostRewatchedItem.title} sub={`${mostRewatchedItem.count}`} />
                 </div>
-              </div>
+              </Panel>
 
-              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-                <div className="text-sm font-medium mb-3">Type totals</div>
-                <div className="space-y-2">
-                  {typeCounts.length ? (
-                    typeCounts.map((x) => (
-                      <div
-                        key={x.type}
-                        className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2"
-                      >
-                        <div className="text-sm text-neutral-200">{TYPE_LABEL[x.type]}</div>
-                        <div className="text-sm text-neutral-300">{x.count}</div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="text-xs text-neutral-400">No items yet.</div>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            <div className="grid lg:grid-cols-2 gap-4">
-              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-                <div className="text-sm font-medium mb-3">Average rating (by type)</div>
-                <div className="grid sm:grid-cols-2 gap-2 text-sm text-neutral-300">
-                  {avgByType.length ? (
-                    avgByType.map((x) => (
-                      <div key={x.type} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
-                        <div className="text-xs text-neutral-400">{TYPE_LABEL[x.type]}</div>
-                        <div>
-                          {x.avg.toFixed(1)} <span className="text-xs text-neutral-500">({x.count} rated)</span>
-                        </div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="text-xs text-neutral-400">Rate some items to see averages.</div>
-                  )}
-                </div>
-              </div>
-
-              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-                <div className="text-sm font-medium mb-3">Completed per month (last 12)</div>
-
-                <div className="flex items-end gap-2 h-28">
+              <Panel
+                title="Monthly completions"
+                right={<span className="text-xs text-neutral-500">Last 12 months</span>}
+                className="lg:col-span-2"
+              >
+                <div className="flex items-end gap-2 h-32">
                   {monthlyCompleted.months.map((m) => {
                     const h = Math.round((m.count / monthlyCompleted.max) * 100);
                     return (
@@ -1834,50 +1793,55 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                     );
                   })}
                 </div>
-
-                <div className="text-xs text-neutral-500 mt-3">Uses date watched if set; otherwise created date.</div>
-              </div>
+                <div className="text-xs text-neutral-500 mt-3">
+                  Uses <span className="text-neutral-400">date watched</span> if set; otherwise <span className="text-neutral-400">created date</span>.
+                </div>
+              </Panel>
             </div>
 
-            {/* ✅ Year highlights */}
-            <div className="grid lg:grid-cols-2 gap-4">
-              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-                <div className="text-sm font-medium mb-3">Year highlights</div>
-                <div className="space-y-2 text-sm text-neutral-300">
-                  <div className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
-                    <div>Top genre this year ({yearGenreCompare.year})</div>
-                    <div className="text-neutral-200">
-                      {yearGenreCompare.thisYearTop.tag}{" "}
-                      <span className="text-neutral-500">({yearGenreCompare.thisYearTop.count})</span>
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
-                    <div>Top genre last year ({yearGenreCompare.year - 1})</div>
-                    <div className="text-neutral-200">
-                      {yearGenreCompare.lastYearTop.tag}{" "}
-                      <span className="text-neutral-500">({yearGenreCompare.lastYearTop.count})</span>
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
-                    <div>Most rewatched</div>
-                    <div className="text-neutral-200">
-                      {mostRewatchedItem.title}{" "}
-                      <span className="text-neutral-500">({mostRewatchedItem.count})</span>
-                    </div>
-                  </div>
+            {/* Breakdown + Genres */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <Panel title="Status breakdown" right={<span className="text-xs text-neutral-500">{items.length} total</span>}>
+                <div className="space-y-2 text-sm">
+                  <BarRow label="Completed" value={statusCounts.completed} total={items.length || 1} />
+                  <BarRow label="In Progress" value={statusCounts.in_progress} total={items.length || 1} />
+                  <BarRow label="Planned" value={statusCounts.planned} total={items.length || 1} />
+                  <BarRow label="Dropped" value={statusCounts.dropped} total={items.length || 1} />
                 </div>
-              </div>
 
-              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-                <div className="text-sm font-medium mb-3">Genres (completed)</div>
+                <details className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
+                  <summary className="cursor-pointer select-none text-xs text-neutral-300">
+                    Exclude types (affects all stats)
+                    <span className="text-neutral-500"> — click to expand</span>
+                  </summary>
+
+                  <div className="text-xs text-neutral-400 mt-3">Toggle types:</div>
+                  <div className="flex flex-wrap gap-2 mt-2">
+                    {(["movie", "tv", "anime", "manga", "book", "game"] as MediaType[]).map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => toggleExclude(t)}
+                        className={`px-3 py-1 rounded-xl border text-xs ${
+                          excludeTypes.has(t) ? "bg-red-500/15 border-red-500/20" : "bg-white/5 border-white/10 hover:bg-white/10"
+                        }`}
+                      >
+                        {excludeTypes.has(t) ? `Excluded: ${TYPE_LABEL[t]}` : TYPE_LABEL[t]}
+                      </button>
+                    ))}
+                  </div>
+                </details>
+              </Panel>
+
+              <Panel title="Genres (completed)" className="lg:col-span-2">
                 {genreCounts.length ? (
-                  <div className="flex items-center gap-6">
+                  <div className="flex flex-col sm:flex-row sm:items-center gap-6">
                     <PieChartSimple data={genreCounts} />
                     <div className="space-y-2 text-sm w-full">
                       {genreCounts.map((g) => (
                         <div key={g.label} className="flex items-center justify-between gap-6">
                           <div className="text-neutral-300 truncate">{g.label}</div>
-                          <div className="text-neutral-400">{g.value}</div>
+                          <div className="text-neutral-400 tabular-nums">{g.value}</div>
                         </div>
                       ))}
                     </div>
@@ -1885,42 +1849,84 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 ) : (
                   <div className="text-xs text-neutral-400">No genres yet.</div>
                 )}
-              </div>
-            </div>
 
-            <div className="grid lg:grid-cols-2 gap-4">
-              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-                <div className="text-sm font-medium mb-3">Top tags / genres (completed)</div>
+                <details className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
+                  <summary className="cursor-pointer select-none text-xs text-neutral-300">
+                    Top tags (completed)
+                    <span className="text-neutral-500"> — click to expand</span>
+                  </summary>
 
-                {topTags.length ? (
-                  <div className="flex flex-wrap gap-2">
-                    {topTags.map((t) => (
-                      <div
-                        key={t.tag}
-                        className="px-3 py-1 rounded-xl bg-neutral-950 border border-neutral-800 text-xs text-neutral-200"
-                        title={`${t.count} items`}
-                      >
-                        {t.tag} <span className="text-neutral-500">({t.count})</span>
+                  <div className="mt-3">
+                    {topTags.length ? (
+                      <div className="flex flex-wrap gap-2">
+                        {topTags.map((t) => (
+                          <div
+                            key={t.tag}
+                            className="px-3 py-1 rounded-xl bg-neutral-950 border border-neutral-800 text-xs text-neutral-200"
+                            title={`${t.count} items`}
+                          >
+                            {t.tag} <span className="text-neutral-500">({t.count})</span>
+                          </div>
+                        ))}
                       </div>
-                    ))}
+                    ) : (
+                      <div className="text-xs text-neutral-400">No tags yet.</div>
+                    )}
                   </div>
-                ) : (
-                  <div className="text-xs text-neutral-400">No tags yet (auto-fill adds genres for Movie/TV/Game/Anime/Manga).</div>
-                )}
-              </div>
-
-              <div className="bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
-                <div className="text-sm font-medium mb-3">Notes</div>
-                <div className="text-xs text-neutral-400 space-y-2">
-                  <div> </div>
-                  <div> </div>
-                  <div> </div>
-                  <div> </div>
-                </div>
-              </div>
+                </details>
+              </Panel>
             </div>
+
+            {/* “Deep dive” section (collapsible, removes repetition by default) */}
+            <Panel title="Details" right={<span className="text-xs text-neutral-500">Less clutter by default</span>}>
+              <details className="rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
+                <summary className="cursor-pointer select-none text-xs text-neutral-300">
+                  Type totals
+                  <span className="text-neutral-500"> — click to expand</span>
+                </summary>
+
+                <div className="mt-3 space-y-2">
+                  {typeCounts.length ? (
+                    typeCounts.map((x) => (
+                      <div
+                        key={x.type}
+                        className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2"
+                      >
+                        <div className="text-sm text-neutral-200">{TYPE_LABEL[x.type]}</div>
+                        <div className="text-sm text-neutral-300 tabular-nums">{x.count}</div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-xs text-neutral-400">No items yet.</div>
+                  )}
+                </div>
+              </details>
+
+              <details className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
+                <summary className="cursor-pointer select-none text-xs text-neutral-300">
+                  Average rating (by type)
+                  <span className="text-neutral-500"> — click to expand</span>
+                </summary>
+
+                <div className="mt-3 grid sm:grid-cols-2 gap-2 text-sm text-neutral-300">
+                  {avgByType.length ? (
+                    avgByType.map((x) => (
+                      <div key={x.type} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+                        <div className="text-xs text-neutral-400">{TYPE_LABEL[x.type]}</div>
+                        <div>
+                          {x.avg.toFixed(1)} <span className="text-xs text-neutral-500">({x.count} rated)</span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-xs text-neutral-400">Rate some items to see averages.</div>
+                  )}
+                </div>
+              </details>
+            </Panel>
           </div>
         ) : null}
+
 
         {/* ADD PAGE */}
         {view === "add" ? (
@@ -2557,20 +2563,28 @@ function MALRow({
   const hasTotal = typeof total === "number";
   const progressText = hasCur || hasTotal ? (hasTotal ? `${cur ?? 0} / ${total}` : `${cur ?? 0}`) : "—";
 
+  const effectiveCur = typeof cur === "number" ? cur : 0;
+
+  const usingCurOverride = item.type !== "movie" && typeof item.progressCurOverride === "number";
+
   const incCur = () => {
-    const base = typeof item.progressCur === "number" ? item.progressCur : 0;
     const t = typeof total === "number" ? total : undefined;
-    const next = t ? Math.min(t, base + 1) : base + 1;
+    const next = t ? Math.min(t, effectiveCur + 1) : effectiveCur + 1;
+
     if (item.type === "movie") return onUpdate({ progressCur: Math.min(1, next), progressTotal: 1 });
-    onUpdate({ progressCur: next });
+
+    onUpdate(usingCurOverride ? { progressCurOverride: next } : { progressCur: next });
   };
 
   const decCur = () => {
-    const base = typeof item.progressCur === "number" ? item.progressCur : 0;
-    const next = Math.max(0, base - 1);
+    const next = Math.max(0, effectiveCur - 1);
+
     if (item.type === "movie") return onUpdate({ progressCur: Math.min(1, next), progressTotal: 1 });
-    onUpdate({ progressCur: next });
+
+    onUpdate(usingCurOverride ? { progressCurOverride: next } : { progressCur: next });
   };
+
+
 
   const isGame = item.type === "game";
   const hoursText = typeof item.hoursPlayed === "number" ? `${item.hoursPlayed.toFixed(1)}h` : "—";
@@ -2962,6 +2976,44 @@ function CardDraggable({
 }
 
 /* ================= SMALL UI COMPONENTS ================= */
+
+function Panel({
+  title,
+  right,
+  className,
+  children,
+}: {
+  title: string;
+  right?: React.ReactNode;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className={[
+        "bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm",
+        className || "",
+      ].join(" ")}
+    >
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <div className="text-sm font-medium text-neutral-200">{title}</div>
+        {right ? <div className="shrink-0">{right}</div> : null}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function MiniStat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+      <div className="text-[11px] text-neutral-500">{label}</div>
+      <div className="text-sm text-neutral-200 mt-1 truncate">{value}</div>
+      {sub ? <div className="text-[11px] text-neutral-600 mt-1">{sub}</div> : null}
+    </div>
+  );
+}
+
 
 function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
   return (
