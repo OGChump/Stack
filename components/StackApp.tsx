@@ -2,19 +2,24 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { supabase } from "../lib/supabaseClient";
+import { supabase } from "@/lib/supabaseClient";
 import { DndContext, DragEndEvent, useDraggable, useDroppable } from "@dnd-kit/core";
 
 /* ================= TYPES ================= */
 
 type MediaType = "movie" | "tv" | "anime" | "manga" | "book" | "game";
-type Status = "planned" | "in_progress" | "dropped" | "completed";
-
 type GroupMode = "none" | "day" | "month" | "year";
 type SortMode = "newest" | "oldest" | "title" | "rating_high" | "rating_low";
 
-export type StackView = "all" | "completed" | "watching" | "watchlist" | "dropped" | "stats" | "add";
-
+export type StackView =
+  | "all"
+  | "completed"
+  | "in_progress"
+  | "planned"
+  | "dropped"
+  | "stats"
+  | "add"
+  | "friends";
 type MediaItem = {
   id: string;
   title: string;
@@ -84,7 +89,9 @@ type AnilistSearchResponse = {
   error?: string;
 };
 
-type Pick = { title: string; posterUrl?: string; tmdbId?: number; tmdbType?: "movie" | "tv" };
+type Pick =
+  | { provider: "tmdb"; title: string; posterUrl?: string; tmdbId: number; tmdbType: "movie" | "tv" }
+  | { provider: "anilist"; title: string; posterUrl?: string; anilistId: number; anilistType: "ANIME" };
 
 type Suggestion = {
   key: string; // unique key for list rendering
@@ -116,12 +123,15 @@ const TYPE_LABEL: Record<MediaType, string> = {
   game: "Game",
 };
 
-const STATUSES: Array<{ id: Status; label: string }> = [
+const STATUSES = [
   { id: "completed", label: "Completed" },
   { id: "in_progress", label: "In Progress" },
   { id: "planned", label: "Planned" },
   { id: "dropped", label: "Dropped" },
-];
+] as const;
+
+type Status = (typeof STATUSES)[number]["id"];
+
 
 function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -323,6 +333,76 @@ async function anilistDetails(
 
 // ================= RECOMMENDER HELPERS (TMDB) =================
 
+type TmdbDiscoverResult = {
+  results?: Array<{ id: number; title?: string; name?: string; poster_path?: string | null }>;
+  total_pages?: number;
+};
+
+async function tmdbDiscoverRandom(type: "movie" | "tv") {
+  const key = process.env.NEXT_PUBLIC_TMDB_KEY;
+  if (!key) throw new Error("Missing TMDB key (NEXT_PUBLIC_TMDB_KEY).");
+
+  // TMDB caps discover pages; 1..500 is the typical safe range
+  const page = 1 + Math.floor(Math.random() * 500);
+
+  const url = new URL(`https://api.themoviedb.org/3/discover/${type}`);
+  url.searchParams.set("api_key", key);
+  url.searchParams.set("include_adult", "false");
+  url.searchParams.set("page", String(page));
+  url.searchParams.set("sort_by", "popularity.desc");
+
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`TMDB discover failed (${res.status}).`);
+  const json = (await res.json()) as TmdbDiscoverResult;
+
+  const list = (json.results ?? []).filter((x) => x && x.id);
+  if (!list.length) throw new Error("TMDB discover returned no results.");
+
+  const picked = list[Math.floor(Math.random() * list.length)];
+  const title = (picked.title || picked.name || "").trim();
+  const posterUrl = picked.poster_path ? `https://image.tmdb.org/t/p/w500${picked.poster_path}` : undefined;
+
+  return { title, tmdbId: picked.id, tmdbType: type, posterUrl };
+}
+
+async function anilistRandomAnime(): Promise<{ title: string; anilistId: number; posterUrl?: string }> {
+  // Random page of popular anime, then random entry in that page
+  const page = 1 + Math.floor(Math.random() * 200); // wide enough to feel random
+  const perPage = 25;
+
+  const query = `
+    query ($page: Int, $perPage: Int) {
+      Page(page: $page, perPage: $perPage) {
+        media(type: ANIME, sort: POPULARITY_DESC) {
+          id
+          title { romaji english native }
+          coverImage { extraLarge large medium }
+        }
+      }
+    }
+  `;
+
+  const res = await fetch("https://graphql.anilist.co", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ query, variables: { page, perPage } }),
+  });
+
+  if (!res.ok) throw new Error(`AniList random failed (${res.status}).`);
+
+  const json = (await res.json()) as any;
+  const list = (json?.data?.Page?.media ?? []).filter(Boolean);
+  if (!list.length) throw new Error("AniList random returned no results.");
+
+  const picked = list[Math.floor(Math.random() * list.length)];
+  const title =
+    (picked?.title?.english || picked?.title?.romaji || picked?.title?.native || "").trim() || "Unknown";
+  const posterUrl = picked?.coverImage?.extraLarge || picked?.coverImage?.large || picked?.coverImage?.medium || undefined;
+
+  return { title, anilistId: picked.id, posterUrl };
+}
+
+
 type TmdbTrendingResult = {
   results?: Array<{ id: number; title?: string; name?: string }>;
 };
@@ -440,15 +520,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [query, setQuery] = useState("");
   const groupMode: GroupMode = "none";
   const [sortMode, setSortMode] = useState<SortMode>("newest");
-  const [boardView, setBoardView] = useState<boolean>(() => {
+  const [boardView, setBoardView] = useState<boolean>(true);
+
+  useEffect(() => {
     try {
       const raw = localStorage.getItem(LOCAL_BOARD_VIEW_KEY);
-      if (raw === null) return true; // default
-      return raw === "1" || raw === "true";
-    } catch {
-      return true;
-    }
-  });
+      if (raw !== null) setBoardView(raw === "1" || raw === "true");
+    } catch {}
+  }, []);
+
 
   const [autofillStatus, setAutofillStatus] = useState("");
   const [autoAutofill, setAutoAutofill] = useState(true);
@@ -460,6 +540,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const [picks, setPicks] = useState<Pick[]>([]);
   const [pickStatus, setPickStatus] = useState("");
+  const seenPickKeysRef = useRef<Set<string>>(new Set());
+
 
   const [excludeTypes, setExcludeTypes] = useState<Set<MediaType>>(new Set());
 
@@ -536,8 +618,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     () => [
       { href: "/", label: "All", key: "all" as StackView },
       { href: "/completed", label: "Completed", key: "completed" as StackView },
-      { href: "/watching", label: "In Progress", key: "watching" as StackView },
-      { href: "/watchlist", label: "Planned", key: "watchlist" as StackView },
+      { href: "/in-progress", label: "In Progress", key: "in_progress" as StackView },
+      { href: "/planned", label: "Planned", key: "planned" as StackView },
       { href: "/dropped", label: "Dropped", key: "dropped" as StackView },
     ],
     []
@@ -547,9 +629,11 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     () => [
       { href: "/stats", label: "Stats", key: "stats" as StackView, icon: "pie" as const },
       { href: "/add", label: "Add", key: "add" as StackView, icon: "plus" as const },
+      { href: "/friends", label: "Friends", key: "friends" as StackView, icon: "users" as const },
     ],
     []
   );
+
 
   /* ================= LOCAL BACKUP ================= */
 
@@ -1030,73 +1114,74 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   /* ================= APPLY SUGGESTION ================= */
 
   const applySuggestion = useCallback(async (s: Suggestion, opts?: { keepManualTags?: boolean }) => {
-    const keepManual = opts?.keepManualTags ?? true;
+  const keepManual = opts?.keepManualTags ?? true;
 
-    setAutofillStatus(`Applying: ${s.title}…`);
+  const currentType = (formRef.current?.type as MediaType) ?? "movie";
+  const currentStatus = (formRef.current?.status as Status) ?? "completed";
 
-    setForm((f) => {
-      const base = {
-        ...f,
-        title: s.title,
-        posterUrl: s.posterUrl || f.posterUrl,
-        runtime: typeof s.runtime === "number" ? s.runtime : f.runtime,
-      };
+  setAutofillStatus(`Applying: ${s.title}…`);
 
-      if (s.provider === "tmdb") {
-        return {
-          ...base,
-          tmdbId: s.tmdbId,
-          tmdbType: s.tmdbType,
-          igdbId: undefined,
-          anilistId: undefined,
-          anilistType: undefined,
-        };
-      }
+  setForm((f) => {
+    const base = {
+      ...f,
+      title: s.title,
+      posterUrl: s.posterUrl || f.posterUrl,
+      runtime: typeof s.runtime === "number" ? s.runtime : f.runtime,
+    };
 
-      if (s.provider === "igdb") {
-        return {
-          ...base,
-          igdbId: s.igdbId,
-          tmdbId: undefined,
-          tmdbType: undefined,
-          anilistId: undefined,
-          anilistType: undefined,
-        };
-      }
-
+    if (s.provider === "tmdb") {
       return {
         ...base,
-        anilistId: s.anilistId,
-        anilistType: s.anilistType,
-        tmdbId: undefined,
-        tmdbType: undefined,
+        tmdbId: s.tmdbId,
+        tmdbType: s.tmdbType,
         igdbId: undefined,
+        anilistId: undefined,
+        anilistType: undefined,
       };
-    });
-
-    const newAuto = uniqTags([...(s.tags ?? [])]);
-    setAutoTags(newAuto);
-    if (!keepManual) setManualTags([]);
-
-    const currentType = (formRef.current?.type as MediaType) ?? "movie";
-    const currentStatus = (formRef.current?.status as Status) ?? "completed";
-
-    if (typeof s.progressTotal === "number" && s.progressTotal > 0) {
-      setProgressTotalText((prev) => (prev.trim() === "" ? String(s.progressTotal) : prev));
-      setProgressCurText((prev) => {
-        if (prev.trim() !== "") return prev;
-        if (currentStatus === "completed") return String(s.progressTotal);
-        return prev;
-      });
-    } else {
-      if (currentType === "movie") {
-        setProgressTotalText((prev) => (prev.trim() === "" ? "1" : prev));
-        if (currentStatus === "completed") setProgressCurText((prev) => (prev.trim() === "" ? "1" : prev));
-      }
     }
 
-    setAutofillStatus("Auto-fill complete.");
-  }, []);
+    if (s.provider === "igdb") {
+      return {
+        ...base,
+        igdbId: s.igdbId,
+        tmdbId: undefined,
+        tmdbType: undefined,
+        anilistId: undefined,
+        anilistType: undefined,
+      };
+    }
+
+    return {
+      ...base,
+      anilistId: s.anilistId,
+      anilistType: s.anilistType,
+      tmdbId: undefined,
+      tmdbType: undefined,
+      igdbId: undefined,
+    };
+  });
+
+  const newAuto = uniqTags([...(s.tags ?? [])]);
+  setAutoTags(newAuto);
+  if (!keepManual) setManualTags([]);
+
+  if (typeof s.progressTotal === "number" && s.progressTotal > 0) {
+    setProgressTotalText((prev) => (prev.trim() === "" ? String(s.progressTotal) : prev));
+    setProgressCurText((prev) => {
+      if (prev.trim() !== "") return prev;
+      if (currentStatus === "completed") return String(s.progressTotal);
+      return prev;
+    });
+  } else if (currentType === "movie") {
+    setProgressTotalText((prev) => (prev.trim() === "" ? "1" : prev));
+    if (currentStatus === "completed") {
+      setProgressCurText((prev) => (prev.trim() === "" ? "1" : prev));
+    }
+  }
+
+  setAutofillStatus("Auto-fill complete.");
+}, []);
+
 
   /* ================= AUTO AUTOFILL ================= */
 
@@ -1149,7 +1234,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           // Do NOT auto-apply while typing.
           // Only show suggestions + ghost preview. User must select (Enter/click) or Tab-accept.
           setAutofillStatus(best ? `Suggestions ready (${Math.round(bestScore * 100)}% match).` : "No match found.");
-          lastAutofillKey.current = ""; // optional: prevents stale "locked" state
         };
 
         if (type === "movie" || type === "tv") {
@@ -1270,7 +1354,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     return () => {
       if (autofillTimer.current) window.clearTimeout(autofillTimer.current);
     };
-  }, [form.title, form.type, autoAutofill, applySuggestion]);
+  }, [form.title, form.type, autoAutofill]);
 
   const selectSuggestion = useCallback(
     async (s: Suggestion) => {
@@ -1356,8 +1440,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     let out = items.slice();
 
     if (view === "completed") out = out.filter((i) => i.status === "completed");
-    if (view === "watching") out = out.filter((i) => i.status === "in_progress");
-    if (view === "watchlist") out = out.filter((i) => i.status === "planned");
+    if (view === "in_progress") out = out.filter((i) => i.status === "in_progress");
+    if (view === "planned") out = out.filter((i) => i.status === "planned");
     if (view === "dropped") out = out.filter((i) => i.status === "dropped");
 
     if (query) {
@@ -1728,8 +1812,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   >
                     {n.icon === "plus" ? (
                       <span className="text-[clamp(1.0rem,2.4vw,1.35rem)] leading-none">+</span>
-                    ) : (
+                    ) : n.icon === "pie" ? (
                       <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">◔</span>
+                    ) : (
+                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">👥</span>
                     )}
                   </Link>
                 ))}
@@ -1977,7 +2063,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       value={form.title || ""}
                       onChange={(e) => {
                         const v = e.target.value;
-                        lastAutofillKey.current = "";
                         setForm({ ...form, title: v });
                         setShowSuggest(true);
                       }}
@@ -1991,8 +2076,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                           setForm((f) => ({ ...f, title: ghostTitle }));
                           setGhostTitle("");
                           setShowSuggest(false);
-                          const best = suggestions[0];
-                          if (best) selectSuggestion(best);
                           return;
                         }
 
@@ -2023,6 +2106,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                           }
                         }
                       }}
+
                       placeholder="Title"
                       className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
                     />
@@ -2304,7 +2388,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         ) : null}
 
         {/* LIST PAGES */}
-        {view !== "stats" && view !== "add" ? (
+        {view !== "stats" && view !== "add" && view !== "friends" ? (
           <div className="space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <input
@@ -3256,7 +3340,6 @@ function TagEditor({
     onChangeManual(next);
   };
 
-
   return (
     <div className="space-y-2">
       <div className="text-xs text-neutral-400">Tags</div>
@@ -3300,7 +3383,11 @@ function TagEditor({
           placeholder="Add tags (comma separated)"
           className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500"
         />
-        <button type="button" onClick={add} className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15">
+        <button
+          type="button"
+          onClick={add}
+          className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+        >
           Add
         </button>
       </div>

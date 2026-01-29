@@ -6,7 +6,7 @@ import StackApp from "../../components/StackApp";
 export default function Page() {
   return (
     <AuthGate>
-      <StackApp view="watchlist" />
+      <StackApp view="in_progress" />
     </AuthGate>
   );
 }
