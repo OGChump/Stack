@@ -945,136 +945,112 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     );
   }
 
-  async function pickForMe(mode: "best" | "random" = "best") {
-    try {
-      setPickStatus(mode === "random" ? "Finding something random…" : "Finding picks…");
-      setPicks([]);
+async function pickForMe(mode: "best" | "random" = "best") {
+  try {
+    setPickStatus(mode === "random" ? "Finding something random…" : "Finding picks…");
+    setPicks([]);
 
-      const existingTitles = new Set(items.map((i) => i.title.toLowerCase()));
-      const taste = computeTasteProfile(items);
+    const existingTitles = new Set(items.map((i) => i.title.toLowerCase()));
+    const taste = computeTasteProfile(items);
 
-      const seed = items
-        .filter((i) => i.tmdbId && (i.tmdbType === "movie" || i.tmdbType === "tv") && typeof i.rating === "number")
-        .sort((a, b) => (b.rating ?? -1) - (a.rating ?? -1))
-        .slice(0, 10);
+    const seed = items
+      .filter((i) => i.tmdbId && (i.tmdbType === "movie" || i.tmdbType === "tv") && typeof i.rating === "number")
+      .sort((a, b) => (b.rating ?? -1) - (a.rating ?? -1))
+      .slice(0, 10);
 
-      const fallbackSeed = items
-        .filter((i) => i.tmdbId && (i.tmdbType === "movie" || i.tmdbType === "tv"))
-        .slice(0, 8);
+    const fallbackSeed = items
+      .filter((i) => i.tmdbId && (i.tmdbType === "movie" || i.tmdbType === "tv"))
+      .slice(0, 8);
 
-      const seeds = seed.length ? seed : fallbackSeed;
+    const seeds = seed.length ? seed : fallbackSeed;
 
-      const pool: Array<{ title: string; tmdbId: number; tmdbType: "movie" | "tv" }> = [];
+    const pool: Array<{ title: string; tmdbId: number; tmdbType: "movie" | "tv" }> = [];
 
-      for (const i of seeds) {
-        const tmdbId = i.tmdbId!;
-        const tmdbType = i.tmdbType!;
-        const rec = await tmdbRecommendations(tmdbId, tmdbType);
+    for (const i of seeds) {
+      const tmdbId = i.tmdbId!;
+      const tmdbType = i.tmdbType!;
+      const rec = await tmdbRecommendations(tmdbId, tmdbType);
 
-        for (const r of rec.results ?? []) {
-          const t = (r.title || r.name || "").trim();
-          if (!t) continue;
-          if (existingTitles.has(t.toLowerCase())) continue;
-          pool.push({ title: t, tmdbId: r.id, tmdbType });
-        }
-      }
-
-      const [trendMovie, trendTv] = await Promise.all([tmdbTrending("movie"), tmdbTrending("tv")]);
-
-      for (const r of trendMovie.results ?? []) {
+      for (const r of rec.results ?? []) {
         const t = (r.title || r.name || "").trim();
         if (!t) continue;
         if (existingTitles.has(t.toLowerCase())) continue;
-        pool.push({ title: t, tmdbId: r.id, tmdbType: "movie" });
+        pool.push({ title: t, tmdbId: r.id, tmdbType });
       }
+    }
 
-      for (const r of trendTv.results ?? []) {
-        const t = (r.title || r.name || "").trim();
-        if (!t) continue;
-        if (existingTitles.has(t.toLowerCase())) continue;
-        pool.push({ title: t, tmdbId: r.id, tmdbType: "tv" });
+    const [trendMovie, trendTv] = await Promise.all([
+      tmdbTrending("movie"),
+      tmdbTrending("tv"),
+    ]);
+
+    for (const r of trendMovie.results ?? []) {
+      const t = (r.title || r.name || "").trim();
+      if (!t) continue;
+      if (existingTitles.has(t.toLowerCase())) continue;
+      pool.push({ title: t, tmdbId: r.id, tmdbType: "movie" });
+    }
+
+    for (const r of trendTv.results ?? []) {
+      const t = (r.title || r.name || "").trim();
+      if (!t) continue;
+      if (existingTitles.has(t.toLowerCase())) continue;
+      pool.push({ title: t, tmdbId: r.id, tmdbType: "tv" });
+    }
+
+    const seen = new Set<string>();
+    const unique = pool.filter((x) => {
+      const k = `${x.tmdbType}:${x.tmdbId}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+
+    if (!unique.length) {
+      setPickStatus("No new picks found (try rating more items).");
+      return;
+    }
+
+    const candidates = unique.slice(0, 80);
+    const enriched: Array<Pick & { score: number; tags: string[] }> = [];
+
+    for (const c of candidates) {
+      try {
+        const d = await tmdbDetails(c.tmdbId, c.tmdbType);
+        const posterUrl = d.poster_path
+          ? `https://image.tmdb.org/t/p/w500${d.poster_path}`
+          : undefined;
+        const tags = (d.genres ?? []).map((g) => g.name);
+
+        const typeBoost = c.tmdbType === "movie" ? taste.typePref.movie : taste.typePref.tv;
+
+        const score = scoreCandidate({
+          candidateTags: tags,
+          userTopTags: taste.topTags,
+          typeBoost,
+        });
+
+        enriched.push({
+          provider: "tmdb",
+          title: c.title,
+          tmdbId: c.tmdbId,
+          tmdbType: c.tmdbType,
+          posterUrl,
+          score,
+          tags,
+        });
+      } catch {
+        // ignore TMDB failures for individual items
       }
+    }
 
-      const seen = new Set<string>();
-      const unique = pool.filter((x) => {
-        const k = `${x.tmdbType}:${x.tmdbId}`;
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      });
+    enriched.sort((a, b) => b.score - a.score);
 
-      if (!unique.length) {
-        setPickStatus("No new picks found (try rating more items).");
-        return;
-      }
-
-      const candidates = unique.slice(0, 80);
-
-      const enriched: Array<Pick & { score: number; tags: string[] }> = [];
-
-      for (const c of candidates) {
-        try {
-          const d = await tmdbDetails(c.tmdbId, c.tmdbType);
-          const posterUrl = d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : undefined;
-          const tags = (d.genres ?? []).map((g) => g.name);
-
-          const typeBoost = c.tmdbType === "movie" ? taste.typePref.movie : taste.typePref.tv;
-
-          const score = scoreCandidate({
-            candidateTags: tags,
-            userTopTags: taste.topTags,
-            typeBoost,
-          });
-
-          enriched.push({
-            provider: "tmdb",
-            title: c.title,
-            tmdbId: c.tmdbId,
-            tmdbType: c.tmdbType,
-            posterUrl,
-            score,
-            tags,
-          });
-        } catch {
-          // ignore TMDB failures for individual items
-        }
-      }
-      enriched.sort((a, b) => b.score - a.score);
-
-      if (mode === "random") {
-        const top = enriched.slice(0, 30);
-        const weights = top.map((x) => Math.max(0.0001, x.score));
-        const total = weights.reduce((a, b) => a + b, 0);
-
-        let r = Math.random() * total;
-        let chosen = top[top.length - 1];
-
-        for (let i = 0; i < top.length; i++) {
-          r -= weights[i];
-          if (r <= 0) {
-            chosen = top[i];
-            break;
-          }
-        }
-
-        setPicks([
-          {
-            provider: "tmdb",
-            title: chosen.title,
-            tmdbId: chosen.tmdbId,
-            tmdbType: chosen.tmdbType,
-            posterUrl: chosen.posterUrl,
-          }
-        ]);
-
-        setPickStatus("Random pick selected.");
-        return;
-      }
-
-      const diversified = diversifyPicks(enriched, 2);
+    if (mode === "best") {
+      const top = diversifyPicks(enriched);
 
       setPicks(
-        diversified.map((p) => ({
+        top.map((p) => ({
           provider: "tmdb",
           title: p.title,
           tmdbId: p.tmdbId,
@@ -1083,21 +1059,31 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         }))
       );
 
+      setPickStatus("Here you go.");
+      return;
+    }
+
+    if (mode === "random") {
+      const chosen = enriched[Math.floor(Math.random() * enriched.length)];
+
+      setPicks([
+        {
+          provider: "tmdb",
+          title: chosen.title,
+          tmdbId: chosen.tmdbId,
+          tmdbType: chosen.tmdbType,
+          posterUrl: chosen.posterUrl,
+        },
+      ]);
 
       setPickStatus("Here you go.");
-    } catch (e: unknown) {
-      setPickStatus(e instanceof Error ? e.message : "Pick failed");
+      return;
     }
+  } catch {
+    setPickStatus("Something went wrong.");
   }
+}
 
-  function toggleExclude(t: MediaType) {
-    setExcludeTypes((prev) => {
-      const next = new Set(prev);
-      if (next.has(t)) next.delete(t);
-      else next.add(t);
-      return next;
-    });
-  }
 
   /* ================= DRAG & DROP ================= */
 
@@ -2374,7 +2360,13 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 {picks.length ? (
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                     {picks.map((p) => (
-                      <div key={`${p.tmdbType ?? "x"}:${p.tmdbId ?? p.title}`} className="space-y-2">
+                      <div
+                        key={
+                          p.provider === "tmdb"
+                            ? `tmdb:${p.tmdbType}:${p.tmdbId}`
+                            : `anilist:${p.anilistId}`
+                        }
+                      >
                         <div className="aspect-[2/3] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
                           {p.posterUrl ? (
                             // eslint-disable-next-line @next/next/no-img-element
