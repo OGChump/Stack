@@ -1057,7 +1057,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           }
         }
 
-        setPicks([{ title: chosen.title, tmdbId: chosen.tmdbId, tmdbType: chosen.tmdbType, posterUrl: chosen.posterUrl }]);
+        setPicks([
+          {
+            provider: "tmdb",
+            title: chosen.title,
+            tmdbId: chosen.tmdbId,
+            tmdbType: chosen.tmdbType,
+            posterUrl: chosen.posterUrl,
+          }
+        ]);
+
         setPickStatus("Random pick selected.");
         return;
       }
@@ -1066,12 +1075,14 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
       setPicks(
         diversified.map((p) => ({
+          provider: "tmdb",
           title: p.title,
           tmdbId: p.tmdbId,
           tmdbType: p.tmdbType,
           posterUrl: p.posterUrl,
         }))
       );
+
 
       setPickStatus("Here you go.");
     } catch (e: unknown) {
