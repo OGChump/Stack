@@ -269,6 +269,7 @@ async function anilistDetails(
   coverUrl?: string;
   genres?: string[];
   episodes?: number | null;
+  duration?: number | null;
   chapters?: number | null;
   volumes?: number | null;
 }> {
@@ -278,6 +279,7 @@ async function anilistDetails(
         coverImage { extraLarge large medium }
         genres
         episodes
+        duration
         chapters
         volumes
       }
@@ -296,6 +298,7 @@ async function anilistDetails(
         coverImage?: { extraLarge?: string; large?: string; medium?: string };
         genres?: string[];
         episodes?: number | null;
+        duration?: number | null;
         chapters?: number | null;
         volumes?: number | null;
       };
@@ -312,6 +315,7 @@ async function anilistDetails(
     coverUrl,
     genres,
     episodes: typeof m?.episodes === "number" ? m.episodes : null,
+    duration: typeof m?.duration === "number" ? m.duration : null,
     chapters: typeof m?.chapters === "number" ? m.chapters : null,
     volumes: typeof m?.volumes === "number" ? m.volumes : null,
   };
@@ -1317,6 +1321,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               posterUrl: d.coverUrl || s.posterUrl,
               tags,
               progressTotal,
+              runtime: typeof d.duration === "number" ? d.duration : undefined,
             },
             { keepManualTags: true }
           );
@@ -1750,7 +1755,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
             {/* Highlights */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              <Panel title="Highlights" right={<span className="text-xs text-neutral-500">Quick wins</span>}>
+              <Panel title="Highlights" right={<span className="text-xs text-neutral-500">Quick stats</span>}>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <MiniStat label="Best month" value={`${bestMonth.label}`} sub={`${bestMonth.count} completed`} />
                   <MiniStat label="Current streak" value={`${completionStreak.current} days`} sub={`Longest: ${completionStreak.longest}`} />
@@ -1780,12 +1785,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               >
                 <div className="flex items-end gap-2 h-32">
                   {monthlyCompleted.months.map((m) => {
-                    const h = Math.round((m.count / monthlyCompleted.max) * 100);
+                    const h = Math.round((m.count / monthlyCompleted.max) * 96);
                     return (
                       <div key={m.key} className="flex-1 min-w-[18px] text-center">
                         <div
                           className="rounded-lg bg-white/10 border border-white/10 mx-auto"
-                          style={{ height: `${Math.max(6, h)}%` }}
+                          style={{ height: `${Math.max(6, h)}px` }}
                           title={`${m.key}: ${m.count}`}
                         />
                         <div className="text-[10px] text-neutral-500 mt-2">{m.label}</div>
