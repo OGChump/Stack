@@ -1027,6 +1027,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           });
 
           enriched.push({
+            provider: "tmdb",
             title: c.title,
             tmdbId: c.tmdbId,
             tmdbType: c.tmdbType,
@@ -1035,17 +1036,9 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             tags,
           });
         } catch {
-          enriched.push({
-            title: c.title,
-            tmdbId: c.tmdbId,
-            tmdbType: c.tmdbType,
-            posterUrl: undefined,
-            score: 0.1,
-            tags: [],
-          });
+          // ignore TMDB failures for individual items
         }
       }
-
       enriched.sort((a, b) => b.score - a.score);
 
       if (mode === "random") {
