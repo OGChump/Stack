@@ -104,6 +104,8 @@ type Suggestion = {
 };
 
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
+const LOCAL_BOARD_VIEW_KEY = "stack-board-view-v1";
+
 
 const TYPE_LABEL: Record<MediaType, string> = {
   movie: "Movie",
@@ -432,9 +434,17 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [userId, setUserId] = useState<string | null>(null);
 
   const [query, setQuery] = useState("");
-  const [groupMode] = useState<GroupMode>("none");
+  const groupMode: GroupMode = "none";
   const [sortMode, setSortMode] = useState<SortMode>("newest");
-  const [boardView, setBoardView] = useState(true);
+  const [boardView, setBoardView] = useState<boolean>(() => {
+    try {
+      const raw = localStorage.getItem(LOCAL_BOARD_VIEW_KEY);
+      if (raw === null) return true; // default
+      return raw === "1" || raw === "true";
+    } catch {
+      return true;
+    }
+  });
 
   const [autofillStatus, setAutofillStatus] = useState("");
   const [autoAutofill, setAutoAutofill] = useState(true);
@@ -470,10 +480,18 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const undoTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_BOARD_VIEW_KEY, boardView ? "1" : "0");
+    } catch {}
+  }, [boardView]);
+
+  // ✅ Cleanup undo timer on unmount
+  useEffect(() => {
     return () => {
       if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
     };
   }, []);
+
 
   // Add form lives only on /add
   const [form, setForm] = useState<Partial<MediaItem>>({
@@ -1362,6 +1380,13 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     }
     return Array.from(map.entries()).sort((a, b) => (a[0] < b[0] ? 1 : -1));
   }, [filtered, groupMode]);
+
+    const byStatusFiltered = useMemo(() => {
+      const map: Record<Status, MediaItem[]> = { completed: [], in_progress: [], planned: [], dropped: [] };
+      for (const i of filtered) map[i.status].push(i);
+      return map;
+    }, [filtered]);
+
 
   /* ================= STATS ================= */
 
@@ -2316,18 +2341,39 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   ))}
                 </div>
               ) : (
-                <div className="space-y-3">
-                  <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
-                    <div />
-                    <div>Title</div>
-                    <div className="text-center">Score</div>
-                    <div className="text-center">Type</div>
-                    <div className="text-center">Progress / Hours</div>
-                  </div>
+                <div className="space-y-6">
+                  {STATUSES.map((s) => {
+                    const list = byStatusFiltered[s.id];
+                    if (!list.length) return null;
 
-                  {filtered.map((i) => (
-                    <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
-                  ))}
+                    return (
+                      <section key={s.id} className="space-y-3">
+                        <div className="flex items-center justify-between">
+                          <h3 className="text-sm text-neutral-300">{s.label}</h3>
+                          <div className="text-xs text-neutral-500">{list.length}</div>
+                        </div>
+
+                        <div className="space-y-3">
+                          <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
+                            <div />
+                            <div>Title</div>
+                            <div className="text-center">Score</div>
+                            <div className="text-center">Type</div>
+                            <div className="text-center">Progress / Hours</div>
+                          </div>
+
+                          {list.map((i) => (
+                            <MALRow
+                              key={i.id}
+                              item={i}
+                              onDelete={() => removeItem(i.id)}
+                              onUpdate={(patch) => updateItem(i.id, patch)}
+                            />
+                          ))}
+                        </div>
+                      </section>
+                    );
+                  })}
                 </div>
               )}
             </DndContext>
