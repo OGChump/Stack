@@ -495,8 +495,11 @@ function scoreCandidate(opts: { candidateTags: string[]; userTopTags: string[]; 
   return 0.65 * clamp01(overlapScore) + 0.35 * clamp01(opts.typeBoost);
 }
 
-function diversifyPicks(picks: Array<Pick & { score: number; tags: string[] }>, maxPerTopTag = 2) {
-  const out: Array<Pick & { score: number; tags: string[] }> = [];
+function diversifyPicks<T extends { score: number; tags: string[] }>(
+  picks: T[],
+  maxPerTopTag = 2
+) {
+  const out: T[] = [];
   const tagCounts = new Map<string, number>();
 
   for (const p of picks) {
@@ -512,6 +515,7 @@ function diversifyPicks(picks: Array<Pick & { score: number; tags: string[] }>, 
 
   return out.length ? out : picks.slice(0, 8);
 }
+
 
 /* ================= APP ================= */
 
