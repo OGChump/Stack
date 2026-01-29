@@ -546,6 +546,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
 
   const [excludeTypes, setExcludeTypes] = useState<Set<MediaType>>(new Set());
+  const toggleExclude = useCallback((t: MediaType) => {
+    setExcludeTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(t)) next.delete(t);
+      else next.add(t);
+      return next;
+    });
+  }, []);
+
 
   // Autofill UX improvements
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
@@ -658,292 +667,324 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   /* ================= SUPABASE ================= */
 
-  const loadCloud = useCallback(
-    async (uidStr: string) => {
-      setSaveStatus("Loading…");
-      setCloudLoaded(false);
+// ✅ ADDITION (keep this in the same file, above loadCloud/saveCloud/pickForMe)
+type TmdbPick = {
+  provider: "tmdb";
+  title: string;
+  posterUrl?: string;
+  tmdbId: number;
+  tmdbType: "movie" | "tv";
+};
 
-      const { data, error } = await supabase.from("media_items").select("data").eq("user_id", uidStr).maybeSingle();
+const loadCloud = useCallback(
+  async (uidStr: string) => {
+    setSaveStatus("Loading…");
+    setCloudLoaded(false);
 
-      if (error) {
-        console.error(error);
-        const backup = loadLocalBackup();
-        if (backup) setItems(backup);
-        setCloudLoaded(true);
-        setSaveStatus("Loaded (local backup)");
-        return;
-      }
+    const { data, error } = await supabase
+      .from("media_items")
+      .select("data")
+      .eq("user_id", uidStr)
+      .maybeSingle();
 
-      if (data?.data && typeof data.data === "object" && "items" in data.data) {
-        const next = (data.data as { items: MediaItem[] }).items ?? [];
-        setItems(next);
-        saveLocalBackup(next);
-        setCloudLoaded(true);
-        setSaveStatus("Loaded");
-      } else {
-        const ins = await supabase.from("media_items").insert({
-          user_id: uidStr,
-          data: { items: [] },
-        });
+    if (error) {
+      console.error(error);
+      const backup = loadLocalBackup();
+      if (backup) setItems(backup);
+      setCloudLoaded(true);
+      setSaveStatus("Loaded (local backup)");
+      return;
+    }
 
-        if (ins.error) {
-          console.error(ins.error);
-          const backup = loadLocalBackup();
-          if (backup) setItems(backup);
-          setCloudLoaded(true);
-          setSaveStatus("Loaded (local backup)");
-          return;
+    // ✅ Safely extract items from the JSON column
+    const raw = data?.data as unknown;
+
+    const parsedItems =
+      raw &&
+      typeof raw === "object" &&
+      raw !== null &&
+      "items" in raw &&
+      Array.isArray((raw as any).items)
+        ? ((raw as any).items as MediaItem[])
+        : null;
+
+    if (parsedItems) {
+      setItems(parsedItems);
+      saveLocalBackup(parsedItems);
+      setCloudLoaded(true);
+      setSaveStatus("Loaded");
+      return;
+    }
+
+    // ✅ If row exists but shape is wrong OR row doesn't exist: create a clean row
+    // ✅ If row exists but shape is wrong OR row doesn't exist: create/repair a clean row
+    const up = await supabase
+      .from("media_items")
+      .upsert({ user_id: uidStr, data: { items: [] } }, { onConflict: "user_id" });
+
+    if (up.error) {
+      console.error(up.error);
+      const backup = loadLocalBackup();
+      if (backup) setItems(backup);
+      setCloudLoaded(true);
+      setSaveStatus("Loaded (local backup)");
+      return;
+    }
+
+    setItems([]);
+    saveLocalBackup([]);
+    setCloudLoaded(true);
+    setSaveStatus("Loaded");
+  },
+  [loadLocalBackup, saveLocalBackup]
+);
+
+const saveCloud = useCallback(
+  async (uidStr: string, next: MediaItem[]) => {
+    // always keep local backup up-to-date
+    saveLocalBackup(next);
+
+    // don't push to cloud until we've finished an initial load
+    if (!cloudLoaded) return;
+
+    setSaveStatus("Saving…");
+
+    const { error } = await supabase
+      .from("media_items")
+      .upsert({ user_id: uidStr, data: { items: next } }, { onConflict: "user_id" });
+
+    if (error) {
+      console.error(error);
+      setSaveStatus("Saved locally (cloud error)");
+      return;
+    }
+
+    setSaveStatus("Saved");
+  },
+  [cloudLoaded, saveLocalBackup]
+);
+
+useEffect(() => {
+  const backup = loadLocalBackup();
+  if (backup) setItems(backup);
+}, [loadLocalBackup]);
+
+useEffect(() => {
+  supabase.auth.getUser().then(({ data }) => {
+    const id = data.user?.id ?? null;
+    setUserId(id);
+    if (id) loadCloud(id);
+  });
+
+  const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
+    const id = s?.user?.id ?? null;
+    setUserId(id);
+    if (id) loadCloud(id);
+  });
+
+  return () => {
+    sub?.subscription?.unsubscribe();
+  };
+}, [loadCloud]);
+
+useEffect(() => {
+  if (userId) saveCloud(userId, items);
+  else saveLocalBackup(items);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [items, userId, cloudLoaded]);
+
+/* ================= ACTIONS ================= */
+
+function addItem(e: React.SyntheticEvent) {
+  e.preventDefault();
+  if (!form.title) return;
+
+  const status = (form.status as Status) ?? "completed";
+
+  const manualDate = (form.dateFinished || "").trim();
+  const autoDate = status === "completed" ? todayYMD() : "";
+  const finalDate = manualDate || autoDate || undefined;
+
+  const ratingNum = ratingText.trim() === "" ? undefined : Number(ratingText);
+  const rating =
+    typeof ratingNum === "number" && Number.isFinite(ratingNum) ? clamp(ratingNum, 0, 10) : undefined;
+
+  const rewatchCount = rewatchText.trim() === "" ? 0 : Math.max(0, Number(rewatchText) || 0);
+
+  const pc = progressCurText.trim() === "" ? undefined : Math.max(0, Number(progressCurText) || 0);
+  const pt = progressTotalText.trim() === "" ? undefined : Math.max(0, Number(progressTotalText) || 0);
+
+  // Progress defaults:
+  const inferredTotal = (form.type as MediaType) === "movie" ? (typeof pt === "number" ? pt : 1) : pt;
+  const inferredCur =
+    typeof pc === "number"
+      ? pc
+      : status === "completed" && typeof inferredTotal === "number"
+      ? inferredTotal
+      : undefined;
+
+  const tags = uniqTags([...(autoTags ?? []), ...(manualTags ?? [])]);
+
+  const item: MediaItem = {
+    id: uid(),
+    title: String(form.title).trim(),
+    type: form.type as MediaType,
+    status,
+    inTheaters: !!form.inTheaters,
+    dateFinished: finalDate,
+
+    posterUrl: (form.posterUrl || "").trim() || undefined,
+    posterOverrideUrl: (form.posterOverrideUrl || "").trim() || undefined,
+
+    runtime: typeof form.runtime === "number" ? form.runtime : undefined,
+    notes: (form.notes || "").trim() || undefined,
+    tags,
+    rewatchCount,
+    createdAt: new Date().toISOString(),
+    rating,
+
+    tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
+    tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
+    igdbId: typeof form.igdbId === "number" ? form.igdbId : undefined,
+    anilistId: typeof form.anilistId === "number" ? form.anilistId : undefined,
+    anilistType: form.anilistType === "ANIME" || form.anilistType === "MANGA" ? form.anilistType : undefined,
+
+    progressCur: typeof inferredCur === "number" ? inferredCur : undefined,
+    progressTotal: typeof inferredTotal === "number" ? inferredTotal : undefined,
+
+    hoursPlayed: typeof form.hoursPlayed === "number" ? form.hoursPlayed : undefined,
+  };
+
+  setItems((p) => [item, ...p]);
+
+  // reset
+  setAutofillStatus("");
+  setSuggestions([]);
+  setShowSuggest(false);
+  setGhostTitle("");
+  setActiveSuggestIdx(0);
+
+  setForm((prev) => ({
+    title: "",
+    type: prev.type ?? "movie",
+    status: "completed",
+    tags: [],
+    inTheaters: false,
+    notes: "",
+    dateFinished: "",
+    posterUrl: "",
+    posterOverrideUrl: "",
+    runtime: undefined,
+    rewatchCount: 0,
+    rating: undefined,
+    tmdbId: undefined,
+    tmdbType: undefined,
+    igdbId: undefined,
+    anilistId: undefined,
+    anilistType: undefined,
+    progressCur: undefined,
+    progressTotal: undefined,
+    hoursPlayed: undefined,
+  }));
+
+  setAutoTags([]);
+  setManualTags([]);
+
+  setRatingText("");
+  setRewatchText("0");
+  setProgressCurText("");
+  setProgressTotalText("");
+}
+
+// ✅ Undo delete
+function removeItem(id: string) {
+  setItems((prev) => {
+    const idx = prev.findIndex((x) => x.id === id);
+    if (idx === -1) return prev;
+
+    const deleted = prev[idx];
+
+    if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+
+    setUndoState({ item: deleted, index: idx });
+
+    undoTimerRef.current = window.setTimeout(() => {
+      setUndoState(null);
+      undoTimerRef.current = null;
+    }, 7000);
+
+    return prev.filter((x) => x.id !== id);
+  });
+}
+
+// ✅ Smart status + smart date + progress auto-complete
+function updateItem(id: string, patch: Partial<MediaItem>) {
+  setItems((prev) =>
+    prev.map((x) => {
+      if (x.id !== id) return x;
+
+      const merged: MediaItem = { ...x, ...patch };
+
+      const hadCompleted = x.status === "completed";
+      const nowCompleted = merged.status === "completed";
+
+      // ✅ Was status explicitly changed by the user in this update?
+      const statusExplicit = Object.prototype.hasOwnProperty.call(patch, "status");
+
+      const getEffectiveProgress = (it: MediaItem) => {
+        if (it.type === "movie") {
+          const d = getMovieProgressDefaults(it);
+          return { cur: d.cur, total: d.total };
         }
 
-        setItems([]);
-        saveLocalBackup([]);
-        setCloudLoaded(true);
-        setSaveStatus("Loaded");
-      }
-    },
-    [loadLocalBackup, saveLocalBackup]
-  );
+        const cur = typeof it.progressCurOverride === "number" ? it.progressCurOverride : it.progressCur;
+        const total = typeof it.progressTotalOverride === "number" ? it.progressTotalOverride : it.progressTotal;
+        return { cur, total };
+      };
 
-  const saveCloud = useCallback(
-    async (uidStr: string, next: MediaItem[]) => {
-      saveLocalBackup(next);
-      if (!cloudLoaded) return;
-
-      setSaveStatus("Saving…");
-
-      const { error } = await supabase
-        .from("media_items")
-        .upsert({ user_id: uidStr, data: { items: next } }, { onConflict: "user_id" });
-
-      if (error) {
-        console.error(error);
-        setSaveStatus("Saved locally (cloud error)");
-        return;
+      // If status becomes completed and no date, set to today
+      if (!hadCompleted && nowCompleted && !merged.dateFinished) {
+        merged.dateFinished = todayYMD();
       }
 
-      setSaveStatus("Saved");
-    },
-    [cloudLoaded, saveLocalBackup]
-  );
+      const { cur, total } = getEffectiveProgress(merged);
+      const totalNum = typeof total === "number" && Number.isFinite(total) ? total : undefined;
+      const curNum = typeof cur === "number" && Number.isFinite(cur) ? cur : undefined;
 
-  useEffect(() => {
-    const backup = loadLocalBackup();
-    if (backup) setItems(backup);
-  }, [loadLocalBackup]);
+      // ✅ Only auto-complete from progress when status was NOT manually changed
+      if (
+        !statusExplicit &&
+        merged.status !== "completed" &&
+        typeof totalNum === "number" &&
+        totalNum > 0 &&
+        typeof curNum === "number" &&
+        curNum >= totalNum
+      ) {
+        merged.status = "completed";
+        if (!merged.dateFinished) merged.dateFinished = todayYMD();
+      }
 
-  useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      const id = data.user?.id ?? null;
-      setUserId(id);
-      if (id) loadCloud(id);
-    });
+      // When completed, make progress "finished" where appropriate
+      if (merged.status === "completed") {
+        if (merged.type === "movie") {
+          merged.progressTotal = 1;
+          merged.progressCur = 1;
+        } else if (merged.type === "tv" || merged.type === "anime" || merged.type === "manga") {
+          if (typeof totalNum === "number" && totalNum > 0) {
+            const currentCur =
+              typeof merged.progressCurOverride === "number" ? merged.progressCurOverride : merged.progressCur;
 
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
-      const id = s?.user?.id ?? null;
-      setUserId(id);
-      if (id) loadCloud(id);
-    });
-
-    return () => sub.subscription.unsubscribe();
-  }, [loadCloud]);
-
-  useEffect(() => {
-    if (userId) saveCloud(userId, items);
-    else saveLocalBackup(items);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items, userId, cloudLoaded]);
-
-  /* ================= ACTIONS ================= */
-
-  function addItem(e: React.SyntheticEvent) {
-    e.preventDefault();
-    if (!form.title) return;
-
-    const status = (form.status as Status) ?? "completed";
-
-    const manualDate = (form.dateFinished || "").trim();
-    const autoDate = status === "completed" ? todayYMD() : "";
-    const finalDate = manualDate || autoDate || undefined;
-
-    const ratingNum = ratingText.trim() === "" ? undefined : Number(ratingText);
-    const rating = typeof ratingNum === "number" && Number.isFinite(ratingNum) ? clamp(ratingNum, 0, 10) : undefined;
-
-    const rewatchCount = rewatchText.trim() === "" ? 0 : Math.max(0, Number(rewatchText) || 0);
-
-    const pc = progressCurText.trim() === "" ? undefined : Math.max(0, Number(progressCurText) || 0);
-    const pt = progressTotalText.trim() === "" ? undefined : Math.max(0, Number(progressTotalText) || 0);
-
-    // Progress defaults:
-    const inferredTotal = (form.type as MediaType) === "movie" ? (typeof pt === "number" ? pt : 1) : pt;
-    const inferredCur =
-      typeof pc === "number"
-        ? pc
-        : status === "completed" && typeof inferredTotal === "number"
-        ? inferredTotal
-        : undefined;
-
-    const tags = uniqTags([...(autoTags ?? []), ...(manualTags ?? [])]);
-
-    const item: MediaItem = {
-      id: uid(),
-      title: String(form.title).trim(),
-      type: form.type as MediaType,
-      status,
-      inTheaters: !!form.inTheaters,
-      dateFinished: finalDate,
-
-      posterUrl: (form.posterUrl || "").trim() || undefined,
-      posterOverrideUrl: (form.posterOverrideUrl || "").trim() || undefined,
-
-      runtime: typeof form.runtime === "number" ? form.runtime : undefined,
-      notes: (form.notes || "").trim() || undefined,
-      tags,
-      rewatchCount,
-      createdAt: new Date().toISOString(),
-      rating,
-
-      tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
-      tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
-      igdbId: typeof form.igdbId === "number" ? form.igdbId : undefined,
-      anilistId: typeof form.anilistId === "number" ? form.anilistId : undefined,
-      anilistType: form.anilistType === "ANIME" || form.anilistType === "MANGA" ? form.anilistType : undefined,
-
-      progressCur: typeof inferredCur === "number" ? inferredCur : undefined,
-      progressTotal: typeof inferredTotal === "number" ? inferredTotal : undefined,
-
-      hoursPlayed: typeof form.hoursPlayed === "number" ? form.hoursPlayed : undefined,
-    };
-
-    setItems((p) => [item, ...p]);
-
-    // reset
-    setAutofillStatus("");
-    setSuggestions([]);
-    setShowSuggest(false);
-    setGhostTitle("");
-    setActiveSuggestIdx(0);
-
-    setForm((prev) => ({
-      title: "",
-      type: prev.type ?? "movie",
-      status: "completed",
-      tags: [],
-      inTheaters: false,
-      notes: "",
-      dateFinished: "",
-      posterUrl: "",
-      posterOverrideUrl: "",
-      runtime: undefined,
-      rewatchCount: 0,
-      rating: undefined,
-      tmdbId: undefined,
-      tmdbType: undefined,
-      igdbId: undefined,
-      anilistId: undefined,
-      anilistType: undefined,
-      progressCur: undefined,
-      progressTotal: undefined,
-      hoursPlayed: undefined,
-    }));
-
-    setAutoTags([]);
-    setManualTags([]);
-
-    setRatingText("");
-    setRewatchText("0");
-    setProgressCurText("");
-    setProgressTotalText("");
-  }
-
-  // ✅ Undo delete
-  function removeItem(id: string) {
-    setItems((prev) => {
-      const idx = prev.findIndex((x) => x.id === id);
-      if (idx === -1) return prev;
-
-      const deleted = prev[idx];
-
-      if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
-
-      setUndoState({ item: deleted, index: idx });
-
-      undoTimerRef.current = window.setTimeout(() => {
-        setUndoState(null);
-        undoTimerRef.current = null;
-      }, 7000);
-
-      return prev.filter((x) => x.id !== id);
-    });
-  }
-
-  // ✅ Smart status + smart date + progress auto-complete
-  function updateItem(id: string, patch: Partial<MediaItem>) {
-    setItems((prev) =>
-      prev.map((x) => {
-        if (x.id !== id) return x;
-
-        const merged: MediaItem = { ...x, ...patch };
-
-        const hadCompleted = x.status === "completed";
-        const nowCompleted = merged.status === "completed";
-
-        // ✅ Was status explicitly changed by the user in this update?
-        const statusExplicit = Object.prototype.hasOwnProperty.call(patch, "status");
-
-        const getEffectiveProgress = (it: MediaItem) => {
-          if (it.type === "movie") {
-            const d = getMovieProgressDefaults(it);
-            return { cur: d.cur, total: d.total };
-          }
-
-          const cur = typeof it.progressCurOverride === "number" ? it.progressCurOverride : it.progressCur;
-          const total = typeof it.progressTotalOverride === "number" ? it.progressTotalOverride : it.progressTotal;
-          return { cur, total };
-        };
-
-        // If status becomes completed and no date, set to today
-        if (!hadCompleted && nowCompleted && !merged.dateFinished) {
-          merged.dateFinished = todayYMD();
-        }
-
-        const { cur, total } = getEffectiveProgress(merged);
-        const totalNum = typeof total === "number" && Number.isFinite(total) ? total : undefined;
-        const curNum = typeof cur === "number" && Number.isFinite(cur) ? cur : undefined;
-
-        // ✅ Only auto-complete from progress when status was NOT manually changed
-        if (
-          !statusExplicit &&
-          merged.status !== "completed" &&
-          typeof totalNum === "number" &&
-          totalNum > 0 &&
-          typeof curNum === "number" &&
-          curNum >= totalNum
-        ) {
-          merged.status = "completed";
-          if (!merged.dateFinished) merged.dateFinished = todayYMD();
-        }
-
-        // When completed, make progress "finished" where appropriate
-        if (merged.status === "completed") {
-          if (merged.type === "movie") {
-            merged.progressTotal = 1;
-            merged.progressCur = 1;
-          } else if (merged.type === "tv" || merged.type === "anime" || merged.type === "manga") {
-            if (typeof totalNum === "number" && totalNum > 0) {
-              const currentCur =
-                typeof merged.progressCurOverride === "number" ? merged.progressCurOverride : merged.progressCur;
-
-              if (typeof currentCur !== "number" || currentCur < totalNum) {
-                merged.progressCur = totalNum;
-              }
+            if (typeof currentCur !== "number" || currentCur < totalNum) {
+              merged.progressCur = totalNum;
             }
           }
         }
+      }
 
-        return merged;
-      })
-    );
-  }
+      return merged;
+    })
+  );
+}
 
 async function pickForMe(mode: "best" | "random" = "best") {
   try {
@@ -979,10 +1020,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
       }
     }
 
-    const [trendMovie, trendTv] = await Promise.all([
-      tmdbTrending("movie"),
-      tmdbTrending("tv"),
-    ]);
+    const [trendMovie, trendTv] = await Promise.all([tmdbTrending("movie"), tmdbTrending("tv")]);
 
     for (const r of trendMovie.results ?? []) {
       const t = (r.title || r.name || "").trim();
@@ -1012,14 +1050,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
     }
 
     const candidates = unique.slice(0, 80);
-    const enriched: Array<Pick & { score: number; tags: string[] }> = [];
+    const enriched: Array<TmdbPick & { score: number; tags: string[] }> = [];
 
     for (const c of candidates) {
       try {
         const d = await tmdbDetails(c.tmdbId, c.tmdbType);
-        const posterUrl = d.poster_path
-          ? `https://image.tmdb.org/t/p/w500${d.poster_path}`
-          : undefined;
+        const posterUrl = d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : undefined;
         const tags = (d.genres ?? []).map((g) => g.name);
 
         const typeBoost = c.tmdbType === "movie" ? taste.typePref.movie : taste.typePref.tv;
@@ -1083,7 +1119,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
     setPickStatus("Something went wrong.");
   }
 }
-
 
   /* ================= DRAG & DROP ================= */
 
