@@ -543,6 +543,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const [cloudLoaded, setCloudLoaded] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
+  // ================= FRIENDS =================
+  const [inputUsername, setInputUsername] = useState("");
+  const [friendStatus, setFriendStatus] = useState("");
+
 
   const [picks, setPicks] = useState<Pick[]>([]);
   const [pickStatus, setPickStatus] = useState("");
@@ -671,6 +675,60 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   /* ================= SUPABASE ================= */
 
+  async function findProfileByUsername(username: string) {
+  const u = username.trim();
+  if (!u) return null;
+
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, username")
+    .ilike("username", u)
+    .maybeSingle();
+
+  if (error) {
+    console.error(error);
+    return null;
+  }
+
+  return data; // { id, username } or null
+}
+
+async function sendFriendRequest() {
+  setFriendStatus("");
+
+  if (!userId) {
+    setFriendStatus("You must be logged in.");
+    return;
+  }
+
+  const profile = await findProfileByUsername(inputUsername);
+
+  if (!profile?.id) {
+    setFriendStatus("User not found. (Make sure you typed their Stack username exactly.)");
+    return;
+  }
+
+  if (profile.id === userId) {
+    setFriendStatus("You can't friend yourself 💀");
+    return;
+  }
+
+  const { error } = await supabase.from("friend_requests").insert({
+    requester_id: userId,
+    requested_id: profile.id,
+    status: "pending",
+  });
+
+  if (error) {
+    console.error(error);
+    setFriendStatus(error.message || "Failed to send request.");
+    return;
+  }
+
+  setFriendStatus(`Friend request sent to ${profile.username}.`);
+  setInputUsername("");
+}
+
 // ✅ ADDITION (keep this in the same file, above loadCloud/saveCloud/pickForMe)
 type TmdbPick = {
   provider: "tmdb";
@@ -700,7 +758,6 @@ const loadCloud = useCallback(
       return;
     }
 
-    // ✅ Safely extract items from the JSON column
     const raw = data?.data as unknown;
 
     const parsedItems =
@@ -720,8 +777,6 @@ const loadCloud = useCallback(
       return;
     }
 
-    // ✅ If row exists but shape is wrong OR row doesn't exist: create a clean row
-    // ✅ If row exists but shape is wrong OR row doesn't exist: create/repair a clean row
     const up = await supabase
       .from("media_items")
       .upsert({ user_id: uidStr, data: { items: [] } }, { onConflict: "user_id" });
@@ -2421,6 +2476,34 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 ) : null}
               </div>
             </div>
+          </div>
+        ) : null}
+
+        {/* FRIENDS PAGE */}
+        {view === "friends" ? (
+          <div className="space-y-4 rounded-2xl bg-neutral-900/50 ring-1 ring-neutral-800/80 p-4 sm:p-6">
+            <div className="text-lg font-semibold">Friends</div>
+            <div className="text-sm text-neutral-400">
+              Add friends by their <span className="text-neutral-200">Stack username</span> (the one stored in <code>profiles.username</code>).
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                value={inputUsername}
+                onChange={(e) => setInputUsername(e.target.value)}
+                placeholder="Enter username (e.g., OGChump)"
+                className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+              />
+              <button
+                type="button"
+                onClick={sendFriendRequest}
+                className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+              >
+                Send request
+              </button>
+            </div>
+
+            {friendStatus ? <div className="text-sm text-neutral-300">{friendStatus}</div> : null}
           </div>
         ) : null}
 
