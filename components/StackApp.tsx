@@ -144,6 +144,8 @@ type Suggestion = {
 
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
 const LOCAL_BOARD_VIEW_KEY = "stack-board-view-v1";
+const LOCAL_NONBOARD_STATUS_KEY = "stack-nonboard-status-v1";
+
 
 
 const TYPE_LABEL: Record<MediaType, string> = {
@@ -550,12 +552,38 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [sortMode, setSortMode] = useState<SortMode>("newest");
   const [boardView, setBoardView] = useState<boolean>(true);
 
+  // ✅ Non-board status filter (only used when view === "all" && boardView === false)
+  const [nonBoardStatus, setNonBoardStatus] = useState<"all" | Status>("all");
+
   useEffect(() => {
     try {
       const raw = localStorage.getItem(LOCAL_BOARD_VIEW_KEY);
       if (raw !== null) setBoardView(raw === "1" || raw === "true");
     } catch {}
   }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(LOCAL_NONBOARD_STATUS_KEY);
+      if (!raw) return;
+      if (raw === "all" || (["completed", "in_progress", "planned", "dropped"] as string[]).includes(raw)) {
+        setNonBoardStatus(raw as any);
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_BOARD_VIEW_KEY, boardView ? "1" : "0");
+    } catch {}
+  }, [boardView]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_NONBOARD_STATUS_KEY, String(nonBoardStatus));
+    } catch {}
+  }, [nonBoardStatus]);
+
 
 
   const [autofillStatus, setAutofillStatus] = useState("");
@@ -1782,14 +1810,22 @@ async function pickForMe(mode: "best" | "random" = "best") {
   const filtered = useMemo(() => {
     let out = items.slice();
 
+    // Route-based filters (your existing pages)
     if (view === "completed") out = out.filter((i) => i.status === "completed");
     if (view === "in_progress") out = out.filter((i) => i.status === "in_progress");
     if (view === "planned") out = out.filter((i) => i.status === "planned");
     if (view === "dropped") out = out.filter((i) => i.status === "dropped");
 
+    // ✅ Non-board filter pills (only apply on /all when board view is OFF)
+    if (view === "all" && !boardView && nonBoardStatus !== "all") {
+      out = out.filter((i) => i.status === nonBoardStatus);
+    }
+
     if (query) {
       const q = query.toLowerCase();
-      out = out.filter((i) => [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q)));
+      out = out.filter((i) =>
+        [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q))
+      );
     }
 
     out.sort((a, b) => {
@@ -1803,7 +1839,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
     });
 
     return out;
-  }, [items, view, query, sortMode]);
+  }, [items, view, query, sortMode, boardView, nonBoardStatus]);
+
 
   const grouped = useMemo(() => {
     if (groupMode === "none") return null;
@@ -2892,67 +2929,122 @@ async function pickForMe(mode: "best" | "random" = "best") {
             </div>
 
             {view === "all" ? (
-              <div className="flex items-center justify-between">
-                <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
-                <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="text-xs text-neutral-500">
+                  {boardView ? "Board view lets you drag cards between statuses." : "List view: filter by status below."}
+                </div>
+                <Toggle
+                  label="Board view"
+                  checked={boardView}
+                  onChange={(next) => {
+                    setBoardView(next);
+                    // Optional: when switching to board view, reset the list filter to All
+                    // (keeps UX clean when you come back)
+                    if (next) setNonBoardStatus("all");
+                  }}
+                />
+              </div>
+            ) : null}
+
+            {/* ✅ Non-board status pill bar (only show on /all when board view is OFF) */}
+            {view === "all" && !boardView ? (
+              <div className="flex flex-wrap items-center gap-2">
+                {(
+                  [
+                    { key: "all", label: "All" },
+                    { key: "completed", label: "Completed" },
+                    { key: "in_progress", label: "In Progress" },
+                    { key: "planned", label: "Planned" },
+                    { key: "dropped", label: "Dropped" },
+                  ] as Array<{ key: "all" | Status; label: string }>
+                ).map((s) => (
+                  <button
+                    key={s.key}
+                    type="button"
+                    onClick={() => setNonBoardStatus(s.key)}
+                    className={[
+                      "px-3 py-2 rounded-xl border text-sm transition",
+                      nonBoardStatus === s.key
+                        ? "bg-white/15 border-white/20"
+                        : "bg-white/5 border-white/10 hover:bg-white/10",
+                    ].join(" ")}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+
+                <div className="ml-auto text-xs text-neutral-500">
+                  Showing:{" "}
+                  <span className="text-neutral-300">
+                    {nonBoardStatus === "all"
+                      ? "All"
+                      : nonBoardStatus === "completed"
+                      ? "Completed"
+                      : nonBoardStatus === "in_progress"
+                      ? "In Progress"
+                      : nonBoardStatus === "planned"
+                      ? "Planned"
+                      : "Dropped"}
+                  </span>{" "}
+                  • <span className="text-neutral-400">{filtered.length}</span>
+                </div>
               </div>
             ) : null}
 
             <DndContext onDragEnd={handleDragEnd}>
+              {/* Board view */}
               {view === "all" && boardView ? (
                 <BoardView items={filtered} onDelete={removeItem} onUpdate={updateItem} />
               ) : groupMode !== "none" && grouped ? (
+                /* Grouped view (if you ever enable groupMode later) */
                 <div className="space-y-6">
                   {grouped.map(([k, list]) => (
                     <section key={k} className="space-y-2">
                       <h3 className="text-sm text-neutral-400">{k}</h3>
                       <div className="space-y-3">
                         {list.map((i) => (
-                          <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
+                          <MALRow
+                            key={i.id}
+                            item={i}
+                            onDelete={() => removeItem(i.id)}
+                            onUpdate={(patch) => updateItem(i.id, patch)}
+                          />
                         ))}
                       </div>
                     </section>
                   ))}
                 </div>
               ) : (
-                <div className="space-y-6">
-                  {STATUSES.map((s) => {
-                    const list = byStatusFiltered[s.id];
-                    if (!list.length) return null;
+                /* ✅ Clean list view (no repeated status sections) */
+                <div className="space-y-3">
+                  <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
+                    <div />
+                    <div>Title</div>
+                    <div className="text-center">Score</div>
+                    <div className="text-center">Type</div>
+                    <div className="text-center">Progress / Hours</div>
+                  </div>
 
-                    return (
-                      <section key={s.id} className="space-y-3">
-                        <div className="flex items-center justify-between">
-                          <h3 className="text-sm text-neutral-300">{s.label}</h3>
-                          <div className="text-xs text-neutral-500">{list.length}</div>
-                        </div>
-
-                        <div className="space-y-3">
-                          <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
-                            <div />
-                            <div>Title</div>
-                            <div className="text-center">Score</div>
-                            <div className="text-center">Type</div>
-                            <div className="text-center">Progress / Hours</div>
-                          </div>
-
-                          {list.map((i) => (
-                            <MALRow
-                              key={i.id}
-                              item={i}
-                              onDelete={() => removeItem(i.id)}
-                              onUpdate={(patch) => updateItem(i.id, patch)}
-                            />
-                          ))}
-                        </div>
-                      </section>
-                    );
-                  })}
+                  {filtered.length ? (
+                    filtered.map((i) => (
+                      <MALRow
+                        key={i.id}
+                        item={i}
+                        onDelete={() => removeItem(i.id)}
+                        onUpdate={(patch) => updateItem(i.id, patch)}
+                      />
+                    ))
+                  ) : (
+                    <div className="text-sm text-neutral-500 text-center py-10 rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/70">
+                      No items match your filters.
+                    </div>
+                  )}
                 </div>
               )}
             </DndContext>
           </div>
         ) : null}
+
 
         <footer className="pt-6 text-xs text-neutral-500">Stack • Saves to Supabase + local backup</footer>
       </div>
