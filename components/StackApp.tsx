@@ -32,6 +32,24 @@ const STATUSES = [
 
 type Status = (typeof STATUSES)[number]["id"];
 
+  type ProfileRow = { id: string; username: string | null };
+
+  type FriendRequestStatus = "pending" | "accepted" | "declined";
+
+  type IncomingRequestRow = {
+    id: string;
+    requester_id: string;
+    receiver_id: string;
+    status: FriendRequestStatus;
+    created_at?: string | null;
+    requester?: { username?: string | null } | null;
+  };
+
+  type FriendRow = {
+    friend_id: string;
+    friend?: { username?: string | null } | null;
+  };
+
 type MediaItem = {
   id: string;
   title: string;
@@ -579,11 +597,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   }, [boardView]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(LOCAL_NONBOARD_STATUS_KEY, String(nonBoardStatus));
-    } catch {}
-  }, [nonBoardStatus]);
-
+  try {
+    localStorage.setItem(LOCAL_NONBOARD_STATUS_KEY, nonBoardStatus);
+  } catch {}
+}, [nonBoardStatus]);
 
 
   const [autofillStatus, setAutofillStatus] = useState("");
@@ -593,27 +610,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const [cloudLoaded, setCloudLoaded] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
+  
   // ================= FRIENDS =================
   const [inputUsername, setInputUsername] = useState("");
   const [friendStatus, setFriendStatus] = useState("");
 
-  const [incomingRequests, setIncomingRequests] = useState<
-    Array<{
-      id: string;
-      requester_id: string;
-      requested_id: string;
-      status: string;
-      created_at?: string;
-      requester?: { username?: string | null } | null;
-    }>
-  >([]);
+  const [incomingRequests, setIncomingRequests] = useState<IncomingRequestRow[]>([]);
 
-  const [friendsList, setFriendsList] = useState<
-    Array<{
-      friend_id: string;
-      friend?: { username?: string | null } | null;
-    }>
-  >([]);
+
+  const [friendsList, setFriendsList] = useState<FriendRow[]>([]);
+
 
 
 
@@ -669,12 +675,6 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
   // ✅ Undo delete
   const [undoState, setUndoState] = useState<{ item: MediaItem; index: number } | null>(null);
   const undoTimerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(LOCAL_BOARD_VIEW_KEY, boardView ? "1" : "0");
-    } catch {}
-  }, [boardView]);
 
   // ✅ Cleanup undo timer on unmount
   useEffect(() => {
@@ -760,23 +760,6 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
 
 /* ================= SUPABASE ================= */
 
-type ProfileRow = { id: string; username: string | null };
-
-type IncomingRequestRow = {
-  id: string;
-  requester_id: string;
-  receiver_id: string;
-  status: "pending" | "accepted" | "declined";
-  created_at?: string;
-  requester?: { username?: string | null } | null;
-};
-
-
-type FriendRow = {
-  friend_id: string;
-  friend?: { username?: string | null } | null;
-};
-
 const AUTO_ACCEPT_FRIEND_REQUESTS = true;
 
 /** Prefer exact match so we don’t error when multiple rows match */
@@ -814,7 +797,7 @@ const loadFriends = useCallback(
       return;
     }
 
-    setFriendsList((data ?? []) as FriendRow[]);
+    setFriendsList(data ?? []);
   },
   [userId]
 );
@@ -965,7 +948,7 @@ async function sendFriendRequest() {
   // existing pending request either direction?
   const { data: existingReq, error: reqErr } = await supabase
     .from("friend_requests")
-    .select("id, status, requester_id, requested_id")
+    .select("id, status, requester_id, receiver_id, created_at")
     .or(
       `and(requester_id.eq.${userId},receiver_id.eq.${profile.id}),and(requester_id.eq.${profile.id},receiver_id.eq.${userId})`
     )
@@ -976,15 +959,23 @@ async function sendFriendRequest() {
   if (reqErr) console.error(reqErr);
 
   if (existingReq?.id && existingReq.status === "pending") {
-    if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
+    const theyRequestedMe =
+      existingReq.requester_id === profile.id && existingReq.receiver_id === userId;
+
+    const iRequestedThem =
+      existingReq.requester_id === userId && existingReq.receiver_id === profile.id;
+
+    if (theyRequestedMe) {
       setFriendStatus(`${profile.username ?? "That user"} already requested you — auto-accepting…`);
       await acceptFriendRequest(existingReq.id, profile.id);
       setInputUsername("");
       return;
     }
 
-    setFriendStatus(`You already sent a pending request to ${profile.username ?? "that user"}.`);
-    return;
+    if (iRequestedThem) {
+      setFriendStatus(`You already sent a pending request to ${profile.username ?? "that user"}.`);
+      return;
+    }
   }
 
   const { error } = await supabase.from("friend_requests").insert({
@@ -992,7 +983,6 @@ async function sendFriendRequest() {
     receiver_id: profile.id,
     status: "pending",
   });
-
 
   if (error) {
     console.error(error);
@@ -1003,128 +993,6 @@ async function sendFriendRequest() {
   setFriendStatus(`Friend request sent to ${profile.username ?? "that user"}.`);
   setInputUsername("");
 }
-
-const loadCloud = useCallback(
-  async (uidStr: string) => {
-    setSaveStatus("Loading…");
-    setCloudLoaded(false);
-
-    const { data, error } = await supabase
-      .from("media_items")
-      .select("data")
-      .eq("user_id", uidStr)
-      .maybeSingle();
-
-    if (error) {
-      console.error(error);
-      const backup = loadLocalBackup();
-      if (backup) setItems(backup);
-      setCloudLoaded(true);
-      setSaveStatus("Loaded (local backup)");
-      return;
-    }
-
-    const raw = data?.data as unknown;
-
-    const parsedItems =
-      raw &&
-      typeof raw === "object" &&
-      raw !== null &&
-      "items" in raw &&
-      Array.isArray((raw as any).items)
-        ? ((raw as any).items as MediaItem[])
-        : null;
-
-    if (parsedItems) {
-      setItems(parsedItems);
-      saveLocalBackup(parsedItems);
-      setCloudLoaded(true);
-      setSaveStatus("Loaded");
-      return;
-    }
-
-    const up = await supabase
-      .from("media_items")
-      .upsert({ user_id: uidStr, data: { items: [] } }, { onConflict: "user_id" });
-
-    if (up.error) {
-      console.error(up.error);
-      const backup = loadLocalBackup();
-      if (backup) setItems(backup);
-      setCloudLoaded(true);
-      setSaveStatus("Loaded (local backup)");
-      return;
-    }
-
-    setItems([]);
-    saveLocalBackup([]);
-    setCloudLoaded(true);
-    setSaveStatus("Loaded");
-  },
-  [loadLocalBackup, saveLocalBackup]
-);
-
-const saveCloud = useCallback(
-  async (uidStr: string, next: MediaItem[]) => {
-    saveLocalBackup(next);
-    if (!cloudLoaded) return;
-
-    setSaveStatus("Saving…");
-
-    const { error } = await supabase
-      .from("media_items")
-      .upsert({ user_id: uidStr, data: { items: next } }, { onConflict: "user_id" });
-
-    if (error) {
-      console.error(error);
-      setSaveStatus("Saved locally (cloud error)");
-      return;
-    }
-
-    setSaveStatus("Saved");
-  },
-  [cloudLoaded, saveLocalBackup]
-);
-
-useEffect(() => {
-  const backup = loadLocalBackup();
-  if (backup) setItems(backup);
-}, [loadLocalBackup]);
-
-useEffect(() => {
-  if (!userId) return;
-  loadIncomingFriendRequests(userId);
-  loadFriends(userId);
-}, [userId, loadIncomingFriendRequests, loadFriends]);
-
-useEffect(() => {
-  let mounted = true;
-
-  supabase.auth.getUser().then(({ data }) => {
-    if (!mounted) return;
-    const uidStr = data.user?.id ?? null;
-    setUserId(uidStr);
-    if (uidStr) loadCloud(uidStr);
-  });
-
-  const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
-    const uidStr = session?.user?.id ?? null;
-    setUserId(uidStr);
-    if (uidStr) loadCloud(uidStr);
-  });
-
-  return () => {
-    mounted = false;
-    sub.subscription.unsubscribe();
-  };
-}, [loadCloud]);
-
-useEffect(() => {
-  if (userId) saveCloud(userId, items);
-  else saveLocalBackup(items);
-}, [items, userId, saveCloud, saveLocalBackup]);
-
-
 
 /* ================= ACTIONS ================= */
 
@@ -1856,13 +1724,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
     }
     return Array.from(map.entries()).sort((a, b) => (a[0] < b[0] ? 1 : -1));
   }, [filtered, groupMode]);
-
-    const byStatusFiltered = useMemo(() => {
-      const map: Record<Status, MediaItem[]> = { completed: [], in_progress: [], planned: [], dropped: [] };
-      for (const i of filtered) map[i.status].push(i);
-      return map;
-    }, [filtered]);
-
 
   /* ================= STATS ================= */
 
