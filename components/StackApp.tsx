@@ -797,18 +797,26 @@ async function acceptFriendRequest(requestId: string, requesterId: string) {
   if (!userId) return;
 
   // 1) mark request accepted (idempotent-ish)
-  const { error: upErr } = await supabase
-    .from("friend_requests")
-    .update({ status: "accepted" })
-    .eq("id", requestId)
-    .eq("requested_id", userId)
-    .eq("status", "pending");
+const { data: updated, error: upErr } = await supabase
+  .from("friend_requests")
+  .update({ status: "accepted" })
+  .eq("id", requestId)
+  .eq("requested_id", userId)
+  .eq("status", "pending")
+  .select("id,status")
+  .maybeSingle();
 
-  if (upErr) {
-    console.error(upErr);
-    setFriendStatus(upErr.message || "Failed to accept request.");
-    return;
-  }
+if (upErr) {
+  console.error(upErr);
+  setFriendStatus(upErr.message || "Failed to accept request.");
+  return;
+}
+
+if (!updated) {
+  setFriendStatus("Nothing to accept (request not found or already handled). Try Refresh.");
+  return;
+}
+
 
   // 2) create friendships both directions (avoid duplicates)
   // NOTE: this assumes you have a unique constraint on (user_id, friend_id).
@@ -1065,8 +1073,8 @@ function addItem(e: React.SyntheticEvent) {
   const rating =
     typeof ratingNum === "number" && Number.isFinite(ratingNum) ? clamp(ratingNum, 0, 10) : undefined;
 
-  const rewatchCountRaw = rewatchText.trim() === "" ? 0 : Math.max(0, Number(rewatchText) || 0);
-  const rewatchCount = isRewatch ? rewatchCountRaw : 0;
+  const rewatchCount = isRewatch ? Math.max(0, Number(rewatchText.trim() || "0") || 0) : 0;
+
 
   const pc = progressCurText.trim() === "" ? undefined : Math.max(0, Number(progressCurText) || 0);
   const pt = progressTotalText.trim() === "" ? undefined : Math.max(0, Number(progressTotalText) || 0);
@@ -2598,12 +2606,16 @@ async function pickForMe(mode: "best" | "random" = "best") {
                     onChange={(v) => {
                       setIsRewatch(v);
 
-                      // If turning ON and count is empty/0, default to 1 (nice UX)
                       if (v) {
+                        // turning ON: if empty/0, default to 1
                         setRewatchText((prev) => (prev.trim() === "" || Number(prev) === 0 ? "1" : prev));
+                      } else {
+                        // turning OFF: force reset so it doesn't "look saved" while disabled
+                        setRewatchText("0");
                       }
                     }}
                   />
+
 
 
                   <TextNumberInput
@@ -3147,35 +3159,43 @@ function MALRow({
                 )}
 
                 {/* STATUS + DATE */}
-                <div className="text-xs text-neutral-400 mt-1 flex flex-wrap items-center gap-2">
-                  <span>Status:</span>
-                  <select
-                    value={item.status}
-                    onChange={(e) => onUpdate({ status: e.target.value as Status })}
+              <div className="text-xs text-neutral-400 mt-1 flex flex-wrap items-center gap-2">
+                <span>Status:</span>
+                <select
+                  value={item.status}
+                  onChange={(e) => onUpdate({ status: e.target.value as Status })}
+                  className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
+                >
+                  <option value="completed">Completed</option>
+                  <option value="in_progress">In Progress</option>
+                  <option value="planned">Planned</option>
+                  <option value="dropped">Dropped</option>
+                </select>
+
+                <span className="text-neutral-600">•</span>
+
+                {isEditing ? (
+                  <input
+                    type="date"
+                    value={draftDate}
+                    onChange={(e) => setDraftDate(e.target.value)}
                     className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
-                  >
-                    <option value="completed">Completed</option>
-                    <option value="in_progress">In Progress</option>
-                    <option value="planned">Planned</option>
-                    <option value="dropped">Dropped</option>
-                  </select>
+                    title="Date watched"
+                  />
+                ) : item.dateFinished ? (
+                  <span className="text-neutral-500">{item.dateFinished}</span>
+                ) : (
+                  <span className="text-neutral-600">No date</span>
+                )}
 
-                  <span className="text-neutral-600">•</span>
+                {(Number(item.rewatchCount ?? 0) || 0) > 0 ? (
+                  <>
+                    <span className="text-neutral-600">•</span>
+                    <span className="text-neutral-300">Rewatch x{Number(item.rewatchCount ?? 0) || 0}</span>
+                  </>
+                ) : null}
+              </div>
 
-                  {isEditing ? (
-                    <input
-                      type="date"
-                      value={draftDate}
-                      onChange={(e) => setDraftDate(e.target.value)}
-                      className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
-                      title="Date watched"
-                    />
-                  ) : item.dateFinished ? (
-                    <span className="text-neutral-500">{item.dateFinished}</span>
-                  ) : (
-                    <span className="text-neutral-600">No date</span>
-                  )}
-                </div>
 
                 {/* NOTES */}
                 {isEditing ? (
@@ -3442,7 +3462,9 @@ function CardDraggable({
             {item.type === "game"
               ? `Hours: ${typeof item.hoursPlayed === "number" ? `${item.hoursPlayed.toFixed(1)}h` : "—"}`
               : `Progress: ${progressText}`}
+            {(Number(item.rewatchCount ?? 0) || 0) > 0 ? ` • Rewatch x${Number(item.rewatchCount ?? 0) || 0}` : ""}
           </div>
+
 
           <div className="flex items-center justify-between mt-3">
             <select
