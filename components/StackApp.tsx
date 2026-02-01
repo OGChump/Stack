@@ -615,6 +615,18 @@ const [ratingText, setRatingText] = useState<string>(""); // decimal ok
 const [isRewatch, setIsRewatch] = useState<boolean>(false);
 const [rewatchText, setRewatchText] = useState<string>("0"); // integer
 
+// ✅ remembers last valid count while toggle is ON (restores when you re-enable)
+const lastRewatchOnRef = useRef<string>("1");
+
+useEffect(() => {
+  // keep ref sane if state starts as something else later
+  const n = Math.floor(Number(rewatchText));
+  if (Number.isFinite(n) && n > 0) lastRewatchOnRef.current = String(n);
+  // run once
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
+
 const [progressCurText, setProgressCurText] = useState<string>(""); // integer
 const [progressTotalText, setProgressTotalText] = useState<string>(""); // integer
 
@@ -733,6 +745,8 @@ type FriendRow = {
   friend?: { username?: string | null } | null;
 };
 
+const AUTO_ACCEPT_FRIEND_REQUESTS = true;
+
 async function findProfileByUsername(username: string): Promise<ProfileRow | null> {
   const u = username.trim();
   if (!u) return null;
@@ -752,7 +766,7 @@ async function findProfileByUsername(username: string): Promise<ProfileRow | nul
 }
 
 const loadIncomingFriendRequests = useCallback(
-  async (uid?: string) => {
+  async (uid?: string, opts?: { autoAccept?: boolean }) => {
     const me = uid ?? userId;
     if (!me) return;
 
@@ -768,10 +782,27 @@ const loadIncomingFriendRequests = useCallback(
       return;
     }
 
-    setIncomingRequests((data ?? []) as IncomingRequestRow[]);
+    const rows = (data ?? []) as IncomingRequestRow[];
+    setIncomingRequests(rows);
+
+    const shouldAutoAccept = opts?.autoAccept ?? AUTO_ACCEPT_FRIEND_REQUESTS;
+    if (!shouldAutoAccept) return;
+
+    // Auto-accept all pending requests (sequential to avoid rate-limit spam)
+    for (const r of rows) {
+      try {
+        await acceptFriendRequest(r.id, r.requester_id, { skipReload: true });
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    // One refresh after processing
+    await Promise.all([loadIncomingFriendRequests(me, { autoAccept: false }), loadFriends(me)]);
   },
-  [userId]
+  [userId, loadFriends]
 );
+
 
 const loadFriends = useCallback(
   async (uid?: string) => {
@@ -793,33 +824,36 @@ const loadFriends = useCallback(
   [userId]
 );
 
-async function acceptFriendRequest(requestId: string, requesterId: string) {
+async function acceptFriendRequest(
+  requestId: string,
+  requesterId: string,
+  opts?: { skipReload?: boolean }
+) {
   if (!userId) return;
 
   // 1) mark request accepted (idempotent-ish)
-const { data: updated, error: upErr } = await supabase
-  .from("friend_requests")
-  .update({ status: "accepted" })
-  .eq("id", requestId)
-  .eq("requested_id", userId)
-  .eq("status", "pending")
-  .select("id,status")
-  .maybeSingle();
+  const { data: updated, error: upErr } = await supabase
+    .from("friend_requests")
+    .update({ status: "accepted" })
+    .eq("id", requestId)
+    .eq("requested_id", userId)
+    .eq("status", "pending")
+    .select("id,status")
+    .maybeSingle();
 
-if (upErr) {
-  console.error(upErr);
-  setFriendStatus(upErr.message || "Failed to accept request.");
-  return;
-}
+  if (upErr) {
+    console.error(upErr);
+    setFriendStatus(upErr.message || "Failed to accept request.");
+    return;
+  }
 
-if (!updated) {
-  setFriendStatus("Nothing to accept (request not found or already handled). Try Refresh.");
-  return;
-}
-
+  if (!updated) {
+    // If it's already handled, just ignore quietly for auto-accept
+    if (!opts?.skipReload) setFriendStatus("Nothing to accept (already handled).");
+    return;
+  }
 
   // 2) create friendships both directions (avoid duplicates)
-  // NOTE: this assumes you have a unique constraint on (user_id, friend_id).
   const { error: frErr } = await supabase
     .from("friends")
     .upsert(
@@ -834,11 +868,15 @@ if (!updated) {
     console.error(frErr);
     setFriendStatus(frErr.message || "Accepted, but failed to create friendship rows.");
   } else {
-    setFriendStatus("Friend added ✅");
+    // Keep status subtle for auto-accept
+    setFriendStatus(AUTO_ACCEPT_FRIEND_REQUESTS ? "Friend added ✅ (auto-accepted)" : "Friend added ✅");
   }
 
-  await Promise.all([loadIncomingFriendRequests(userId), loadFriends(userId)]);
+  if (opts?.skipReload) return;
+
+  await Promise.all([loadIncomingFriendRequests(userId, { autoAccept: false }), loadFriends(userId)]);
 }
+
 
 async function declineFriendRequest(requestId: string) {
   if (!userId) return;
@@ -857,7 +895,7 @@ async function declineFriendRequest(requestId: string) {
   }
 
   setFriendStatus("Request declined.");
-  await loadIncomingFriendRequests(userId);
+  await loadIncomingFriendRequests(userId, { autoAccept: false });
 }
 
 async function sendFriendRequest() {
@@ -910,8 +948,9 @@ async function sendFriendRequest() {
 
   if (existingReq?.id && existingReq.status === "pending") {
     if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
-      setFriendStatus(`${profile.username ?? "That user"} already requested you — accept it below.`);
-      await loadIncomingFriendRequests(userId);
+      setFriendStatus(`${profile.username ?? "That user"} already requested you — auto-accepting…`);
+      await acceptFriendRequest(existingReq.id, profile.id);
+      setInputUsername("");
       return;
     }
 
@@ -1073,7 +1112,9 @@ function addItem(e: React.SyntheticEvent) {
   const rating =
     typeof ratingNum === "number" && Number.isFinite(ratingNum) ? clamp(ratingNum, 0, 10) : undefined;
 
-  const rewatchCount = isRewatch ? Math.max(0, Number(rewatchText.trim() || "0") || 0) : 0;
+  const rewatchCount = isRewatch
+    ? Math.max(1, Math.floor(Number(rewatchText.trim() || "1") || 1))
+    : 0;
 
 
   const pc = progressCurText.trim() === "" ? undefined : Math.max(0, Number(progressCurText) || 0);
@@ -2543,6 +2584,44 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   />
                 </div>
 
+                  <TextNumberInput
+                    label="Count"
+                    value={rewatchText}
+                    onChange={setRewatchText}
+                    placeholder="0"
+                    pattern={/^\d{0,3}$/}
+                    disabled={!isRewatch}
+                    helper="This still doesnt work as intended ngl"
+                  />
+
+                  <TextNumberInput
+                    label="Count"
+                    value={rewatchText}
+                    onChange={(v) => {
+                      if (!isRewatch) return;
+
+                      // allow empty while typing
+                      if (v.trim() === "") {
+                        setRewatchText("");
+                        return;
+                      }
+
+                      const n = Math.floor(Number(v));
+                      if (!Number.isFinite(n)) return;
+
+                      // enforce min 1 while ON, cap at 999
+                      const clamped = Math.max(1, Math.min(999, n));
+                      setRewatchText(String(clamped));
+                      lastRewatchOnRef.current = String(clamped);
+                    }}
+                    placeholder="1"
+                    pattern={/^\d{0,3}$/}
+                    disabled={!isRewatch}
+                    helper={isRewatch ? "Rewatch count (min 1)." : "Enable Rewatch to edit."}
+                  />
+
+
+
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <TextNumberInput
                     label="Progress current (optional)"
@@ -2597,37 +2676,28 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   helper="Auto-filled genres show below; add your own tags too."
                 />
 
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <Toggle label="In theaters" checked={!!form.inTheaters} onChange={(v) => setForm({ ...form, inTheaters: v })} />
+                <Toggle
+                  label="Rewatch"
+                  checked={isRewatch}
+                  onChange={(nextOn) => {
+                    setIsRewatch(nextOn);
 
-                  <Toggle
-                    label="Rewatch"
-                    checked={isRewatch}
-                    onChange={(v) => {
-                      setIsRewatch(v);
+                    if (nextOn) {
+                      // turning ON: restore last ON count (default 1)
+                      setRewatchText((prev) => {
+                        const restored = (lastRewatchOnRef.current || "1").trim();
+                        if (prev.trim() === "" || Number(prev) === 0) return restored;
+                        return prev;
+                      });
+                    } else {
+                      // turning OFF: remember current value if valid, then show 0
+                      const n = Math.floor(Number(rewatchText));
+                      if (Number.isFinite(n) && n > 0) lastRewatchOnRef.current = String(n);
+                      setRewatchText("0");
+                    }
+                  }}
+                />
 
-                      if (v) {
-                        // turning ON: if empty/0, default to 1
-                        setRewatchText((prev) => (prev.trim() === "" || Number(prev) === 0 ? "1" : prev));
-                      } else {
-                        // turning OFF: force reset so it doesn't "look saved" while disabled
-                        setRewatchText("0");
-                      }
-                    }}
-                  />
-
-
-
-                  <TextNumberInput
-                    label="Count"
-                    value={rewatchText}
-                    onChange={setRewatchText}
-                    placeholder="0"
-                    pattern={/^\d{0,3}$/}
-                    disabled={!isRewatch}
-                    helper="This still doesnt work as intended ngl"
-                  />
-                </div>
 
                 <TextArea
                   label="Notes"
@@ -2719,7 +2789,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
               <button
                 type="button"
                 onClick={() => {
-                  loadIncomingFriendRequests();
+                  loadIncomingFriendRequests(undefined, { autoAccept: true });
                   loadFriends();
                 }}
                 className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
