@@ -765,11 +765,12 @@ type ProfileRow = { id: string; username: string | null };
 type IncomingRequestRow = {
   id: string;
   requester_id: string;
-  requested_id: string;
+  receiver_id: string;
   status: "pending" | "accepted" | "declined";
   created_at?: string;
   requester?: { username?: string | null } | null;
 };
+
 
 type FriendRow = {
   friend_id: string;
@@ -825,8 +826,8 @@ const loadIncomingFriendRequests = useCallback(
 
     const { data, error } = await supabase
       .from("friend_requests")
-      .select("id, requester_id, requested_id, status, created_at, requester:requester_id(username)")
-      .eq("requested_id", me)
+      .select("id, requester_id, receiver_id, status, created_at, requester:requester_id(username)")
+      .eq("receiver_id", me)
       .eq("status", "pending")
       .order("created_at", { ascending: false });
 
@@ -867,7 +868,7 @@ async function acceptFriendRequest(
     .from("friend_requests")
     .update({ status: "accepted" })
     .eq("id", requestId)
-    .eq("requested_id", me)
+    .eq("receiver_id", me)
     .eq("status", "pending")
     .select("id,status")
     .maybeSingle();
@@ -913,7 +914,7 @@ async function declineFriendRequest(requestId: string) {
     .from("friend_requests")
     .update({ status: "declined" })
     .eq("id", requestId)
-    .eq("requested_id", userId)
+    .eq("receiver_id", userId)
     .eq("status", "pending");
 
   if (error) {
@@ -966,7 +967,7 @@ async function sendFriendRequest() {
     .from("friend_requests")
     .select("id, status, requester_id, requested_id")
     .or(
-      `and(requester_id.eq.${userId},requested_id.eq.${profile.id}),and(requester_id.eq.${profile.id},requested_id.eq.${userId})`
+      `and(requester_id.eq.${userId},receiver_id.eq.${profile.id}),and(requester_id.eq.${profile.id},receiver_id.eq.${userId})`
     )
     .order("created_at", { ascending: false })
     .limit(1)
@@ -988,9 +989,10 @@ async function sendFriendRequest() {
 
   const { error } = await supabase.from("friend_requests").insert({
     requester_id: userId,
-    requested_id: profile.id,
+    receiver_id: profile.id,
     status: "pending",
   });
+
 
   if (error) {
     console.error(error);
