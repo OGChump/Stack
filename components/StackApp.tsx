@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /* eslint-disable @typescript-eslint/no-unused-vars */
+/* eslint-disable react-hooks/exhaustive-deps */
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -7,7 +8,117 @@ import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { DndContext, DragEndEvent, useDraggable, useDroppable } from "@dnd-kit/core";
 
+
+
+
 /* ================= TYPES ================= */
+
+type StackItemRow = {
+  id: string;
+  user_id: string;
+  title: string;
+  type: MediaType;
+  rating: number | null;
+  poster_url: string | null;
+  poster_override_url: string | null;
+
+  tmdb_id: number | null;
+  tmdb_type: "movie" | "tv" | null;
+
+  igdb_id: number | null;
+
+  anilist_id: number | null;
+  anilist_type: "ANIME" | "MANGA" | null;
+
+  in_theaters: boolean | null;
+  date_finished: string | null;
+  notes: string | null;
+  rewatch_count: number | null;
+  runtime: number | null;
+  status: Status;
+  tags: string[] | null;
+  created_at: string; // ISO from DB
+
+  progress_cur: number | null;
+  progress_total: number | null;
+  progress_cur_override: number | null;
+  progress_total_override: number | null;
+
+  hours_played: number | null;
+};
+
+function rowToItem(r: StackItemRow): MediaItem {
+  return {
+    id: r.id,
+    title: r.title,
+    type: r.type,
+    status: r.status,
+    tags: r.tags ?? [],
+    createdAt: r.created_at,
+
+    rating: r.rating ?? undefined,
+    posterUrl: r.poster_url ?? undefined,
+    posterOverrideUrl: r.poster_override_url ?? undefined,
+
+    tmdbId: r.tmdb_id ?? undefined,
+    tmdbType: r.tmdb_type ?? undefined,
+
+    igdbId: r.igdb_id ?? undefined,
+
+    anilistId: r.anilist_id ?? undefined,
+    anilistType: r.anilist_type ?? undefined,
+
+    inTheaters: !!r.in_theaters,
+    dateFinished: r.date_finished ?? undefined,
+    notes: r.notes ?? undefined,
+    rewatchCount: r.rewatch_count ?? undefined,
+    runtime: r.runtime ?? undefined,
+
+    progressCur: r.progress_cur ?? undefined,
+    progressTotal: r.progress_total ?? undefined,
+    progressCurOverride: r.progress_cur_override ?? undefined,
+    progressTotalOverride: r.progress_total_override ?? undefined,
+
+    hoursPlayed: r.hours_played ?? undefined,
+  };
+}
+
+function itemToRow(i: MediaItem, userId: string): Partial<StackItemRow> {
+  return {
+    id: i.id,
+    user_id: userId,
+    title: i.title,
+    type: i.type,
+    status: i.status,
+    tags: i.tags ?? [],
+    created_at: i.createdAt,
+
+    rating: typeof i.rating === "number" ? i.rating : null,
+    poster_url: i.posterUrl ?? null,
+    poster_override_url: i.posterOverrideUrl ?? null,
+
+    tmdb_id: typeof i.tmdbId === "number" ? i.tmdbId : null,
+    tmdb_type: i.tmdbType ?? null,
+
+    igdb_id: typeof i.igdbId === "number" ? i.igdbId : null,
+
+    anilist_id: typeof i.anilistId === "number" ? i.anilistId : null,
+    anilist_type: i.anilistType ?? null,
+
+    in_theaters: !!i.inTheaters,
+    date_finished: i.dateFinished ?? null,
+    notes: i.notes ?? null,
+    rewatch_count: typeof i.rewatchCount === "number" ? i.rewatchCount : null,
+    runtime: typeof i.runtime === "number" ? i.runtime : null,
+
+    progress_cur: typeof i.progressCur === "number" ? i.progressCur : null,
+    progress_total: typeof i.progressTotal === "number" ? i.progressTotal : null,
+    progress_cur_override: typeof i.progressCurOverride === "number" ? i.progressCurOverride : null,
+    progress_total_override: typeof i.progressTotalOverride === "number" ? i.progressTotalOverride : null,
+
+    hours_played: typeof i.hoursPlayed === "number" ? i.hoursPlayed : null,
+  };
+}
 
 type MediaType = "movie" | "tv" | "anime" | "manga" | "book" | "game";
 type GroupMode = "none" | "day" | "month" | "year";
@@ -797,7 +908,7 @@ const loadFriends = useCallback(
       return;
     }
 
-    setFriendsList(data ?? []);
+    setFriendsList((data ?? []) as FriendRow[]);
   },
   [userId]
 );
@@ -820,7 +931,7 @@ const loadIncomingFriendRequests = useCallback(
     }
 
     const rows = (data ?? []) as IncomingRequestRow[];
-    setIncomingRequests(rows);
+    setIncomingRequests(rows as IncomingRequestRow[]);
 
     const shouldAutoAccept = opts?.autoAccept ?? AUTO_ACCEPT_FRIEND_REQUESTS;
     if (!shouldAutoAccept) return;
@@ -3839,4 +3950,5 @@ function TagEditor({
       {helper ? <div className="text-[11px] text-neutral-500">{helper}</div> : null}
     </div>
   );
+
 }
