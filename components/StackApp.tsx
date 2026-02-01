@@ -92,8 +92,27 @@ type AnilistSearchResponse = {
 };
 
 type Pick =
-  | { provider: "tmdb"; title: string; posterUrl?: string; tmdbId: number; tmdbType: "movie" | "tv" }
-  | { provider: "anilist"; title: string; posterUrl?: string; anilistId: number; anilistType: "ANIME" };
+  | {
+      provider: "tmdb";
+      title: string;
+      posterUrl?: string;
+      tmdbId: number;
+      tmdbType: "movie" | "tv";
+    }
+  | {
+      provider: "anilist";
+      title: string;
+      posterUrl?: string;
+      anilistId: number;
+      anilistType: "ANIME" | "MANGA";
+    }
+  | {
+      provider: "igdb";
+      title: string;
+      posterUrl?: string;
+      igdbId: number;
+    };
+
 
 type Suggestion = {
   key: string; // unique key for list rendering
@@ -547,6 +566,25 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [inputUsername, setInputUsername] = useState("");
   const [friendStatus, setFriendStatus] = useState("");
 
+  const [incomingRequests, setIncomingRequests] = useState<
+    Array<{
+      id: string;
+      requester_id: string;
+      requested_id: string;
+      status: string;
+      created_at?: string;
+      requester?: { username?: string | null } | null;
+    }>
+  >([]);
+
+  const [friendsList, setFriendsList] = useState<
+    Array<{
+      friend_id: string;
+      friend?: { username?: string | null } | null;
+    }>
+  >([]);
+
+
 
   const [picks, setPicks] = useState<Pick[]>([]);
   const [pickStatus, setPickStatus] = useState("");
@@ -570,11 +608,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [ghostTitle, setGhostTitle] = useState<string>("");
   const [activeSuggestIdx, setActiveSuggestIdx] = useState(0);
 
-  // For "delete 0 and type" UX
-  const [ratingText, setRatingText] = useState<string>(""); // decimal ok
-  const [rewatchText, setRewatchText] = useState<string>("0"); // integer
-  const [progressCurText, setProgressCurText] = useState<string>(""); // integer
-  const [progressTotalText, setProgressTotalText] = useState<string>(""); // integer
+// For "delete 0 and type" UX
+const [ratingText, setRatingText] = useState<string>(""); // decimal ok
+
+// ✅ Rewatch: separate toggle + separate count text
+const [isRewatch, setIsRewatch] = useState<boolean>(false);
+const [rewatchText, setRewatchText] = useState<string>("0"); // integer
+
+const [progressCurText, setProgressCurText] = useState<string>(""); // integer
+const [progressTotalText, setProgressTotalText] = useState<string>(""); // integer
+
 
   // Manual tags editor (keeps autofilled tags but allows extras)
   const [autoTags, setAutoTags] = useState<string[]>([]);
@@ -628,8 +671,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   useEffect(() => {
     formRef.current = form;
   }, [form]);
-
-  const isRewatch = (Number(rewatchText || "0") || 0) > 0;
+  
 
   /* ================= NAV ================= */
 
@@ -673,16 +715,32 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     } catch {}
   }, []);
 
-  /* ================= SUPABASE ================= */
+/* ================= SUPABASE ================= */
 
-  async function findProfileByUsername(username: string) {
+type ProfileRow = { id: string; username: string | null };
+
+type IncomingRequestRow = {
+  id: string;
+  requester_id: string;
+  requested_id: string;
+  status: "pending" | "accepted" | "declined";
+  created_at?: string;
+  requester?: { username?: string | null } | null;
+};
+
+type FriendRow = {
+  friend_id: string;
+  friend?: { username?: string | null } | null;
+};
+
+async function findProfileByUsername(username: string): Promise<ProfileRow | null> {
   const u = username.trim();
   if (!u) return null;
 
   const { data, error } = await supabase
     .from("profiles")
     .select("id, username")
-    .ilike("username", u)
+    .ilike("username", `%${u}%`)
     .maybeSingle();
 
   if (error) {
@@ -690,7 +748,108 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     return null;
   }
 
-  return data; // { id, username } or null
+  return data ?? null;
+}
+
+const loadIncomingFriendRequests = useCallback(
+  async (uid?: string) => {
+    const me = uid ?? userId;
+    if (!me) return;
+
+    const { data, error } = await supabase
+      .from("friend_requests")
+      .select("id, requester_id, requested_id, status, created_at, requester:requester_id(username)")
+      .eq("requested_id", me)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error(error);
+      return;
+    }
+
+    setIncomingRequests((data ?? []) as IncomingRequestRow[]);
+  },
+  [userId]
+);
+
+const loadFriends = useCallback(
+  async (uid?: string) => {
+    const me = uid ?? userId;
+    if (!me) return;
+
+    const { data, error } = await supabase
+      .from("friends")
+      .select("friend_id, friend:friend_id(username)")
+      .eq("user_id", me);
+
+    if (error) {
+      console.error(error);
+      return;
+    }
+
+    setFriendsList((data ?? []) as FriendRow[]);
+  },
+  [userId]
+);
+
+async function acceptFriendRequest(requestId: string, requesterId: string) {
+  if (!userId) return;
+
+  // 1) mark request accepted (idempotent-ish)
+  const { error: upErr } = await supabase
+    .from("friend_requests")
+    .update({ status: "accepted" })
+    .eq("id", requestId)
+    .eq("requested_id", userId)
+    .eq("status", "pending");
+
+  if (upErr) {
+    console.error(upErr);
+    setFriendStatus(upErr.message || "Failed to accept request.");
+    return;
+  }
+
+  // 2) create friendships both directions (avoid duplicates)
+  // NOTE: this assumes you have a unique constraint on (user_id, friend_id).
+  const { error: frErr } = await supabase
+    .from("friends")
+    .upsert(
+      [
+        { user_id: userId, friend_id: requesterId },
+        { user_id: requesterId, friend_id: userId },
+      ],
+      { onConflict: "user_id,friend_id" }
+    );
+
+  if (frErr) {
+    console.error(frErr);
+    setFriendStatus(frErr.message || "Accepted, but failed to create friendship rows.");
+  } else {
+    setFriendStatus("Friend added ✅");
+  }
+
+  await Promise.all([loadIncomingFriendRequests(userId), loadFriends(userId)]);
+}
+
+async function declineFriendRequest(requestId: string) {
+  if (!userId) return;
+
+  const { error } = await supabase
+    .from("friend_requests")
+    .update({ status: "declined" })
+    .eq("id", requestId)
+    .eq("requested_id", userId)
+    .eq("status", "pending");
+
+  if (error) {
+    console.error(error);
+    setFriendStatus(error.message || "Failed to decline request.");
+    return;
+  }
+
+  setFriendStatus("Request declined.");
+  await loadIncomingFriendRequests(userId);
 }
 
 async function sendFriendRequest() {
@@ -713,6 +872,45 @@ async function sendFriendRequest() {
     return;
   }
 
+  // already friends?
+  const { data: existingFriend, error: friendCheckErr } = await supabase
+    .from("friends")
+    .select("friend_id")
+    .eq("user_id", userId)
+    .eq("friend_id", profile.id)
+    .maybeSingle();
+
+  if (friendCheckErr) console.error(friendCheckErr);
+
+  if (existingFriend?.friend_id) {
+    setFriendStatus(`You're already friends with ${profile.username ?? "that user"}.`);
+    return;
+  }
+
+  // existing pending request either direction?
+  const { data: existingReq, error: reqErr } = await supabase
+    .from("friend_requests")
+    .select("id, status, requester_id, requested_id")
+    .or(
+      `and(requester_id.eq.${userId},requested_id.eq.${profile.id}),and(requester_id.eq.${profile.id},requested_id.eq.${userId})`
+    )
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (reqErr) console.error(reqErr);
+
+  if (existingReq?.id && existingReq.status === "pending") {
+    if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
+      setFriendStatus(`${profile.username ?? "That user"} already requested you — accept it below.`);
+      await loadIncomingFriendRequests(userId);
+      return;
+    }
+
+    setFriendStatus(`You already sent a pending request to ${profile.username ?? "that user"}.`);
+    return;
+  }
+
   const { error } = await supabase.from("friend_requests").insert({
     requester_id: userId,
     requested_id: profile.id,
@@ -725,18 +923,9 @@ async function sendFriendRequest() {
     return;
   }
 
-  setFriendStatus(`Friend request sent to ${profile.username}.`);
+  setFriendStatus(`Friend request sent to ${profile.username ?? "that user"}.`);
   setInputUsername("");
 }
-
-// ✅ ADDITION (keep this in the same file, above loadCloud/saveCloud/pickForMe)
-type TmdbPick = {
-  provider: "tmdb";
-  title: string;
-  posterUrl?: string;
-  tmdbId: number;
-  tmdbType: "movie" | "tv";
-};
 
 const loadCloud = useCallback(
   async (uidStr: string) => {
@@ -800,10 +989,7 @@ const loadCloud = useCallback(
 
 const saveCloud = useCallback(
   async (uidStr: string, next: MediaItem[]) => {
-    // always keep local backup up-to-date
     saveLocalBackup(next);
-
-    // don't push to cloud until we've finished an initial load
     if (!cloudLoaded) return;
 
     setSaveStatus("Saving…");
@@ -829,28 +1015,39 @@ useEffect(() => {
 }, [loadLocalBackup]);
 
 useEffect(() => {
+  if (!userId) return;
+  loadIncomingFriendRequests(userId);
+  loadFriends(userId);
+}, [userId, loadIncomingFriendRequests, loadFriends]);
+
+useEffect(() => {
+  let mounted = true;
+
   supabase.auth.getUser().then(({ data }) => {
-    const id = data.user?.id ?? null;
-    setUserId(id);
-    if (id) loadCloud(id);
+    if (!mounted) return;
+    const uidStr = data.user?.id ?? null;
+    setUserId(uidStr);
+    if (uidStr) loadCloud(uidStr);
   });
 
-  const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
-    const id = s?.user?.id ?? null;
-    setUserId(id);
-    if (id) loadCloud(id);
+  const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
+    const uidStr = session?.user?.id ?? null;
+    setUserId(uidStr);
+    if (uidStr) loadCloud(uidStr);
   });
 
   return () => {
-    sub?.subscription?.unsubscribe();
+    mounted = false;
+    sub.subscription.unsubscribe();
   };
 }, [loadCloud]);
 
 useEffect(() => {
   if (userId) saveCloud(userId, items);
   else saveLocalBackup(items);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [items, userId, cloudLoaded]);
+}, [items, userId, saveCloud, saveLocalBackup]);
+
+
 
 /* ================= ACTIONS ================= */
 
@@ -868,7 +1065,8 @@ function addItem(e: React.SyntheticEvent) {
   const rating =
     typeof ratingNum === "number" && Number.isFinite(ratingNum) ? clamp(ratingNum, 0, 10) : undefined;
 
-  const rewatchCount = rewatchText.trim() === "" ? 0 : Math.max(0, Number(rewatchText) || 0);
+  const rewatchCountRaw = rewatchText.trim() === "" ? 0 : Math.max(0, Number(rewatchText) || 0);
+  const rewatchCount = isRewatch ? rewatchCountRaw : 0;
 
   const pc = progressCurText.trim() === "" ? undefined : Math.max(0, Number(progressCurText) || 0);
   const pt = progressTotalText.trim() === "" ? undefined : Math.max(0, Number(progressTotalText) || 0);
@@ -950,9 +1148,11 @@ function addItem(e: React.SyntheticEvent) {
   setManualTags([]);
 
   setRatingText("");
+  setIsRewatch(false);
   setRewatchText("0");
   setProgressCurText("");
   setProgressTotalText("");
+
 }
 
 // ✅ Undo delete
@@ -1109,7 +1309,15 @@ async function pickForMe(mode: "best" | "random" = "best") {
     }
 
     const candidates = unique.slice(0, 80);
-    const enriched: Array<TmdbPick & { score: number; tags: string[] }> = [];
+    const enriched: Array<{
+      provider: "tmdb";
+      title: string;
+      tmdbId: number;
+      tmdbType: "movie" | "tv";
+      posterUrl?: string;
+      score: number;
+      tags: string[];
+    }> = [];
 
     for (const c of candidates) {
       try {
@@ -2388,10 +2596,15 @@ async function pickForMe(mode: "best" | "random" = "best") {
                     label="Rewatch"
                     checked={isRewatch}
                     onChange={(v) => {
-                      if (v) setRewatchText((prev) => (prev.trim() === "" || Number(prev) === 0 ? "1" : prev));
-                      else setRewatchText("0");
+                      setIsRewatch(v);
+
+                      // If turning ON and count is empty/0, default to 1 (nice UX)
+                      if (v) {
+                        setRewatchText((prev) => (prev.trim() === "" || Number(prev) === 0 ? "1" : prev));
+                      }
                     }}
                   />
+
 
                   <TextNumberInput
                     label="Count"
@@ -2458,7 +2671,9 @@ async function pickForMe(mode: "best" | "random" = "best") {
                         key={
                           p.provider === "tmdb"
                             ? `tmdb:${p.tmdbType}:${p.tmdbId}`
-                            : `anilist:${p.anilistId}`
+                            : p.provider === "anilist"
+                            ? `anilist:${p.anilistType}:${p.anilistId}`
+                            : `igdb:${p.igdbId}`
                         }
                       >
                         <div className="aspect-[2/3] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
@@ -2482,11 +2697,26 @@ async function pickForMe(mode: "best" | "random" = "best") {
         {/* FRIENDS PAGE */}
         {view === "friends" ? (
           <div className="space-y-4 rounded-2xl bg-neutral-900/50 ring-1 ring-neutral-800/80 p-4 sm:p-6">
-            <div className="text-lg font-semibold">Friends</div>
-            <div className="text-sm text-neutral-400">
-              Add friends by their <span className="text-neutral-200">Stack username</span> (the one stored in <code>profiles.username</code>).
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-lg font-semibold">Friends</div>
+                <div className="text-sm text-neutral-400">
+                  Add friends by their <span className="text-neutral-200">Stack username</span> (stored in <code>profiles.username</code>).
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  loadIncomingFriendRequests();
+                  loadFriends();
+                }}
+                className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+              >
+                Refresh
+              </button>
             </div>
 
+            {/* Send request */}
             <div className="flex flex-col sm:flex-row gap-2">
               <input
                 value={inputUsername}
@@ -2504,8 +2734,64 @@ async function pickForMe(mode: "best" | "random" = "best") {
             </div>
 
             {friendStatus ? <div className="text-sm text-neutral-300">{friendStatus}</div> : null}
+
+            {/* Incoming requests */}
+            <div className="pt-2">
+              <div className="text-sm font-semibold text-neutral-200">Incoming requests</div>
+              {incomingRequests.length ? (
+                <div className="mt-2 space-y-2">
+                  {incomingRequests.map((r) => (
+                    <div
+                      key={r.id}
+                      className="flex items-center justify-between gap-3 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2"
+                    >
+                      <div className="text-sm text-neutral-200 truncate">
+                        {r.requester?.username ? r.requester.username : r.requester_id}
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => acceptFriendRequest(r.id, r.requester_id)}
+                          className="text-xs px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => declineFriendRequest(r.id)}
+                          className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                        >
+                          Decline
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-neutral-500 mt-2">No incoming requests.</div>
+              )}
+            </div>
+
+            {/* Friends list */}
+            <div className="pt-2">
+              <div className="text-sm font-semibold text-neutral-200">Your friends</div>
+              {friendsList.length ? (
+                <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {friendsList.map((f) => (
+                    <div key={f.friend_id} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+                      <div className="text-sm text-neutral-200 truncate">{f.friend?.username ?? f.friend_id}</div>
+                      <div className="text-[11px] text-neutral-500 truncate">{f.friend_id}</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-neutral-500 mt-2">No friends yet.</div>
+              )}
+            </div>
           </div>
         ) : null}
+
 
         {/* LIST PAGES */}
         {view !== "stats" && view !== "add" && view !== "friends" ? (
