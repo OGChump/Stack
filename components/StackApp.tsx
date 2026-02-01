@@ -22,6 +22,16 @@ export type StackView =
   | "stats"
   | "add"
   | "friends";
+
+const STATUSES = [
+  { id: "completed", label: "Completed" },
+  { id: "in_progress", label: "In Progress" },
+  { id: "planned", label: "Planned" },
+  { id: "dropped", label: "Dropped" },
+] as const;
+
+type Status = (typeof STATUSES)[number]["id"];
+
 type MediaItem = {
   id: string;
   title: string;
@@ -62,6 +72,7 @@ type MediaItem = {
   // games
   hoursPlayed?: number; // manual hours played
 };
+
 
 type TmdbSearchResult = {
   results?: Array<{ id: number; title?: string; name?: string; release_date?: string; first_air_date?: string }>;
@@ -144,14 +155,6 @@ const TYPE_LABEL: Record<MediaType, string> = {
   game: "Game",
 };
 
-const STATUSES = [
-  { id: "completed", label: "Completed" },
-  { id: "in_progress", label: "In Progress" },
-  { id: "planned", label: "Planned" },
-  { id: "dropped", label: "Dropped" },
-] as const;
-
-type Status = (typeof STATUSES)[number]["id"];
 
 
 function uid() {
@@ -747,14 +750,15 @@ type FriendRow = {
 
 const AUTO_ACCEPT_FRIEND_REQUESTS = true;
 
-async function findProfileByUsername(username: string): Promise<ProfileRow | null> {
+/** Prefer exact match so we don’t error when multiple rows match */
+const findProfileByUsername = useCallback(async (username: string): Promise<ProfileRow | null> => {
   const u = username.trim();
   if (!u) return null;
 
   const { data, error } = await supabase
     .from("profiles")
     .select("id, username")
-    .ilike("username", `%${u}%`)
+    .eq("username", u)
     .maybeSingle();
 
   if (error) {
@@ -762,8 +766,29 @@ async function findProfileByUsername(username: string): Promise<ProfileRow | nul
     return null;
   }
 
-  return data ?? null;
-}
+  return (data as ProfileRow) ?? null;
+}, []);
+
+/** ✅ DEFINE THIS FIRST so it can be referenced safely below */
+const loadFriends = useCallback(
+  async (uid?: string) => {
+    const me = uid ?? userId;
+    if (!me) return;
+
+    const { data, error } = await supabase
+      .from("friends")
+      .select("friend_id, friend:friend_id(username)")
+      .eq("user_id", me);
+
+    if (error) {
+      console.error(error);
+      return;
+    }
+
+    setFriendsList((data ?? []) as FriendRow[]);
+  },
+  [userId]
+);
 
 const loadIncomingFriendRequests = useCallback(
   async (uid?: string, opts?: { autoAccept?: boolean }) => {
@@ -788,55 +813,33 @@ const loadIncomingFriendRequests = useCallback(
     const shouldAutoAccept = opts?.autoAccept ?? AUTO_ACCEPT_FRIEND_REQUESTS;
     if (!shouldAutoAccept) return;
 
-    // Auto-accept all pending requests (sequential to avoid rate-limit spam)
     for (const r of rows) {
       try {
-        await acceptFriendRequest(r.id, r.requester_id, { skipReload: true });
+        await acceptFriendRequest(r.id, r.requester_id, { skipReload: true, me });
       } catch (e) {
         console.error(e);
       }
     }
 
-    // One refresh after processing
     await Promise.all([loadIncomingFriendRequests(me, { autoAccept: false }), loadFriends(me)]);
   },
   [userId, loadFriends]
 );
 
-
-const loadFriends = useCallback(
-  async (uid?: string) => {
-    const me = uid ?? userId;
-    if (!me) return;
-
-    const { data, error } = await supabase
-      .from("friends")
-      .select("friend_id, friend:friend_id(username)")
-      .eq("user_id", me);
-
-    if (error) {
-      console.error(error);
-      return;
-    }
-
-    setFriendsList((data ?? []) as FriendRow[]);
-  },
-  [userId]
-);
-
 async function acceptFriendRequest(
   requestId: string,
   requesterId: string,
-  opts?: { skipReload?: boolean }
+  opts?: { skipReload?: boolean; me?: string }
 ) {
-  if (!userId) return;
+  const me = opts?.me ?? userId;
+  if (!me) return;
 
   // 1) mark request accepted (idempotent-ish)
   const { data: updated, error: upErr } = await supabase
     .from("friend_requests")
     .update({ status: "accepted" })
     .eq("id", requestId)
-    .eq("requested_id", userId)
+    .eq("requested_id", me)
     .eq("status", "pending")
     .select("id,status")
     .maybeSingle();
@@ -848,7 +851,6 @@ async function acceptFriendRequest(
   }
 
   if (!updated) {
-    // If it's already handled, just ignore quietly for auto-accept
     if (!opts?.skipReload) setFriendStatus("Nothing to accept (already handled).");
     return;
   }
@@ -858,8 +860,8 @@ async function acceptFriendRequest(
     .from("friends")
     .upsert(
       [
-        { user_id: userId, friend_id: requesterId },
-        { user_id: requesterId, friend_id: userId },
+        { user_id: me, friend_id: requesterId },
+        { user_id: requesterId, friend_id: me },
       ],
       { onConflict: "user_id,friend_id" }
     );
@@ -868,15 +870,13 @@ async function acceptFriendRequest(
     console.error(frErr);
     setFriendStatus(frErr.message || "Accepted, but failed to create friendship rows.");
   } else {
-    // Keep status subtle for auto-accept
     setFriendStatus(AUTO_ACCEPT_FRIEND_REQUESTS ? "Friend added ✅ (auto-accepted)" : "Friend added ✅");
   }
 
   if (opts?.skipReload) return;
 
-  await Promise.all([loadIncomingFriendRequests(userId, { autoAccept: false }), loadFriends(userId)]);
+  await Promise.all([loadIncomingFriendRequests(me, { autoAccept: false }), loadFriends(me)]);
 }
-
 
 async function declineFriendRequest(requestId: string) {
   if (!userId) return;
@@ -2584,44 +2584,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   />
                 </div>
 
-                  <TextNumberInput
-                    label="Count"
-                    value={rewatchText}
-                    onChange={setRewatchText}
-                    placeholder="0"
-                    pattern={/^\d{0,3}$/}
-                    disabled={!isRewatch}
-                    helper="This still doesnt work as intended ngl"
-                  />
-
-                  <TextNumberInput
-                    label="Count"
-                    value={rewatchText}
-                    onChange={(v) => {
-                      if (!isRewatch) return;
-
-                      // allow empty while typing
-                      if (v.trim() === "") {
-                        setRewatchText("");
-                        return;
-                      }
-
-                      const n = Math.floor(Number(v));
-                      if (!Number.isFinite(n)) return;
-
-                      // enforce min 1 while ON, cap at 999
-                      const clamped = Math.max(1, Math.min(999, n));
-                      setRewatchText(String(clamped));
-                      lastRewatchOnRef.current = String(clamped);
-                    }}
-                    placeholder="1"
-                    pattern={/^\d{0,3}$/}
-                    disabled={!isRewatch}
-                    helper={isRewatch ? "Rewatch count (min 1)." : "Enable Rewatch to edit."}
-                  />
-
-
-
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <TextNumberInput
                     label="Progress current (optional)"
@@ -2630,6 +2592,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                     placeholder="—"
                     pattern={/^\d{0,6}$/}
                   />
+
                   <TextNumberInput
                     label="Progress total (optional)"
                     value={progressTotalText}
@@ -2667,6 +2630,34 @@ async function pickForMe(mode: "best" | "random" = "best") {
                       helper="Overrides auto-filled cover."
                     />
                   ) : null}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <TextNumberInput
+                    label="Count"
+                    value={rewatchText}
+                    onChange={(v) => {
+                      if (!isRewatch) return;
+
+                      if (v.trim() === "") {
+                        setRewatchText("");
+                        return;
+                      }
+
+                      const n = Math.floor(Number(v));
+                      if (!Number.isFinite(n)) return;
+
+                      const clamped = Math.max(1, Math.min(999, n));
+                      setRewatchText(String(clamped));
+                      lastRewatchOnRef.current = String(clamped);
+                    }}
+                    placeholder="1"
+                    pattern={/^\d{0,3}$/}
+                    disabled={!isRewatch}
+                    helper={isRewatch ? "Rewatch count (min 1)." : "Enable Rewatch to edit."}
+                  />
+
+                  <div />
                 </div>
 
                 <TagEditor
