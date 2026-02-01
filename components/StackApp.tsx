@@ -20,7 +20,8 @@ export type StackView =
   | "planned"
   | "dropped"
   | "stats"
-  | "add";
+  | "add"
+  | "friends";
 
 const STATUSES = [
   { id: "completed", label: "Completed" },
@@ -564,7 +565,30 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const [cloudLoaded, setCloudLoaded] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
-  
+  // ================= FRIENDS =================
+  const [inputUsername, setInputUsername] = useState("");
+  const [friendStatus, setFriendStatus] = useState("");
+
+  const [incomingRequests, setIncomingRequests] = useState<
+    Array<{
+      id: string;
+      requester_id: string;
+      requested_id: string;
+      status: string;
+      created_at?: string;
+      requester?: { username?: string | null } | null;
+    }>
+  >([]);
+
+  const [friendsList, setFriendsList] = useState<
+    Array<{
+      friend_id: string;
+      friend?: { username?: string | null } | null;
+    }>
+  >([]);
+
+
+
   const [picks, setPicks] = useState<Pick[]>([]);
   const [pickStatus, setPickStatus] = useState("");
   const seenPickKeysRef = useRef<Set<string>>(new Set());
@@ -681,10 +705,10 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
     () => [
       { href: "/stats", label: "Stats", key: "stats" as StackView, icon: "pie" as const },
       { href: "/add", label: "Add", key: "add" as StackView, icon: "plus" as const },
+      { href: "/friends", label: "Friends", key: "friends" as StackView, icon: "users" as const },
     ],
     []
   );
-
 
 
   /* ================= LOCAL BACKUP ================= */
@@ -705,6 +729,372 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
       localStorage.setItem(LOCAL_BACKUP_KEY, JSON.stringify(next));
     } catch {}
   }, []);
+
+/* ================= SUPABASE ================= */
+
+type ProfileRow = { id: string; username: string | null };
+
+type IncomingRequestRow = {
+  id: string;
+  requester_id: string;
+  requested_id: string;
+  status: "pending" | "accepted" | "declined";
+  created_at?: string;
+  requester?: { username?: string | null } | null;
+};
+
+type FriendRow = {
+  friend_id: string;
+  friend?: { username?: string | null } | null;
+};
+
+const AUTO_ACCEPT_FRIEND_REQUESTS = true;
+
+/** Prefer exact match so we don’t error when multiple rows match */
+const findProfileByUsername = useCallback(async (username: string): Promise<ProfileRow | null> => {
+  const u = username.trim();
+  if (!u) return null;
+
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, username")
+    .eq("username", u)
+    .maybeSingle();
+
+  if (error) {
+    console.error(error);
+    return null;
+  }
+
+  return (data as ProfileRow) ?? null;
+}, []);
+
+/** ✅ DEFINE THIS FIRST so it can be referenced safely below */
+const loadFriends = useCallback(
+  async (uid?: string) => {
+    const me = uid ?? userId;
+    if (!me) return;
+
+    const { data, error } = await supabase
+      .from("friends")
+      .select("friend_id, friend:friend_id(username)")
+      .eq("user_id", me);
+
+    if (error) {
+      console.error(error);
+      return;
+    }
+
+    setFriendsList((data ?? []) as FriendRow[]);
+  },
+  [userId]
+);
+
+const loadIncomingFriendRequests = useCallback(
+  async (uid?: string, opts?: { autoAccept?: boolean }) => {
+    const me = uid ?? userId;
+    if (!me) return;
+
+    const { data, error } = await supabase
+      .from("friend_requests")
+      .select("id, requester_id, requested_id, status, created_at, requester:requester_id(username)")
+      .eq("requested_id", me)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error(error);
+      return;
+    }
+
+    const rows = (data ?? []) as IncomingRequestRow[];
+    setIncomingRequests(rows);
+
+    const shouldAutoAccept = opts?.autoAccept ?? AUTO_ACCEPT_FRIEND_REQUESTS;
+    if (!shouldAutoAccept) return;
+
+    for (const r of rows) {
+      try {
+        await acceptFriendRequest(r.id, r.requester_id, { skipReload: true, me });
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    await Promise.all([loadIncomingFriendRequests(me, { autoAccept: false }), loadFriends(me)]);
+  },
+  [userId, loadFriends]
+);
+
+async function acceptFriendRequest(
+  requestId: string,
+  requesterId: string,
+  opts?: { skipReload?: boolean; me?: string }
+) {
+  const me = opts?.me ?? userId;
+  if (!me) return;
+
+  // 1) mark request accepted (idempotent-ish)
+  const { data: updated, error: upErr } = await supabase
+    .from("friend_requests")
+    .update({ status: "accepted" })
+    .eq("id", requestId)
+    .eq("requested_id", me)
+    .eq("status", "pending")
+    .select("id,status")
+    .maybeSingle();
+
+  if (upErr) {
+    console.error(upErr);
+    setFriendStatus(upErr.message || "Failed to accept request.");
+    return;
+  }
+
+  if (!updated) {
+    if (!opts?.skipReload) setFriendStatus("Nothing to accept (already handled).");
+    return;
+  }
+
+  // 2) create friendships both directions (avoid duplicates)
+  const { error: frErr } = await supabase
+    .from("friends")
+    .upsert(
+      [
+        { user_id: me, friend_id: requesterId },
+        { user_id: requesterId, friend_id: me },
+      ],
+      { onConflict: "user_id,friend_id" }
+    );
+
+  if (frErr) {
+    console.error(frErr);
+    setFriendStatus(frErr.message || "Accepted, but failed to create friendship rows.");
+  } else {
+    setFriendStatus(AUTO_ACCEPT_FRIEND_REQUESTS ? "Friend added ✅ (auto-accepted)" : "Friend added ✅");
+  }
+
+  if (opts?.skipReload) return;
+
+  await Promise.all([loadIncomingFriendRequests(me, { autoAccept: false }), loadFriends(me)]);
+}
+
+async function declineFriendRequest(requestId: string) {
+  if (!userId) return;
+
+  const { error } = await supabase
+    .from("friend_requests")
+    .update({ status: "declined" })
+    .eq("id", requestId)
+    .eq("requested_id", userId)
+    .eq("status", "pending");
+
+  if (error) {
+    console.error(error);
+    setFriendStatus(error.message || "Failed to decline request.");
+    return;
+  }
+
+  setFriendStatus("Request declined.");
+  await loadIncomingFriendRequests(userId, { autoAccept: false });
+}
+
+async function sendFriendRequest() {
+  setFriendStatus("");
+
+  if (!userId) {
+    setFriendStatus("You must be logged in.");
+    return;
+  }
+
+  const profile = await findProfileByUsername(inputUsername);
+
+  if (!profile?.id) {
+    setFriendStatus("User not found. (Make sure you typed their Stack username exactly.)");
+    return;
+  }
+
+  if (profile.id === userId) {
+    setFriendStatus("You can't friend yourself 💀");
+    return;
+  }
+
+  // already friends?
+  const { data: existingFriend, error: friendCheckErr } = await supabase
+    .from("friends")
+    .select("friend_id")
+    .eq("user_id", userId)
+    .eq("friend_id", profile.id)
+    .maybeSingle();
+
+  if (friendCheckErr) console.error(friendCheckErr);
+
+  if (existingFriend?.friend_id) {
+    setFriendStatus(`You're already friends with ${profile.username ?? "that user"}.`);
+    return;
+  }
+
+  // existing pending request either direction?
+  const { data: existingReq, error: reqErr } = await supabase
+    .from("friend_requests")
+    .select("id, status, requester_id, requested_id")
+    .or(
+      `and(requester_id.eq.${userId},requested_id.eq.${profile.id}),and(requester_id.eq.${profile.id},requested_id.eq.${userId})`
+    )
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (reqErr) console.error(reqErr);
+
+  if (existingReq?.id && existingReq.status === "pending") {
+    if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
+      setFriendStatus(`${profile.username ?? "That user"} already requested you — auto-accepting…`);
+      await acceptFriendRequest(existingReq.id, profile.id);
+      setInputUsername("");
+      return;
+    }
+
+    setFriendStatus(`You already sent a pending request to ${profile.username ?? "that user"}.`);
+    return;
+  }
+
+  const { error } = await supabase.from("friend_requests").insert({
+    requester_id: userId,
+    requested_id: profile.id,
+    status: "pending",
+  });
+
+  if (error) {
+    console.error(error);
+    setFriendStatus(error.message || "Failed to send request.");
+    return;
+  }
+
+  setFriendStatus(`Friend request sent to ${profile.username ?? "that user"}.`);
+  setInputUsername("");
+}
+
+const loadCloud = useCallback(
+  async (uidStr: string) => {
+    setSaveStatus("Loading…");
+    setCloudLoaded(false);
+
+    const { data, error } = await supabase
+      .from("media_items")
+      .select("data")
+      .eq("user_id", uidStr)
+      .maybeSingle();
+
+    if (error) {
+      console.error(error);
+      const backup = loadLocalBackup();
+      if (backup) setItems(backup);
+      setCloudLoaded(true);
+      setSaveStatus("Loaded (local backup)");
+      return;
+    }
+
+    const raw = data?.data as unknown;
+
+    const parsedItems =
+      raw &&
+      typeof raw === "object" &&
+      raw !== null &&
+      "items" in raw &&
+      Array.isArray((raw as any).items)
+        ? ((raw as any).items as MediaItem[])
+        : null;
+
+    if (parsedItems) {
+      setItems(parsedItems);
+      saveLocalBackup(parsedItems);
+      setCloudLoaded(true);
+      setSaveStatus("Loaded");
+      return;
+    }
+
+    const up = await supabase
+      .from("media_items")
+      .upsert({ user_id: uidStr, data: { items: [] } }, { onConflict: "user_id" });
+
+    if (up.error) {
+      console.error(up.error);
+      const backup = loadLocalBackup();
+      if (backup) setItems(backup);
+      setCloudLoaded(true);
+      setSaveStatus("Loaded (local backup)");
+      return;
+    }
+
+    setItems([]);
+    saveLocalBackup([]);
+    setCloudLoaded(true);
+    setSaveStatus("Loaded");
+  },
+  [loadLocalBackup, saveLocalBackup]
+);
+
+const saveCloud = useCallback(
+  async (uidStr: string, next: MediaItem[]) => {
+    saveLocalBackup(next);
+    if (!cloudLoaded) return;
+
+    setSaveStatus("Saving…");
+
+    const { error } = await supabase
+      .from("media_items")
+      .upsert({ user_id: uidStr, data: { items: next } }, { onConflict: "user_id" });
+
+    if (error) {
+      console.error(error);
+      setSaveStatus("Saved locally (cloud error)");
+      return;
+    }
+
+    setSaveStatus("Saved");
+  },
+  [cloudLoaded, saveLocalBackup]
+);
+
+useEffect(() => {
+  const backup = loadLocalBackup();
+  if (backup) setItems(backup);
+}, [loadLocalBackup]);
+
+useEffect(() => {
+  if (!userId) return;
+  loadIncomingFriendRequests(userId);
+  loadFriends(userId);
+}, [userId, loadIncomingFriendRequests, loadFriends]);
+
+useEffect(() => {
+  let mounted = true;
+
+  supabase.auth.getUser().then(({ data }) => {
+    if (!mounted) return;
+    const uidStr = data.user?.id ?? null;
+    setUserId(uidStr);
+    if (uidStr) loadCloud(uidStr);
+  });
+
+  const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
+    const uidStr = session?.user?.id ?? null;
+    setUserId(uidStr);
+    if (uidStr) loadCloud(uidStr);
+  });
+
+  return () => {
+    mounted = false;
+    sub.subscription.unsubscribe();
+  };
+}, [loadCloud]);
+
+useEffect(() => {
+  if (userId) saveCloud(userId, items);
+  else saveLocalBackup(items);
+}, [items, userId, saveCloud, saveLocalBackup]);
+
+
 
 /* ================= ACTIONS ================= */
 
@@ -2374,6 +2764,193 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 ) : null}
               </div>
             </div>
+          </div>
+        ) : null}
+
+        {/* FRIENDS PAGE */}
+        {view === "friends" ? (
+          <div className="space-y-4 rounded-2xl bg-neutral-900/50 ring-1 ring-neutral-800/80 p-4 sm:p-6">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-lg font-semibold">Friends</div>
+                <div className="text-sm text-neutral-400">
+                  Add friends by their <span className="text-neutral-200">Stack username</span> (stored in <code>profiles.username</code>).
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  loadIncomingFriendRequests(undefined, { autoAccept: true });
+                  loadFriends();
+                }}
+                className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+              >
+                Refresh
+              </button>
+            </div>
+
+            {/* Send request */}
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                value={inputUsername}
+                onChange={(e) => setInputUsername(e.target.value)}
+                placeholder="Enter username (e.g., OGChump)"
+                className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+              />
+              <button
+                type="button"
+                onClick={sendFriendRequest}
+                className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+              >
+                Send request
+              </button>
+            </div>
+
+            {friendStatus ? <div className="text-sm text-neutral-300">{friendStatus}</div> : null}
+
+            {/* Incoming requests */}
+            <div className="pt-2">
+              <div className="text-sm font-semibold text-neutral-200">Incoming requests</div>
+              {incomingRequests.length ? (
+                <div className="mt-2 space-y-2">
+                  {incomingRequests.map((r) => (
+                    <div
+                      key={r.id}
+                      className="flex items-center justify-between gap-3 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2"
+                    >
+                      <div className="text-sm text-neutral-200 truncate">
+                        {r.requester?.username ? r.requester.username : r.requester_id}
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => acceptFriendRequest(r.id, r.requester_id)}
+                          className="text-xs px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => declineFriendRequest(r.id)}
+                          className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                        >
+                          Decline
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-neutral-500 mt-2">No incoming requests.</div>
+              )}
+            </div>
+
+            {/* Friends list */}
+            <div className="pt-2">
+              <div className="text-sm font-semibold text-neutral-200">Your friends</div>
+              {friendsList.length ? (
+                <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {friendsList.map((f) => (
+                    <div key={f.friend_id} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+                      <div className="text-sm text-neutral-200 truncate">{f.friend?.username ?? f.friend_id}</div>
+                      <div className="text-[11px] text-neutral-500 truncate">{f.friend_id}</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-neutral-500 mt-2">No friends yet.</div>
+              )}
+            </div>
+          </div>
+        ) : null}
+
+
+        {/* LIST PAGES */}
+        {view !== "stats" && view !== "add" && view !== "friends" ? (
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search title, notes, tags..."
+                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+              />
+
+              <Select
+                label="Sort"
+                value={sortMode}
+                onChange={(v) => setSortMode(v as SortMode)}
+                options={[
+                  { value: "newest", label: "Newest first" },
+                  { value: "oldest", label: "Oldest first" },
+                  { value: "title", label: "Title (A–Z)" },
+                  { value: "rating_high", label: "Rating (high → low)" },
+                  { value: "rating_low", label: "Rating (low → high)" },
+                ]}
+              />
+            </div>
+
+            {view === "all" ? (
+              <div className="flex items-center justify-between">
+                <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
+                <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
+              </div>
+            ) : null}
+
+            <DndContext onDragEnd={handleDragEnd}>
+              {view === "all" && boardView ? (
+                <BoardView items={filtered} onDelete={removeItem} onUpdate={updateItem} />
+              ) : groupMode !== "none" && grouped ? (
+                <div className="space-y-6">
+                  {grouped.map(([k, list]) => (
+                    <section key={k} className="space-y-2">
+                      <h3 className="text-sm text-neutral-400">{k}</h3>
+                      <div className="space-y-3">
+                        {list.map((i) => (
+                          <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
+                        ))}
+                      </div>
+                    </section>
+                  ))}
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  {STATUSES.map((s) => {
+                    const list = byStatusFiltered[s.id];
+                    if (!list.length) return null;
+
+                    return (
+                      <section key={s.id} className="space-y-3">
+                        <div className="flex items-center justify-between">
+                          <h3 className="text-sm text-neutral-300">{s.label}</h3>
+                          <div className="text-xs text-neutral-500">{list.length}</div>
+                        </div>
+
+                        <div className="space-y-3">
+                          <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
+                            <div />
+                            <div>Title</div>
+                            <div className="text-center">Score</div>
+                            <div className="text-center">Type</div>
+                            <div className="text-center">Progress / Hours</div>
+                          </div>
+
+                          {list.map((i) => (
+                            <MALRow
+                              key={i.id}
+                              item={i}
+                              onDelete={() => removeItem(i.id)}
+                              onUpdate={(patch) => updateItem(i.id, patch)}
+                            />
+                          ))}
+                        </div>
+                      </section>
+                    );
+                  })}
+                </div>
+              )}
+            </DndContext>
           </div>
         ) : null}
 
