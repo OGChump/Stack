@@ -32,24 +32,6 @@ const STATUSES = [
 
 type Status = (typeof STATUSES)[number]["id"];
 
-  type ProfileRow = { id: string; username: string | null };
-
-  type FriendRequestStatus = "pending" | "accepted" | "declined";
-
-  type IncomingRequestRow = {
-    id: string;
-    requester_id: string;
-    receiver_id: string;
-    status: FriendRequestStatus;
-    created_at?: string | null;
-    requester?: { username?: string | null } | null;
-  };
-
-  type FriendRow = {
-    friend_id: string;
-    friend?: { username?: string | null } | null;
-  };
-
 type MediaItem = {
   id: string;
   title: string;
@@ -162,8 +144,6 @@ type Suggestion = {
 
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
 const LOCAL_BOARD_VIEW_KEY = "stack-board-view-v1";
-const LOCAL_NONBOARD_STATUS_KEY = "stack-nonboard-status-v1";
-
 
 
 const TYPE_LABEL: Record<MediaType, string> = {
@@ -570,9 +550,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [sortMode, setSortMode] = useState<SortMode>("newest");
   const [boardView, setBoardView] = useState<boolean>(true);
 
-  // ✅ Non-board status filter (only used when view === "all" && boardView === false)
-  const [nonBoardStatus, setNonBoardStatus] = useState<"all" | Status>("all");
-
   useEffect(() => {
     try {
       const raw = localStorage.getItem(LOCAL_BOARD_VIEW_KEY);
@@ -580,21 +557,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     } catch {}
   }, []);
 
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(LOCAL_NONBOARD_STATUS_KEY);
-      if (!raw) return;
-      if (raw === "all" || (["completed", "in_progress", "planned", "dropped"] as string[]).includes(raw)) {
-        setNonBoardStatus(raw as any);
-      }
-    } catch {}
-  }, []);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(LOCAL_BOARD_VIEW_KEY, boardView ? "1" : "0");
-    } catch {}
-  }, [boardView]);
 
   const [autofillStatus, setAutofillStatus] = useState("");
   const [autoAutofill, setAutoAutofill] = useState(true);
@@ -603,16 +565,27 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const [cloudLoaded, setCloudLoaded] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
-  
   // ================= FRIENDS =================
   const [inputUsername, setInputUsername] = useState("");
   const [friendStatus, setFriendStatus] = useState("");
 
-  const [incomingRequests, setIncomingRequests] = useState<IncomingRequestRow[]>([]);
+  const [incomingRequests, setIncomingRequests] = useState<
+    Array<{
+      id: string;
+      requester_id: string;
+      requested_id: string;
+      status: string;
+      created_at?: string;
+      requester?: { username?: string | null } | null;
+    }>
+  >([]);
 
-
-  const [friendsList, setFriendsList] = useState<FriendRow[]>([]);
-
+  const [friendsList, setFriendsList] = useState<
+    Array<{
+      friend_id: string;
+      friend?: { username?: string | null } | null;
+    }>
+  >([]);
 
 
 
@@ -668,6 +641,12 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
   // ✅ Undo delete
   const [undoState, setUndoState] = useState<{ item: MediaItem; index: number } | null>(null);
   const undoTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LOCAL_BOARD_VIEW_KEY, boardView ? "1" : "0");
+    } catch {}
+  }, [boardView]);
 
   // ✅ Cleanup undo timer on unmount
   useEffect(() => {
@@ -753,6 +732,22 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
 
 /* ================= SUPABASE ================= */
 
+type ProfileRow = { id: string; username: string | null };
+
+type IncomingRequestRow = {
+  id: string;
+  requester_id: string;
+  requested_id: string;
+  status: "pending" | "accepted" | "declined";
+  created_at?: string;
+  requester?: { username?: string | null } | null;
+};
+
+type FriendRow = {
+  friend_id: string;
+  friend?: { username?: string | null } | null;
+};
+
 const AUTO_ACCEPT_FRIEND_REQUESTS = true;
 
 /** Prefer exact match so we don’t error when multiple rows match */
@@ -790,7 +785,7 @@ const loadFriends = useCallback(
       return;
     }
 
-    setFriendsList(data ?? []);
+    setFriendsList((data ?? []) as FriendRow[]);
   },
   [userId]
 );
@@ -802,8 +797,8 @@ const loadIncomingFriendRequests = useCallback(
 
     const { data, error } = await supabase
       .from("friend_requests")
-      .select("id, requester_id, receiver_id, status, created_at, requester:requester_id(username)")
-      .eq("receiver_id", me)
+      .select("id, requester_id, requested_id, status, created_at, requester:requester_id(username)")
+      .eq("requested_id", me)
       .eq("status", "pending")
       .order("created_at", { ascending: false });
 
@@ -844,7 +839,7 @@ async function acceptFriendRequest(
     .from("friend_requests")
     .update({ status: "accepted" })
     .eq("id", requestId)
-    .eq("receiver_id", me)
+    .eq("requested_id", me)
     .eq("status", "pending")
     .select("id,status")
     .maybeSingle();
@@ -890,7 +885,7 @@ async function declineFriendRequest(requestId: string) {
     .from("friend_requests")
     .update({ status: "declined" })
     .eq("id", requestId)
-    .eq("receiver_id", userId)
+    .eq("requested_id", userId)
     .eq("status", "pending");
 
   if (error) {
@@ -941,9 +936,9 @@ async function sendFriendRequest() {
   // existing pending request either direction?
   const { data: existingReq, error: reqErr } = await supabase
     .from("friend_requests")
-    .select("id, status, requester_id, receiver_id, created_at")
+    .select("id, status, requester_id, requested_id")
     .or(
-      `and(requester_id.eq.${userId},receiver_id.eq.${profile.id}),and(requester_id.eq.${profile.id},receiver_id.eq.${userId})`
+      `and(requester_id.eq.${userId},requested_id.eq.${profile.id}),and(requester_id.eq.${profile.id},requested_id.eq.${userId})`
     )
     .order("created_at", { ascending: false })
     .limit(1)
@@ -952,28 +947,20 @@ async function sendFriendRequest() {
   if (reqErr) console.error(reqErr);
 
   if (existingReq?.id && existingReq.status === "pending") {
-    const theyRequestedMe =
-      existingReq.requester_id === profile.id && existingReq.receiver_id === userId;
-
-    const iRequestedThem =
-      existingReq.requester_id === userId && existingReq.receiver_id === profile.id;
-
-    if (theyRequestedMe) {
+    if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
       setFriendStatus(`${profile.username ?? "That user"} already requested you — auto-accepting…`);
       await acceptFriendRequest(existingReq.id, profile.id);
       setInputUsername("");
       return;
     }
 
-    if (iRequestedThem) {
-      setFriendStatus(`You already sent a pending request to ${profile.username ?? "that user"}.`);
-      return;
-    }
+    setFriendStatus(`You already sent a pending request to ${profile.username ?? "that user"}.`);
+    return;
   }
 
   const { error } = await supabase.from("friend_requests").insert({
     requester_id: userId,
-    receiver_id: profile.id,
+    requested_id: profile.id,
     status: "pending",
   });
 
@@ -986,6 +973,128 @@ async function sendFriendRequest() {
   setFriendStatus(`Friend request sent to ${profile.username ?? "that user"}.`);
   setInputUsername("");
 }
+
+const loadCloud = useCallback(
+  async (uidStr: string) => {
+    setSaveStatus("Loading…");
+    setCloudLoaded(false);
+
+    const { data, error } = await supabase
+      .from("media_items")
+      .select("data")
+      .eq("user_id", uidStr)
+      .maybeSingle();
+
+    if (error) {
+      console.error(error);
+      const backup = loadLocalBackup();
+      if (backup) setItems(backup);
+      setCloudLoaded(true);
+      setSaveStatus("Loaded (local backup)");
+      return;
+    }
+
+    const raw = data?.data as unknown;
+
+    const parsedItems =
+      raw &&
+      typeof raw === "object" &&
+      raw !== null &&
+      "items" in raw &&
+      Array.isArray((raw as any).items)
+        ? ((raw as any).items as MediaItem[])
+        : null;
+
+    if (parsedItems) {
+      setItems(parsedItems);
+      saveLocalBackup(parsedItems);
+      setCloudLoaded(true);
+      setSaveStatus("Loaded");
+      return;
+    }
+
+    const up = await supabase
+      .from("media_items")
+      .upsert({ user_id: uidStr, data: { items: [] } }, { onConflict: "user_id" });
+
+    if (up.error) {
+      console.error(up.error);
+      const backup = loadLocalBackup();
+      if (backup) setItems(backup);
+      setCloudLoaded(true);
+      setSaveStatus("Loaded (local backup)");
+      return;
+    }
+
+    setItems([]);
+    saveLocalBackup([]);
+    setCloudLoaded(true);
+    setSaveStatus("Loaded");
+  },
+  [loadLocalBackup, saveLocalBackup]
+);
+
+const saveCloud = useCallback(
+  async (uidStr: string, next: MediaItem[]) => {
+    saveLocalBackup(next);
+    if (!cloudLoaded) return;
+
+    setSaveStatus("Saving…");
+
+    const { error } = await supabase
+      .from("media_items")
+      .upsert({ user_id: uidStr, data: { items: next } }, { onConflict: "user_id" });
+
+    if (error) {
+      console.error(error);
+      setSaveStatus("Saved locally (cloud error)");
+      return;
+    }
+
+    setSaveStatus("Saved");
+  },
+  [cloudLoaded, saveLocalBackup]
+);
+
+useEffect(() => {
+  const backup = loadLocalBackup();
+  if (backup) setItems(backup);
+}, [loadLocalBackup]);
+
+useEffect(() => {
+  if (!userId) return;
+  loadIncomingFriendRequests(userId);
+  loadFriends(userId);
+}, [userId, loadIncomingFriendRequests, loadFriends]);
+
+useEffect(() => {
+  let mounted = true;
+
+  supabase.auth.getUser().then(({ data }) => {
+    if (!mounted) return;
+    const uidStr = data.user?.id ?? null;
+    setUserId(uidStr);
+    if (uidStr) loadCloud(uidStr);
+  });
+
+  const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
+    const uidStr = session?.user?.id ?? null;
+    setUserId(uidStr);
+    if (uidStr) loadCloud(uidStr);
+  });
+
+  return () => {
+    mounted = false;
+    sub.subscription.unsubscribe();
+  };
+}, [loadCloud]);
+
+useEffect(() => {
+  if (userId) saveCloud(userId, items);
+  else saveLocalBackup(items);
+}, [items, userId, saveCloud, saveLocalBackup]);
+
+
 
 /* ================= ACTIONS ================= */
 
@@ -1673,22 +1782,14 @@ async function pickForMe(mode: "best" | "random" = "best") {
   const filtered = useMemo(() => {
     let out = items.slice();
 
-    // Route-based filters (your existing pages)
     if (view === "completed") out = out.filter((i) => i.status === "completed");
     if (view === "in_progress") out = out.filter((i) => i.status === "in_progress");
     if (view === "planned") out = out.filter((i) => i.status === "planned");
     if (view === "dropped") out = out.filter((i) => i.status === "dropped");
 
-    // ✅ Non-board filter pills (only apply on /all when board view is OFF)
-    if (view === "all" && !boardView && nonBoardStatus !== "all") {
-      out = out.filter((i) => i.status === nonBoardStatus);
-    }
-
     if (query) {
       const q = query.toLowerCase();
-      out = out.filter((i) =>
-        [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q))
-      );
+      out = out.filter((i) => [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q)));
     }
 
     out.sort((a, b) => {
@@ -1702,8 +1803,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
     });
 
     return out;
-  }, [items, view, query, sortMode, boardView, nonBoardStatus]);
-
+  }, [items, view, query, sortMode]);
 
   const grouped = useMemo(() => {
     if (groupMode === "none") return null;
@@ -2792,122 +2892,67 @@ async function pickForMe(mode: "best" | "random" = "best") {
             </div>
 
             {view === "all" ? (
-              <div className="flex items-center justify-between gap-3 flex-wrap">
-                <div className="text-xs text-neutral-500">
-                  {boardView ? "Board view lets you drag cards between statuses." : "List view: filter by status below."}
-                </div>
-                <Toggle
-                  label="Board view"
-                  checked={boardView}
-                  onChange={(next) => {
-                    setBoardView(next);
-                    // Optional: when switching to board view, reset the list filter to All
-                    // (keeps UX clean when you come back)
-                    if (next) setNonBoardStatus("all");
-                  }}
-                />
-              </div>
-            ) : null}
-
-            {/* ✅ Non-board status pill bar (only show on /all when board view is OFF) */}
-            {view === "all" && !boardView ? (
-              <div className="flex flex-wrap items-center gap-2">
-                {(
-                  [
-                    { key: "all", label: "All" },
-                    { key: "completed", label: "Completed" },
-                    { key: "in_progress", label: "In Progress" },
-                    { key: "planned", label: "Planned" },
-                    { key: "dropped", label: "Dropped" },
-                  ] as Array<{ key: "all" | Status; label: string }>
-                ).map((s) => (
-                  <button
-                    key={s.key}
-                    type="button"
-                    onClick={() => setNonBoardStatus(s.key)}
-                    className={[
-                      "px-3 py-2 rounded-xl border text-sm transition",
-                      nonBoardStatus === s.key
-                        ? "bg-white/15 border-white/20"
-                        : "bg-white/5 border-white/10 hover:bg-white/10",
-                    ].join(" ")}
-                  >
-                    {s.label}
-                  </button>
-                ))}
-
-                <div className="ml-auto text-xs text-neutral-500">
-                  Showing:{" "}
-                  <span className="text-neutral-300">
-                    {nonBoardStatus === "all"
-                      ? "All"
-                      : nonBoardStatus === "completed"
-                      ? "Completed"
-                      : nonBoardStatus === "in_progress"
-                      ? "In Progress"
-                      : nonBoardStatus === "planned"
-                      ? "Planned"
-                      : "Dropped"}
-                  </span>{" "}
-                  • <span className="text-neutral-400">{filtered.length}</span>
-                </div>
+              <div className="flex items-center justify-between">
+                <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
+                <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
               </div>
             ) : null}
 
             <DndContext onDragEnd={handleDragEnd}>
-              {/* Board view */}
               {view === "all" && boardView ? (
                 <BoardView items={filtered} onDelete={removeItem} onUpdate={updateItem} />
               ) : groupMode !== "none" && grouped ? (
-                /* Grouped view (if you ever enable groupMode later) */
                 <div className="space-y-6">
                   {grouped.map(([k, list]) => (
                     <section key={k} className="space-y-2">
                       <h3 className="text-sm text-neutral-400">{k}</h3>
                       <div className="space-y-3">
                         {list.map((i) => (
-                          <MALRow
-                            key={i.id}
-                            item={i}
-                            onDelete={() => removeItem(i.id)}
-                            onUpdate={(patch) => updateItem(i.id, patch)}
-                          />
+                          <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
                         ))}
                       </div>
                     </section>
                   ))}
                 </div>
               ) : (
-                /* ✅ Clean list view (no repeated status sections) */
-                <div className="space-y-3">
-                  <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
-                    <div />
-                    <div>Title</div>
-                    <div className="text-center">Score</div>
-                    <div className="text-center">Type</div>
-                    <div className="text-center">Progress / Hours</div>
-                  </div>
+                <div className="space-y-6">
+                  {STATUSES.map((s) => {
+                    const list = byStatusFiltered[s.id];
+                    if (!list.length) return null;
 
-                  {filtered.length ? (
-                    filtered.map((i) => (
-                      <MALRow
-                        key={i.id}
-                        item={i}
-                        onDelete={() => removeItem(i.id)}
-                        onUpdate={(patch) => updateItem(i.id, patch)}
-                      />
-                    ))
-                  ) : (
-                    <div className="text-sm text-neutral-500 text-center py-10 rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/70">
-                      No items match your filters.
-                    </div>
-                  )}
+                    return (
+                      <section key={s.id} className="space-y-3">
+                        <div className="flex items-center justify-between">
+                          <h3 className="text-sm text-neutral-300">{s.label}</h3>
+                          <div className="text-xs text-neutral-500">{list.length}</div>
+                        </div>
+
+                        <div className="space-y-3">
+                          <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
+                            <div />
+                            <div>Title</div>
+                            <div className="text-center">Score</div>
+                            <div className="text-center">Type</div>
+                            <div className="text-center">Progress / Hours</div>
+                          </div>
+
+                          {list.map((i) => (
+                            <MALRow
+                              key={i.id}
+                              item={i}
+                              onDelete={() => removeItem(i.id)}
+                              onUpdate={(patch) => updateItem(i.id, patch)}
+                            />
+                          ))}
+                        </div>
+                      </section>
+                    );
+                  })}
                 </div>
               )}
             </DndContext>
           </div>
         ) : null}
-
 
         <footer className="pt-6 text-xs text-neutral-500">Stack • Saves to Supabase + local backup</footer>
       </div>
