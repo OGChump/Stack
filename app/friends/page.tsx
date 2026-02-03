@@ -69,7 +69,9 @@ export default function FriendsPage() {
 
     if (friendsErr) console.error("friends select error:", friendsErr);
 
-    const ids = (friendRows ?? []).map((r: any) => r.friend_id).filter(Boolean);
+    const ids = (friendRows ?? [])
+      .map((r: any) => r.friend_id)
+      .filter(Boolean);
 
     if (!ids.length) {
       setFriends([]);
@@ -150,19 +152,16 @@ export default function FriendsPage() {
       return;
     }
 
-    // OPTIONAL: check if there's already a pending request either direction
+    // Optional: check if a pending request exists either direction
     const { data: existing, error: existsErr } = await supabase
       .from("friend_requests")
-      .select("id, status, requester_id, requested_id")
+      .select("id")
       .or(
         `and(requester_id.eq.${me},requested_id.eq.${target.id},status.eq.pending),and(requester_id.eq.${target.id},requested_id.eq.${me},status.eq.pending)`
       )
       .limit(1);
 
-    if (existsErr) {
-      console.error("existing request check error:", existsErr);
-      // Not fatal; continue insert attempt
-    } else if (existing && existing.length > 0) {
+    if (!existsErr && existing && existing.length > 0) {
       setInviteStatus("A pending request already exists between you two.");
       return;
     }
@@ -175,8 +174,6 @@ export default function FriendsPage() {
 
     if (insErr) {
       console.error("insert friend_request error:", insErr);
-
-      // Friendly message for the common unique-pending index violation
       const msg = insErr.message || "";
       if (msg.toLowerCase().includes("duplicate key value")) {
         setInviteStatus("A pending request already exists. Ask them to accept it.");
@@ -194,7 +191,7 @@ export default function FriendsPage() {
   async function acceptRequest(requestId: string) {
     setInviteStatus("");
 
-    // MUST use RPC so it inserts into friends table
+    // MUST use RPC so it inserts into friends table (both directions)
     const { error } = await supabase.rpc("accept_friend_request", {
       p_request_id: requestId,
     });
@@ -211,7 +208,7 @@ export default function FriendsPage() {
   async function declineRequest(requestId: string) {
     setInviteStatus("");
 
-    // DB allows 'rejected' (NOT 'declined')
+    // DB uses 'rejected' (NOT 'declined')
     const { error } = await supabase
       .from("friend_requests")
       .update({ status: "rejected" })
@@ -287,13 +284,19 @@ export default function FriendsPage() {
         {/* Friends */}
         <div className="space-y-2">
           <h2 className="text-lg font-medium">Friends</h2>
+
           {friends.length === 0 ? (
             <div className="text-neutral-500 text-sm">No friends yet</div>
           ) : (
             friends.map((f) => (
-              <div key={f.id} className="border border-neutral-800 p-3 rounded-md">
-                {f.display_name || f.username || f.id}
-              </div>
+              <Link
+                key={f.id}
+                href={`/profile/${f.id}`}
+                className="block border border-neutral-800 p-3 rounded-md hover:bg-neutral-900"
+              >
+                <div className="font-medium">{f.display_name || f.username || f.id}</div>
+                <div className="text-xs text-neutral-500">Tap to view profile</div>
+              </Link>
             ))
           )}
         </div>
