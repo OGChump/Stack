@@ -12,6 +12,11 @@ type Profile = {
   display_name: string | null;
 };
 
+type IncomingRequestRow = {
+  id: string;
+  requester_id: string;
+};
+
 type IncomingRequest = {
   id: string;
   requester_id: string;
@@ -25,14 +30,27 @@ export default function FriendsPage() {
   const [inviteUsername, setInviteUsername] = useState("");
   const [inviteStatus, setInviteStatus] = useState("");
 
+  // Keep session/user in sync
   useEffect(() => {
+    let mounted = true;
+
     supabase.auth.getUser().then(({ data, error }) => {
+      if (!mounted) return;
       if (error) {
         console.error("auth.getUser error:", error);
         return;
       }
       setMe(data.user?.id ?? null);
     });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      setMe(session?.user?.id ?? null);
+    });
+
+    return () => {
+      mounted = false;
+      sub.subscription.unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
@@ -43,7 +61,7 @@ export default function FriendsPage() {
   async function refresh() {
     setInviteStatus("");
 
-    // 1) friends list (IDs)
+    // 1) Friends list (directional rows where user_id = me)
     const { data: friendRows, error: friendsErr } = await supabase
       .from("friends")
       .select("friend_id")
@@ -51,7 +69,8 @@ export default function FriendsPage() {
 
     if (friendsErr) console.error("friends select error:", friendsErr);
 
-    const ids = (friendRows ?? []).map((r) => r.friend_id);
+    const ids = (friendRows ?? []).map((r: any) => r.friend_id).filter(Boolean);
+
     if (!ids.length) {
       setFriends([]);
     } else {
@@ -64,7 +83,7 @@ export default function FriendsPage() {
       setFriends((profs ?? []) as Profile[]);
     }
 
-    // 2) incoming friend requests
+    // 2) Incoming friend requests (pending where requested_id = me)
     const { data: reqs, error: reqErr } = await supabase
       .from("friend_requests")
       .select("id, requester_id")
@@ -78,7 +97,8 @@ export default function FriendsPage() {
       return;
     }
 
-    const requesterIds = reqs.map((r) => r.requester_id);
+    const requesterIds = (reqs as IncomingRequestRow[]).map((r) => r.requester_id);
+
     const { data: reqProfiles, error: reqProfErr } = await supabase
       .from("profiles")
       .select("id, username, display_name")
@@ -86,9 +106,9 @@ export default function FriendsPage() {
 
     if (reqProfErr) console.error("profiles (incoming) select error:", reqProfErr);
 
-    const map = new Map((reqProfiles ?? []).map((p) => [p.id, p as Profile]));
+    const map = new Map((reqProfiles ?? []).map((p: any) => [p.id, p as Profile]));
     setIncoming(
-      reqs.map((r) => ({
+      (reqs as IncomingRequestRow[]).map((r) => ({
         id: r.id,
         requester_id: r.requester_id,
         user: map.get(r.requester_id),
@@ -101,11 +121,13 @@ export default function FriendsPage() {
 
     const username = inviteUsername.trim().toLowerCase();
     if (!username) return;
+
     if (!me) {
       setInviteStatus("Not logged in.");
       return;
     }
 
+    // Find target user by username
     const { data: target, error: findErr } = await supabase
       .from("profiles")
       .select("id")
@@ -114,12 +136,12 @@ export default function FriendsPage() {
 
     if (findErr) {
       console.error("find user error:", findErr);
-      setInviteStatus("Error finding user");
+      setInviteStatus("Error finding user.");
       return;
     }
 
     if (!target?.id) {
-      setInviteStatus("User not found");
+      setInviteStatus("User not found.");
       return;
     }
 
@@ -128,26 +150,51 @@ export default function FriendsPage() {
       return;
     }
 
-    // IMPORTANT: use requester_id / requested_id (not requester/requested)
+    // OPTIONAL: check if there's already a pending request either direction
+    const { data: existing, error: existsErr } = await supabase
+      .from("friend_requests")
+      .select("id, status, requester_id, requested_id")
+      .or(
+        `and(requester_id.eq.${me},requested_id.eq.${target.id},status.eq.pending),and(requester_id.eq.${target.id},requested_id.eq.${me},status.eq.pending)`
+      )
+      .limit(1);
+
+    if (existsErr) {
+      console.error("existing request check error:", existsErr);
+      // Not fatal; continue insert attempt
+    } else if (existing && existing.length > 0) {
+      setInviteStatus("A pending request already exists between you two.");
+      return;
+    }
+
+    // Insert request (status defaults to 'pending')
     const { error: insErr } = await supabase.from("friend_requests").insert({
       requester_id: me,
       requested_id: target.id,
-      // status is default 'pending'
     });
 
     if (insErr) {
       console.error("insert friend_request error:", insErr);
-      setInviteStatus(insErr.message);
+
+      // Friendly message for the common unique-pending index violation
+      const msg = insErr.message || "";
+      if (msg.toLowerCase().includes("duplicate key value")) {
+        setInviteStatus("A pending request already exists. Ask them to accept it.");
+      } else {
+        setInviteStatus(msg);
+      }
       return;
     }
 
     setInviteUsername("");
-    setInviteStatus("Invite sent");
+    setInviteStatus("Invite sent.");
     await refresh();
   }
 
   async function acceptRequest(requestId: string) {
-    // Accept MUST call RPC so it inserts into friends (both directions)
+    setInviteStatus("");
+
+    // MUST use RPC so it inserts into friends table
     const { error } = await supabase.rpc("accept_friend_request", {
       p_request_id: requestId,
     });
@@ -162,7 +209,9 @@ export default function FriendsPage() {
   }
 
   async function declineRequest(requestId: string) {
-    // Your DB allows 'rejected' (NOT 'declined')
+    setInviteStatus("");
+
+    // DB allows 'rejected' (NOT 'declined')
     const { error } = await supabase
       .from("friend_requests")
       .update({ status: "rejected" })
