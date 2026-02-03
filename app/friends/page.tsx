@@ -3,19 +3,20 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 
 export default function FriendsPage() {
   const [me, setMe] = useState<string | null>(null);
   const [friends, setFriends] = useState<any[]>([]);
-  const [incoming, setIncoming] = useState<any[]>([]);
+  const [incoming, setIncoming] = useState<{ id: string; user: any }[]>([]);
   const [inviteUsername, setInviteUsername] = useState("");
   const [inviteStatus, setInviteStatus] = useState("");
 
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
+    supabase.auth.getUser().then(({ data, error }) => {
+      if (error) console.log("getUser error:", error);
       setMe(data.user?.id ?? null);
     });
   }, []);
@@ -26,70 +27,140 @@ export default function FriendsPage() {
   }, [me]);
 
   async function refresh() {
-    // friends
-    const { data: friendRows } = await supabase
+    if (!me) return;
+
+    // -----------------------
+    // Friends list
+    // friends table holds directional rows:
+    // (user_id = me) -> friend_id
+    // -----------------------
+    const { data: friendRows, error: friendsErr } = await supabase
       .from("friends")
       .select("friend_id")
       .eq("user_id", me);
 
+    if (friendsErr) console.log("friends select error:", friendsErr);
+
     const ids = (friendRows ?? []).map((r) => r.friend_id);
+
     if (!ids.length) {
       setFriends([]);
     } else {
-      const { data } = await supabase
+      const { data: profs, error: profErr } = await supabase
         .from("profiles")
         .select("id, username, display_name")
         .in("id", ids);
-      setFriends(data ?? []);
+
+      if (profErr) console.log("profiles (friends) error:", profErr);
+      setFriends(profs ?? []);
     }
 
-    // incoming
-    const { data: reqs } = await supabase
+    // -----------------------
+    // Incoming friend requests
+    // friend_requests columns:
+    // id, requester_id, requested_id, status, created_at
+    // -----------------------
+    const { data: reqs, error: reqErr } = await supabase
       .from("friend_requests")
-      .select("id, requester")
-      .eq("requested", me)
+      .select("id, requester_id")
+      .eq("requested_id", me)
       .eq("status", "pending");
+
+    if (reqErr) console.log("incoming requests error:", reqErr);
 
     if (!reqs?.length) {
       setIncoming([]);
     } else {
-      const requesterIds = reqs.map((r) => r.requester);
-      const { data: profs } = await supabase
+      const requesterIds = reqs.map((r) => r.requester_id);
+
+      const { data: reqProfiles, error: reqProfErr } = await supabase
         .from("profiles")
         .select("id, username, display_name")
         .in("id", requesterIds);
 
-      const map = new Map((profs ?? []).map((p) => [p.id, p]));
-      setIncoming(reqs.map((r) => ({ id: r.id, user: map.get(r.requester) })));
+      if (reqProfErr) console.log("profiles (incoming) error:", reqProfErr);
+
+      const map = new Map((reqProfiles ?? []).map((p) => [p.id, p]));
+      setIncoming(reqs.map((r) => ({ id: r.id, user: map.get(r.requester_id) })));
     }
   }
 
   async function sendInvite() {
-    if (!inviteUsername.trim()) return;
+    if (!inviteUsername.trim() || !me) return;
 
-    const { data: user } = await supabase
+    setInviteStatus("");
+
+    const username = inviteUsername.trim().toLowerCase();
+
+    // Find user by username
+    const { data: userRow, error: findErr } = await supabase
       .from("profiles")
       .select("id")
-      .eq("username", inviteUsername.trim())
+      .eq("username", username)
       .maybeSingle();
 
-    if (!user) {
+    if (findErr) {
+      console.log("lookup error:", findErr);
+      setInviteStatus(findErr.message);
+      return;
+    }
+
+    if (!userRow?.id) {
       setInviteStatus("User not found");
       return;
     }
 
-    await supabase.from("friend_requests").insert({
-      requester: me,
-      requested: user.id,
-    });
+    if (userRow.id === me) {
+      setInviteStatus("You can't friend yourself");
+      return;
+    }
+
+    // Insert request:
+    // requester_id defaults to auth.uid() in your SQL
+    // and RLS checks requester_id = auth.uid()
+    const { error: insErr } = await supabase
+      .from("friend_requests")
+      .insert({ requested_id: userRow.id });
+
+    if (insErr) {
+      console.log("insert request error:", insErr);
+      setInviteStatus(insErr.message);
+      return;
+    }
 
     setInviteUsername("");
     setInviteStatus("Invite sent");
     refresh();
   }
 
-  async function respond(id: string, status: "accepted" | "declined") {
-    await supabase.from("friend_requests").update({ status }).eq("id", id);
+  async function respond(requestId: string, action: "accepted" | "rejected") {
+    if (!me) return;
+
+    if (action === "accepted") {
+      // Use RPC so it:
+      // - sets request status to accepted
+      // - inserts BOTH rows into friends
+      const { error } = await supabase.rpc("accept_friend_request", {
+        p_request_id: requestId,
+      });
+
+      if (error) {
+        console.log("accept_friend_request rpc error:", error);
+        return;
+      }
+    } else {
+      // IMPORTANT: your DB constraint uses 'rejected' (not 'declined')
+      const { error } = await supabase
+        .from("friend_requests")
+        .update({ status: "rejected" })
+        .eq("id", requestId);
+
+      if (error) {
+        console.log("reject error:", error);
+        return;
+      }
+    }
+
     refresh();
   }
 
@@ -127,8 +198,11 @@ export default function FriendsPage() {
           <div className="space-y-2">
             <h2 className="text-lg font-medium">Incoming</h2>
             {incoming.map((r) => (
-              <div key={r.id} className="flex justify-between border border-neutral-800 p-3 rounded-md">
-                <div>{r.user?.username}</div>
+              <div
+                key={r.id}
+                className="flex justify-between border border-neutral-800 p-3 rounded-md"
+              >
+                <div>{r.user?.display_name || r.user?.username || "Unknown user"}</div>
                 <div className="flex gap-2">
                   <button
                     onClick={() => respond(r.id, "accepted")}
@@ -137,7 +211,7 @@ export default function FriendsPage() {
                     Accept
                   </button>
                   <button
-                    onClick={() => respond(r.id, "declined")}
+                    onClick={() => respond(r.id, "rejected")}
                     className="px-3 py-1 bg-neutral-700 rounded"
                   >
                     Decline
