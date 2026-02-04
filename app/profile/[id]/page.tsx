@@ -12,29 +12,65 @@ type Profile = {
 };
 
 type MediaItem = {
-  id: string;
-  title: string | null;
-  category: string | null;
-  rating: number | null;
-  created_at: string | null;
+  id?: string;
+  title?: string | null;
+
+  // your app has evolved, so support both
+  category?: string | null;
+  status?: string | null;
+
+  rating?: number | null;
+
+  // optional fields your app may store
+  type?: string | null;
+  created_at?: string | null;
 };
 
-type ProfileParams = {
-  id?: string | string[];
+type MediaItemsRow = {
+  data: unknown;
 };
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
+function safeParseItems(data: unknown): MediaItem[] {
+  // Expecting: { items: [...] }
+  if (!isRecord(data)) return [];
+  const items = data.items;
+
+  if (!Array.isArray(items)) return [];
+
+  // Only keep object-ish entries
+  return items
+    .filter(isRecord)
+    .map((x) => ({
+      id: typeof x.id === "string" ? x.id : undefined,
+      title: typeof x.title === "string" ? x.title : null,
+      category: typeof x.category === "string" ? x.category : null,
+      status: typeof x.status === "string" ? x.status : null,
+      rating: typeof x.rating === "number" ? x.rating : null,
+      type: typeof x.type === "string" ? x.type : null,
+      created_at: typeof x.created_at === "string" ? x.created_at : null,
+    }));
+}
 
 export default function ProfilePage() {
-  const params = useParams<ProfileParams>();
-
-  const id = useMemo(() => {
-    const raw = params?.id;
-    if (!raw) return undefined;
-    return Array.isArray(raw) ? raw[0] : raw;
-  }, [params]);
+  const params = useParams();
+  const id = params?.id as string | undefined;
 
   const [profile, setProfile] = useState<Profile | null>(null);
   const [media, setMedia] = useState<MediaItem[]>([]);
   const [errorMsg, setErrorMsg] = useState<string>("");
+
+  const sortedMedia = useMemo(() => {
+    // If created_at exists, sort newest first; otherwise keep stable order
+    return [...media].sort((a, b) => {
+      const ad = a.created_at ? Date.parse(a.created_at) : 0;
+      const bd = b.created_at ? Date.parse(b.created_at) : 0;
+      return bd - ad;
+    });
+  }, [media]);
 
   useEffect(() => {
     if (!id) return;
@@ -59,13 +95,14 @@ export default function ProfilePage() {
         return;
       }
 
-      setProfile(prof);
+      setProfile(prof as Profile);
 
-      const { data: items, error: itemsErr } = await supabase
+      // ✅ Correct: media_items is ONE ROW PER USER, JSON blob in data
+      const { data: row, error: itemsErr } = await supabase
         .from("media_items")
-        .select("id, title, category, rating, created_at")
+        .select("data")
         .eq("user_id", id)
-        .order("created_at", { ascending: false });
+        .maybeSingle();
 
       if (itemsErr) {
         console.error("media_items fetch error:", itemsErr);
@@ -73,16 +110,8 @@ export default function ProfilePage() {
         return;
       }
 
-      // Trust-but-verify: coerce unknown rows into our shape without `any`
-      const safe: MediaItem[] = (items ?? []).map((row) => ({
-        id: String((row as { id: unknown }).id),
-        title: (row as { title?: string | null }).title ?? null,
-        category: (row as { category?: string | null }).category ?? null,
-        rating: (row as { rating?: number | null }).rating ?? null,
-        created_at: (row as { created_at?: string | null }).created_at ?? null,
-      }));
-
-      setMedia(safe);
+      const parsed = safeParseItems((row as MediaItemsRow | null)?.data);
+      setMedia(parsed);
     }
 
     load();
@@ -110,18 +139,29 @@ export default function ProfilePage() {
             <div className="space-y-2">
               <h2 className="text-lg font-medium">Media</h2>
 
-              {media.length === 0 ? (
+              {sortedMedia.length === 0 ? (
                 <div className="text-neutral-500 text-sm">No media yet</div>
               ) : (
-                media.map((m) => (
-                  <div key={m.id} className="border border-neutral-800 p-3 rounded-md">
-                    <div className="font-medium">{m.title || "(untitled)"}</div>
-                    <div className="text-xs text-neutral-500">
-                      {m.category || "All"}
-                      {m.rating !== null && m.rating !== undefined ? ` • Rating: ${m.rating}` : ""}
+                sortedMedia.map((m, idx) => {
+                  const label =
+                    m.status ||
+                    m.category ||
+                    (m.type ? m.type : null) ||
+                    "—";
+
+                  return (
+                    <div
+                      key={m.id ?? `${idx}`}
+                      className="border border-neutral-800 p-3 rounded-md"
+                    >
+                      <div className="font-medium">{m.title || "(untitled)"}</div>
+                      <div className="text-xs text-neutral-500">
+                        {label}
+                        {typeof m.rating === "number" ? ` • Rating: ${m.rating}` : ""}
+                      </div>
                     </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </>
