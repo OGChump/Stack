@@ -11,49 +11,26 @@ type Profile = {
   display_name: string | null;
 };
 
-type MediaType = "movie" | "tv" | "anime" | "manga" | "book" | "game";
-type Status = "completed" | "in_progress" | "planned" | "dropped";
-
 type MediaItem = {
   id: string;
-  title: string;
-  type: MediaType;
-  status: Status;
-
-  rating?: number; // 0-10
-  createdAt?: string; // ISO
-  dateFinished?: string; // YYYY-MM-DD
-  notes?: string;
-  tags?: string[];
-
-  posterUrl?: string;
-  posterOverrideUrl?: string;
-
-  // optional extras (safe to ignore in UI)
-  progressCur?: number;
-  progressTotal?: number;
-  progressCurOverride?: number;
-  progressTotalOverride?: number;
-  hoursPlayed?: number;
-  rewatchCount?: number;
+  title: string | null;
+  category: string | null;
+  rating: number | null;
+  created_at: string | null;
 };
 
-function safeParseItems(raw: unknown): MediaItem[] {
-  if (!raw || typeof raw !== "object") return [];
-  const obj = raw as any;
-
-  const items = obj?.items;
-  if (!Array.isArray(items)) return [];
-
-  // minimal validation to avoid runtime crashes
-  return items
-    .filter((x: any) => x && typeof x.id === "string" && typeof x.title === "string")
-    .map((x: any) => x as MediaItem);
-}
+type ProfileParams = {
+  id?: string | string[];
+};
 
 export default function ProfilePage() {
-  const params = useParams();
-  const id = params?.id as string | undefined;
+  const params = useParams<ProfileParams>();
+
+  const id = useMemo(() => {
+    const raw = params?.id;
+    if (!raw) return undefined;
+    return Array.isArray(raw) ? raw[0] : raw;
+  }, [params]);
 
   const [profile, setProfile] = useState<Profile | null>(null);
   const [media, setMedia] = useState<MediaItem[]>([]);
@@ -62,21 +39,14 @@ export default function ProfilePage() {
   useEffect(() => {
     if (!id) return;
 
-    let cancelled = false;
-
     async function load() {
       setErrorMsg("");
-      setProfile(null);
-      setMedia([]);
 
-      // 1) Profile info
       const { data: prof, error: profErr } = await supabase
         .from("profiles")
         .select("id, username, display_name")
         .eq("id", id)
         .maybeSingle();
-
-      if (cancelled) return;
 
       if (profErr) {
         console.error("profile fetch error:", profErr);
@@ -89,16 +59,13 @@ export default function ProfilePage() {
         return;
       }
 
-      setProfile(prof as Profile);
+      setProfile(prof);
 
-      // 2) Media blob for that user (ONE ROW PER USER)
-      const { data: row, error: itemsErr } = await supabase
+      const { data: items, error: itemsErr } = await supabase
         .from("media_items")
-        .select("data")
+        .select("id, title, category, rating, created_at")
         .eq("user_id", id)
-        .maybeSingle();
-
-      if (cancelled) return;
+        .order("created_at", { ascending: false });
 
       if (itemsErr) {
         console.error("media_items fetch error:", itemsErr);
@@ -106,28 +73,20 @@ export default function ProfilePage() {
         return;
       }
 
-      const parsed = safeParseItems(row?.data);
-      // sort newest first using dateFinished then createdAt (mirrors app behavior)
-      parsed.sort((a, b) => {
-        const ad = new Date((a.dateFinished ?? a.createdAt ?? "") as string).getTime() || 0;
-        const bd = new Date((b.dateFinished ?? b.createdAt ?? "") as string).getTime() || 0;
-        return bd - ad;
-      });
+      // Trust-but-verify: coerce unknown rows into our shape without `any`
+      const safe: MediaItem[] = (items ?? []).map((row) => ({
+        id: String((row as { id: unknown }).id),
+        title: (row as { title?: string | null }).title ?? null,
+        category: (row as { category?: string | null }).category ?? null,
+        rating: (row as { rating?: number | null }).rating ?? null,
+        created_at: (row as { created_at?: string | null }).created_at ?? null,
+      }));
 
-      setMedia(parsed);
+      setMedia(safe);
     }
 
     load();
-
-    return () => {
-      cancelled = true;
-    };
   }, [id]);
-
-  const title = useMemo(() => {
-    if (!profile) return "";
-    return profile.display_name || profile.username || profile.id;
-  }, [profile]);
 
   return (
     <div className="min-h-screen bg-black text-white">
@@ -136,15 +95,17 @@ export default function ProfilePage() {
           ← Back to Friends
         </Link>
 
-        {errorMsg ? (
+        {errorMsg && (
           <div className="border border-red-900 bg-red-950/30 p-3 rounded-md text-sm text-red-200">
             {errorMsg}
           </div>
-        ) : null}
+        )}
 
-        {profile ? (
+        {profile && (
           <>
-            <h1 className="text-3xl font-semibold">{title}</h1>
+            <h1 className="text-3xl font-semibold">
+              {profile.display_name || profile.username || profile.id}
+            </h1>
 
             <div className="space-y-2">
               <h2 className="text-lg font-medium">Media</h2>
@@ -155,32 +116,16 @@ export default function ProfilePage() {
                 media.map((m) => (
                   <div key={m.id} className="border border-neutral-800 p-3 rounded-md">
                     <div className="font-medium">{m.title || "(untitled)"}</div>
-
                     <div className="text-xs text-neutral-500">
-                      {m.type}
-                      {m.status ? ` • ${m.status.replace("_", " ")}` : ""}
-                      {typeof m.rating === "number" ? ` • Rating: ${m.rating}` : ""}
-                      {m.dateFinished ? ` • ${m.dateFinished}` : m.createdAt ? ` • ${m.createdAt.slice(0, 10)}` : ""}
+                      {m.category || "All"}
+                      {m.rating !== null && m.rating !== undefined ? ` • Rating: ${m.rating}` : ""}
                     </div>
-
-                    {m.tags?.length ? (
-                      <div className="mt-2 flex flex-wrap gap-2">
-                        {m.tags.slice(0, 10).map((t) => (
-                          <span
-                            key={`${m.id}:${t}`}
-                            className="text-[11px] px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-neutral-200"
-                          >
-                            {t}
-                          </span>
-                        ))}
-                      </div>
-                    ) : null}
                   </div>
                 ))
               )}
             </div>
           </>
-        ) : null}
+        )}
       </div>
     </div>
   );
