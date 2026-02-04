@@ -1,5 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-/* eslint-disable react-hooks/exhaustive-deps */
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
@@ -12,6 +10,8 @@ type Profile = {
   display_name: string | null;
 };
 
+type FriendRow = { friend_id: string };
+
 type IncomingRequestRow = {
   id: string;
   requester_id: string;
@@ -23,26 +23,57 @@ type IncomingRequest = {
   user?: Profile;
 };
 
+function displayLabel(p: Profile | undefined | null) {
+  if (!p) return "";
+  return p.display_name || p.username || p.id;
+}
+
+function initialsFromProfile(p: Profile | undefined | null) {
+  const label = (p?.display_name || p?.username || "").trim();
+  if (!label) return "U";
+  const parts = label.split(/\s+/).filter(Boolean);
+  const a = parts[0]?.[0] ?? "U";
+  const b = parts.length > 1 ? parts[1]?.[0] ?? "" : "";
+  return (a + b).toUpperCase();
+}
+
+function formatHandle(p: Profile) {
+  if (!p.username) return null;
+  return `@${p.username}`;
+}
+
 export default function FriendsPage() {
   const [me, setMe] = useState<string | null>(null);
+
   const [friends, setFriends] = useState<Profile[]>([]);
   const [incoming, setIncoming] = useState<IncomingRequest[]>([]);
+
   const [inviteUsername, setInviteUsername] = useState("");
   const [inviteStatus, setInviteStatus] = useState("");
-  const [busy, setBusy] = useState(false);
+
+  const [pageLoading, setPageLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [sendingInvite, setSendingInvite] = useState(false);
+  const [actingRequestId, setActingRequestId] = useState<string | null>(null);
 
   // Keep session/user in sync
   useEffect(() => {
     let mounted = true;
 
-    supabase.auth.getUser().then(({ data, error }) => {
+    (async () => {
+      const { data, error } = await supabase.auth.getUser();
       if (!mounted) return;
+
       if (error) {
         console.error("auth.getUser error:", error);
+        setMe(null);
+        setPageLoading(false);
         return;
       }
+
       setMe(data.user?.id ?? null);
-    });
+      setPageLoading(false);
+    })();
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       setMe(session?.user?.id ?? null);
@@ -56,90 +87,109 @@ export default function FriendsPage() {
 
   useEffect(() => {
     if (!me) return;
-    refresh();
+    void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me]);
+
+  const sortedFriends = useMemo(() => {
+    const copy = [...friends];
+    copy.sort((a, b) => {
+      const A = (a.display_name || a.username || a.id).toLowerCase();
+      const B = (b.display_name || b.username || b.id).toLowerCase();
+      return A.localeCompare(B);
+    });
+    return copy;
+  }, [friends]);
 
   async function refresh() {
     if (!me) return;
 
     setInviteStatus("");
+    setRefreshing(true);
 
-    // 1) Friends list (directional rows where user_id = me)
-    const { data: friendRows, error: friendsErr } = await supabase
-      .from("friends")
-      .select("friend_id")
-      .eq("user_id", me);
+    try {
+      // 1) Friends list (directional rows where user_id = me)
+      const { data: friendRows, error: friendsErr } = await supabase
+        .from("friends")
+        .select("friend_id")
+        .eq("user_id", me);
 
-    if (friendsErr) console.error("friends select error:", friendsErr);
+      if (friendsErr) {
+        console.error("friends select error:", friendsErr);
+      }
 
-    // Deduplicate friend ids (just in case)
-    const ids = Array.from(
-      new Set(
-        (friendRows ?? [])
-          .map((r: any) => r.friend_id as string | null | undefined)
-          .filter(Boolean) as string[]
-      )
-    );
+      const ids = (friendRows ?? [])
+        .map((r) => (r as FriendRow).friend_id)
+        .filter((x): x is string => Boolean(x));
 
-    if (!ids.length) {
-      setFriends([]);
-    } else {
-      const { data: profs, error: profErr } = await supabase
+      if (!ids.length) {
+        setFriends([]);
+      } else {
+        const { data: profs, error: profErr } = await supabase
+          .from("profiles")
+          .select("id, username, display_name")
+          .in("id", ids);
+
+        if (profErr) console.error("profiles (friends) select error:", profErr);
+        setFriends((profs ?? []) as Profile[]);
+      }
+
+      // 2) Incoming friend requests (pending where requested_id = me)
+      const { data: reqs, error: reqErr } = await supabase
+        .from("friend_requests")
+        .select("id, requester_id")
+        .eq("requested_id", me)
+        .eq("status", "pending");
+
+      if (reqErr) console.error("friend_requests select error:", reqErr);
+
+      if (!reqs?.length) {
+        setIncoming([]);
+        return;
+      }
+
+      const requesterIds = (reqs as IncomingRequestRow[]).map((r) => r.requester_id);
+
+      const { data: reqProfiles, error: reqProfErr } = await supabase
         .from("profiles")
         .select("id, username, display_name")
-        .in("id", ids);
+        .in("id", requesterIds);
 
-      if (profErr) console.error("profiles (friends) select error:", profErr);
-      setFriends((profs ?? []) as Profile[]);
+      if (reqProfErr) console.error("profiles (incoming) select error:", reqProfErr);
+
+      const map = new Map<string, Profile>(
+        (reqProfiles ?? []).map((p) => [p.id, p as Profile])
+      );
+
+      setIncoming(
+        (reqs as IncomingRequestRow[]).map((r) => ({
+          id: r.id,
+          requester_id: r.requester_id,
+          user: map.get(r.requester_id),
+        }))
+      );
+    } finally {
+      setRefreshing(false);
     }
-
-    // 2) Incoming friend requests (pending where requested_id = me)
-    const { data: reqs, error: reqErr } = await supabase
-      .from("friend_requests")
-      .select("id, requester_id")
-      .eq("requested_id", me)
-      .eq("status", "pending");
-
-    if (reqErr) console.error("friend_requests select error:", reqErr);
-
-    if (!reqs?.length) {
-      setIncoming([]);
-      return;
-    }
-
-    const requesterIds = Array.from(
-      new Set((reqs as IncomingRequestRow[]).map((r) => r.requester_id))
-    );
-
-    const { data: reqProfiles, error: reqProfErr } = await supabase
-      .from("profiles")
-      .select("id, username, display_name")
-      .in("id", requesterIds);
-
-    if (reqProfErr) console.error("profiles (incoming) select error:", reqProfErr);
-
-    const map = new Map((reqProfiles ?? []).map((p: any) => [p.id, p as Profile]));
-    setIncoming(
-      (reqs as IncomingRequestRow[]).map((r) => ({
-        id: r.id,
-        requester_id: r.requester_id,
-        user: map.get(r.requester_id),
-      }))
-    );
   }
 
   async function sendInvite() {
+    if (sendingInvite) return;
+
     setInviteStatus("");
 
     const username = inviteUsername.trim().toLowerCase();
-    if (!username) return;
+    if (!username) {
+      setInviteStatus("Enter a username.");
+      return;
+    }
 
     if (!me) {
       setInviteStatus("Not logged in.");
       return;
     }
 
-    setBusy(true);
+    setSendingInvite(true);
     try {
       // Find target user by username
       const { data: target, error: findErr } = await supabase
@@ -150,7 +200,7 @@ export default function FriendsPage() {
 
       if (findErr) {
         console.error("find user error:", findErr);
-        setInviteStatus("Error finding user.");
+        setInviteStatus(findErr.message || "Error finding user.");
         return;
       }
 
@@ -164,21 +214,8 @@ export default function FriendsPage() {
         return;
       }
 
-      // Check if already friends (directional row me -> them OR them -> me)
-      const { data: existingFriend, error: friendCheckErr } = await supabase
-        .from("friends")
-        .select("id")
-        .or(`and(user_id.eq.${me},friend_id.eq.${target.id}),and(user_id.eq.${target.id},friend_id.eq.${me})`)
-        .limit(1);
-
-      if (!friendCheckErr && existingFriend && existingFriend.length > 0) {
-        setInviteStatus("You are already friends.");
-        return;
-      }
-
-      // Check if a pending request exists either direction
-      // NOTE: PostgREST .or() supports "and(...),and(...)" at the top-level
-      const { data: existingReq, error: existsErr } = await supabase
+      // Optional: check if a pending request exists either direction
+      const { data: existing, error: existsErr } = await supabase
         .from("friend_requests")
         .select("id")
         .or(
@@ -186,7 +223,7 @@ export default function FriendsPage() {
         )
         .limit(1);
 
-      if (!existsErr && existingReq && existingReq.length > 0) {
+      if (!existsErr && existing && existing.length > 0) {
         setInviteStatus("A pending request already exists between you two.");
         return;
       }
@@ -203,7 +240,7 @@ export default function FriendsPage() {
         if (msg.toLowerCase().includes("duplicate key value")) {
           setInviteStatus("A pending request already exists. Ask them to accept it.");
         } else {
-          setInviteStatus(msg);
+          setInviteStatus(msg || "Failed to send invite.");
         }
         return;
       }
@@ -212,13 +249,15 @@ export default function FriendsPage() {
       setInviteStatus("Invite sent.");
       await refresh();
     } finally {
-      setBusy(false);
+      setSendingInvite(false);
     }
   }
 
   async function acceptRequest(requestId: string) {
+    if (actingRequestId) return;
+
     setInviteStatus("");
-    setBusy(true);
+    setActingRequestId(requestId);
 
     try {
       // MUST use RPC so it inserts into friends table (both directions)
@@ -228,19 +267,21 @@ export default function FriendsPage() {
 
       if (error) {
         console.error("accept_friend_request RPC error:", error);
-        setInviteStatus(error.message);
+        setInviteStatus(error.message || "Failed to accept request.");
         return;
       }
 
       await refresh();
     } finally {
-      setBusy(false);
+      setActingRequestId(null);
     }
   }
 
   async function declineRequest(requestId: string) {
+    if (actingRequestId) return;
+
     setInviteStatus("");
-    setBusy(true);
+    setActingRequestId(requestId);
 
     try {
       // DB uses 'rejected' (NOT 'declined')
@@ -251,100 +292,230 @@ export default function FriendsPage() {
 
       if (error) {
         console.error("decline request update error:", error);
-        setInviteStatus(error.message);
+        setInviteStatus(error.message || "Failed to decline request.");
         return;
       }
 
       await refresh();
     } finally {
-      setBusy(false);
+      setActingRequestId(null);
     }
   }
 
-  const canSend = useMemo(() => {
-    return !!me && inviteUsername.trim().length > 0 && !busy;
-  }, [me, inviteUsername, busy]);
-
   return (
     <div className="min-h-screen bg-black text-white">
-      <div className="max-w-4xl mx-auto p-6 space-y-6">
-        <Link href="/" className="text-sm text-neutral-400 hover:text-white">
-          ← Back
-        </Link>
-
-        <h1 className="text-3xl font-semibold">Friends</h1>
-
-        {/* Add friend */}
-        <div className="rounded-xl border border-neutral-800 p-4 space-y-2">
-          <div className="font-medium">Add friend</div>
-          <div className="flex gap-2">
-            <input
-              className="flex-1 rounded-md bg-neutral-900 border border-neutral-700 px-3 py-2"
-              placeholder="username"
-              value={inviteUsername}
-              onChange={(e) => setInviteUsername(e.target.value)}
-              disabled={busy}
-            />
-            <button
-              onClick={sendInvite}
-              disabled={!canSend}
-              className="px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              Send
-            </button>
+      <div className="max-w-5xl mx-auto p-6 space-y-6">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-4">
+          <div className="space-y-1">
+            <Link href="/" className="text-sm text-neutral-400 hover:text-white">
+              ← Back
+            </Link>
+            <div className="flex items-center gap-2">
+              <h1 className="text-3xl font-semibold">Friends</h1>
+              <span className="text-xs px-2 py-1 rounded-full border border-neutral-800 text-neutral-300">
+                {friends.length} total
+              </span>
+              {incoming.length > 0 && (
+                <span className="text-xs px-2 py-1 rounded-full border border-neutral-800 text-neutral-300">
+                  {incoming.length} incoming
+                </span>
+              )}
+            </div>
+            <div className="text-sm text-neutral-400">
+              Add friends and view their profiles & media.
+            </div>
           </div>
-          {inviteStatus && <div className="text-sm text-neutral-400">{inviteStatus}</div>}
+
+          <button
+            onClick={() => void refresh()}
+            disabled={!me || refreshing}
+            className="shrink-0 px-3 py-2 rounded-md border border-neutral-800 bg-neutral-950 hover:bg-neutral-900 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+          >
+            {refreshing ? "Refreshing…" : "Refresh"}
+          </button>
         </div>
 
-        {/* Incoming */}
-        {incoming.length > 0 && (
-          <div className="space-y-2">
-            <h2 className="text-lg font-medium">Incoming</h2>
-            {incoming.map((r) => (
-              <div
-                key={r.id}
-                className="flex justify-between border border-neutral-800 p-3 rounded-md"
+        {/* Not logged in */}
+        {!pageLoading && !me && (
+          <div className="rounded-2xl border border-neutral-800 bg-neutral-950 p-5">
+            <div className="text-lg font-medium">You’re not signed in</div>
+            <div className="text-sm text-neutral-400 mt-1">
+              Sign in to manage friends and requests.
+            </div>
+            <div className="mt-4">
+              <Link
+                href="/login"
+                className="inline-flex items-center justify-center px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 text-sm font-medium"
               >
-                <div>{r.user?.display_name || r.user?.username || r.requester_id}</div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => acceptRequest(r.id)}
-                    disabled={busy}
-                    className="px-3 py-1 bg-emerald-600 rounded disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    Accept
-                  </button>
-                  <button
-                    onClick={() => declineRequest(r.id)}
-                    disabled={busy}
-                    className="px-3 py-1 bg-neutral-700 rounded disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    Decline
-                  </button>
-                </div>
-              </div>
-            ))}
+                Go to Login
+              </Link>
+            </div>
           </div>
         )}
 
+        {/* Add friend */}
+        <div className="rounded-2xl border border-neutral-800 bg-neutral-950 p-5">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <div className="text-lg font-medium">Add a friend</div>
+              <div className="text-sm text-neutral-400">
+                Send an invite by username (example: <span className="text-neutral-200">DenaliM</span>)
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-4 flex flex-col sm:flex-row gap-2">
+            <div className="relative flex-1">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500 text-sm">
+                @
+              </span>
+              <input
+                className="w-full rounded-md bg-neutral-900 border border-neutral-700 pl-7 pr-3 py-2 outline-none focus:ring-2 focus:ring-emerald-600/40 focus:border-emerald-700"
+                placeholder="username"
+                value={inviteUsername}
+                onChange={(e) => setInviteUsername(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void sendInvite();
+                }}
+                disabled={!me || sendingInvite}
+              />
+            </div>
+
+            <button
+              onClick={() => void sendInvite()}
+              disabled={!me || sendingInvite}
+              className="px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
+            >
+              {sendingInvite ? "Sending…" : "Send invite"}
+            </button>
+          </div>
+
+          {inviteStatus && (
+            <div className="mt-3 text-sm text-neutral-300 border border-neutral-800 bg-neutral-900/30 rounded-md p-3">
+              {inviteStatus}
+            </div>
+          )}
+        </div>
+
+        {/* Incoming */}
+        <div className="rounded-2xl border border-neutral-800 bg-neutral-950 p-5">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <div className="text-lg font-medium">Incoming requests</div>
+              <div className="text-sm text-neutral-400">Accept to add them as a friend.</div>
+            </div>
+            <span className="text-xs px-2 py-1 rounded-full border border-neutral-800 text-neutral-300">
+              {incoming.length}
+            </span>
+          </div>
+
+          {incoming.length === 0 ? (
+            <div className="mt-4 text-sm text-neutral-500">
+              No incoming requests right now.
+            </div>
+          ) : (
+            <div className="mt-4 grid grid-cols-1 gap-2">
+              {incoming.map((r) => {
+                const label = r.user?.display_name || r.user?.username || r.requester_id;
+                const handle = r.user ? formatHandle(r.user) : null;
+                const isActing = actingRequestId === r.id;
+
+                return (
+                  <div
+                    key={r.id}
+                    className="flex items-center justify-between gap-3 rounded-xl border border-neutral-800 bg-neutral-900/20 p-3"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="h-10 w-10 rounded-full border border-neutral-800 bg-neutral-900 flex items-center justify-center text-sm font-semibold text-neutral-200">
+                        {initialsFromProfile(r.user ?? null)}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="font-medium truncate">{label}</div>
+                        <div className="text-xs text-neutral-500 truncate">
+                          {handle ?? r.requester_id}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex gap-2 shrink-0">
+                      <button
+                        onClick={() => void acceptRequest(r.id)}
+                        disabled={isActing}
+                        className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded-md text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isActing ? "Working…" : "Accept"}
+                      </button>
+                      <button
+                        onClick={() => void declineRequest(r.id)}
+                        disabled={isActing}
+                        className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded-md text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        Decline
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
         {/* Friends */}
-        <div className="space-y-2">
-          <h2 className="text-lg font-medium">Friends</h2>
+        <div className="rounded-2xl border border-neutral-800 bg-neutral-950 p-5">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <div className="text-lg font-medium">Your friends</div>
+              <div className="text-sm text-neutral-400">Tap a friend to view their profile.</div>
+            </div>
+            <span className="text-xs px-2 py-1 rounded-full border border-neutral-800 text-neutral-300">
+              {friends.length}
+            </span>
+          </div>
 
           {friends.length === 0 ? (
-            <div className="text-neutral-500 text-sm">No friends yet</div>
+            <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-900/20 p-4">
+              <div className="text-sm text-neutral-300">No friends yet.</div>
+              <div className="text-xs text-neutral-500 mt-1">
+                Add someone by username above, then accept requests here.
+              </div>
+            </div>
           ) : (
-            friends.map((f) => (
-              <Link
-                key={f.id}
-                href={`/profile/${f.id}`}
-                className="block border border-neutral-800 p-3 rounded-md hover:bg-neutral-900"
-              >
-                <div className="font-medium">{f.display_name || f.username || f.id}</div>
-                <div className="text-xs text-neutral-500">Tap to view profile</div>
-              </Link>
-            ))
+            <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {sortedFriends.map((f) => {
+                const label = displayLabel(f);
+                const handle = formatHandle(f);
+
+                return (
+                  <Link
+                    key={f.id}
+                    href={`/profile/${f.id}`}
+                    className="group rounded-xl border border-neutral-800 bg-neutral-900/20 p-3 hover:bg-neutral-900/40 transition-colors"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="h-10 w-10 rounded-full border border-neutral-800 bg-neutral-900 flex items-center justify-center text-sm font-semibold text-neutral-200">
+                        {initialsFromProfile(f)}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium truncate">{label}</div>
+                        <div className="text-xs text-neutral-500 truncate">
+                          {handle ?? f.id}
+                        </div>
+                      </div>
+                      <div className="text-xs text-neutral-500 group-hover:text-neutral-300">
+                        View →
+                      </div>
+                    </div>
+                  </Link>
+                );
+              })}
+            </div>
           )}
+        </div>
+
+        {/* Footer hint */}
+        <div className="text-xs text-neutral-600">
+          {pageLoading ? "Loading…" : me ? `Signed in: ${me}` : "Not signed in"}
         </div>
       </div>
     </div>
