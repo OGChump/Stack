@@ -2,7 +2,7 @@
 /* eslint-disable react-hooks/exhaustive-deps */
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 
@@ -29,6 +29,7 @@ export default function FriendsPage() {
   const [incoming, setIncoming] = useState<IncomingRequest[]>([]);
   const [inviteUsername, setInviteUsername] = useState("");
   const [inviteStatus, setInviteStatus] = useState("");
+  const [busy, setBusy] = useState(false);
 
   // Keep session/user in sync
   useEffect(() => {
@@ -59,6 +60,8 @@ export default function FriendsPage() {
   }, [me]);
 
   async function refresh() {
+    if (!me) return;
+
     setInviteStatus("");
 
     // 1) Friends list (directional rows where user_id = me)
@@ -69,9 +72,14 @@ export default function FriendsPage() {
 
     if (friendsErr) console.error("friends select error:", friendsErr);
 
-    const ids = (friendRows ?? [])
-      .map((r: any) => r.friend_id)
-      .filter(Boolean);
+    // Deduplicate friend ids (just in case)
+    const ids = Array.from(
+      new Set(
+        (friendRows ?? [])
+          .map((r: any) => r.friend_id as string | null | undefined)
+          .filter(Boolean) as string[]
+      )
+    );
 
     if (!ids.length) {
       setFriends([]);
@@ -99,7 +107,9 @@ export default function FriendsPage() {
       return;
     }
 
-    const requesterIds = (reqs as IncomingRequestRow[]).map((r) => r.requester_id);
+    const requesterIds = Array.from(
+      new Set((reqs as IncomingRequestRow[]).map((r) => r.requester_id))
+    );
 
     const { data: reqProfiles, error: reqProfErr } = await supabase
       .from("profiles")
@@ -129,99 +139,131 @@ export default function FriendsPage() {
       return;
     }
 
-    // Find target user by username
-    const { data: target, error: findErr } = await supabase
-      .from("profiles")
-      .select("id")
-      .eq("username", username)
-      .maybeSingle();
+    setBusy(true);
+    try {
+      // Find target user by username
+      const { data: target, error: findErr } = await supabase
+        .from("profiles")
+        .select("id")
+        .eq("username", username)
+        .maybeSingle();
 
-    if (findErr) {
-      console.error("find user error:", findErr);
-      setInviteStatus("Error finding user.");
-      return;
-    }
-
-    if (!target?.id) {
-      setInviteStatus("User not found.");
-      return;
-    }
-
-    if (target.id === me) {
-      setInviteStatus("You can’t friend yourself.");
-      return;
-    }
-
-    // Optional: check if a pending request exists either direction
-    const { data: existing, error: existsErr } = await supabase
-      .from("friend_requests")
-      .select("id")
-      .or(
-        `and(requester_id.eq.${me},requested_id.eq.${target.id},status.eq.pending),and(requester_id.eq.${target.id},requested_id.eq.${me},status.eq.pending)`
-      )
-      .limit(1);
-
-    if (!existsErr && existing && existing.length > 0) {
-      setInviteStatus("A pending request already exists between you two.");
-      return;
-    }
-
-    // Insert request (status defaults to 'pending')
-    const { error: insErr } = await supabase.from("friend_requests").insert({
-      requester_id: me,
-      requested_id: target.id,
-    });
-
-    if (insErr) {
-      console.error("insert friend_request error:", insErr);
-      const msg = insErr.message || "";
-      if (msg.toLowerCase().includes("duplicate key value")) {
-        setInviteStatus("A pending request already exists. Ask them to accept it.");
-      } else {
-        setInviteStatus(msg);
+      if (findErr) {
+        console.error("find user error:", findErr);
+        setInviteStatus("Error finding user.");
+        return;
       }
-      return;
-    }
 
-    setInviteUsername("");
-    setInviteStatus("Invite sent.");
-    await refresh();
+      if (!target?.id) {
+        setInviteStatus("User not found.");
+        return;
+      }
+
+      if (target.id === me) {
+        setInviteStatus("You can’t friend yourself.");
+        return;
+      }
+
+      // Check if already friends (directional row me -> them OR them -> me)
+      const { data: existingFriend, error: friendCheckErr } = await supabase
+        .from("friends")
+        .select("id")
+        .or(`and(user_id.eq.${me},friend_id.eq.${target.id}),and(user_id.eq.${target.id},friend_id.eq.${me})`)
+        .limit(1);
+
+      if (!friendCheckErr && existingFriend && existingFriend.length > 0) {
+        setInviteStatus("You are already friends.");
+        return;
+      }
+
+      // Check if a pending request exists either direction
+      // NOTE: PostgREST .or() supports "and(...),and(...)" at the top-level
+      const { data: existingReq, error: existsErr } = await supabase
+        .from("friend_requests")
+        .select("id")
+        .or(
+          `and(requester_id.eq.${me},requested_id.eq.${target.id},status.eq.pending),and(requester_id.eq.${target.id},requested_id.eq.${me},status.eq.pending)`
+        )
+        .limit(1);
+
+      if (!existsErr && existingReq && existingReq.length > 0) {
+        setInviteStatus("A pending request already exists between you two.");
+        return;
+      }
+
+      // Insert request (status defaults to 'pending')
+      const { error: insErr } = await supabase.from("friend_requests").insert({
+        requester_id: me,
+        requested_id: target.id,
+      });
+
+      if (insErr) {
+        console.error("insert friend_request error:", insErr);
+        const msg = insErr.message || "";
+        if (msg.toLowerCase().includes("duplicate key value")) {
+          setInviteStatus("A pending request already exists. Ask them to accept it.");
+        } else {
+          setInviteStatus(msg);
+        }
+        return;
+      }
+
+      setInviteUsername("");
+      setInviteStatus("Invite sent.");
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function acceptRequest(requestId: string) {
     setInviteStatus("");
+    setBusy(true);
 
-    // MUST use RPC so it inserts into friends table (both directions)
-    const { error } = await supabase.rpc("accept_friend_request", {
-      p_request_id: requestId,
-    });
+    try {
+      // MUST use RPC so it inserts into friends table (both directions)
+      const { error } = await supabase.rpc("accept_friend_request", {
+        p_request_id: requestId,
+      });
 
-    if (error) {
-      console.error("accept_friend_request RPC error:", error);
-      setInviteStatus(error.message);
-      return;
+      if (error) {
+        console.error("accept_friend_request RPC error:", error);
+        setInviteStatus(error.message);
+        return;
+      }
+
+      await refresh();
+    } finally {
+      setBusy(false);
     }
-
-    await refresh();
   }
 
   async function declineRequest(requestId: string) {
     setInviteStatus("");
+    setBusy(true);
 
-    // DB uses 'rejected' (NOT 'declined')
-    const { error } = await supabase
-      .from("friend_requests")
-      .update({ status: "rejected" })
-      .eq("id", requestId);
+    try {
+      // DB uses 'rejected' (NOT 'declined')
+      const { error } = await supabase
+        .from("friend_requests")
+        .update({ status: "rejected" })
+        .eq("id", requestId);
 
-    if (error) {
-      console.error("decline request update error:", error);
-      setInviteStatus(error.message);
-      return;
+      if (error) {
+        console.error("decline request update error:", error);
+        setInviteStatus(error.message);
+        return;
+      }
+
+      await refresh();
+    } finally {
+      setBusy(false);
     }
-
-    await refresh();
   }
+
+  const canSend = useMemo(() => {
+    return !!me && inviteUsername.trim().length > 0 && !busy;
+  }, [me, inviteUsername, busy]);
 
   return (
     <div className="min-h-screen bg-black text-white">
@@ -241,10 +283,12 @@ export default function FriendsPage() {
               placeholder="username"
               value={inviteUsername}
               onChange={(e) => setInviteUsername(e.target.value)}
+              disabled={busy}
             />
             <button
               onClick={sendInvite}
-              className="px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500"
+              disabled={!canSend}
+              className="px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Send
             </button>
@@ -265,13 +309,15 @@ export default function FriendsPage() {
                 <div className="flex gap-2">
                   <button
                     onClick={() => acceptRequest(r.id)}
-                    className="px-3 py-1 bg-emerald-600 rounded"
+                    disabled={busy}
+                    className="px-3 py-1 bg-emerald-600 rounded disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     Accept
                   </button>
                   <button
                     onClick={() => declineRequest(r.id)}
-                    className="px-3 py-1 bg-neutral-700 rounded"
+                    disabled={busy}
+                    className="px-3 py-1 bg-neutral-700 rounded disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     Decline
                   </button>

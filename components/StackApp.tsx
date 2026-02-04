@@ -158,7 +158,7 @@ const TYPE_LABEL: Record<MediaType, string> = {
 
 
 function uid() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  return crypto.randomUUID();
 }
 
 function todayYMD() {
@@ -1002,8 +1002,11 @@ const loadCloud = useCallback(
       raw !== null &&
       "items" in raw &&
       Array.isArray((raw as any).items)
-        ? ((raw as any).items as MediaItem[])
+        ? ((raw as any).items as any[])
+            .filter((x) => x && typeof x.id === "string" && typeof x.title === "string")
+            .map((x) => x as MediaItem)
         : null;
+
 
     if (parsedItems) {
       setItems(parsedItems);
@@ -1015,7 +1018,8 @@ const loadCloud = useCallback(
 
     const up = await supabase
       .from("media_items")
-      .upsert({ user_id: uidStr, data: { items: [] } }, { onConflict: "user_id" });
+      .upsert([{ user_id: uidStr, data: { items: [] } }], { onConflict: "user_id" });
+
 
     if (up.error) {
       console.error(up.error);
@@ -1043,7 +1047,7 @@ const saveCloud = useCallback(
 
     const { error } = await supabase
       .from("media_items")
-      .upsert({ user_id: uidStr, data: { items: next } }, { onConflict: "user_id" });
+      .upsert([{ user_id: uidStr, data: { items: next } }], { onConflict: "user_id" });
 
     if (error) {
       console.error(error);
@@ -1085,8 +1089,9 @@ useEffect(() => {
 
   return () => {
     mounted = false;
-    sub.subscription.unsubscribe();
+    sub?.subscription?.unsubscribe();
   };
+
 }, [loadCloud]);
 
 useEffect(() => {
@@ -1459,8 +1464,11 @@ async function pickForMe(mode: "best" | "random" = "best") {
   const applySuggestion = useCallback(async (s: Suggestion, opts?: { keepManualTags?: boolean }) => {
   const keepManual = opts?.keepManualTags ?? true;
 
-  const currentType = (formRef.current?.type as MediaType) ?? "movie";
-  const currentStatus = (formRef.current?.status as Status) ?? "completed";
+  const getCurrent = () => {
+    const { type = "movie", status = "completed" } = formRef.current ?? {};
+    return { type: type as MediaType, status: status as Status };
+  };
+
 
   setAutofillStatus(`Applying: ${s.title}…`);
 
@@ -1508,6 +1516,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
   setAutoTags(newAuto);
   if (!keepManual) setManualTags([]);
 
+  const { type: currentType, status: currentStatus } = getCurrent();
+
   if (typeof s.progressTotal === "number" && s.progressTotal > 0) {
     setProgressTotalText((prev) => (prev.trim() === "" ? String(s.progressTotal) : prev));
     setProgressCurText((prev) => {
@@ -1523,7 +1533,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
   }
 
   setAutofillStatus("Auto-fill complete.");
-}, []);
+}, [setAutofillStatus, setForm, setAutoTags, setManualTags, setProgressTotalText, setProgressCurText]);
+
 
 
   /* ================= AUTO AUTOFILL ================= */
@@ -2419,8 +2430,10 @@ async function pickForMe(mode: "best" | "random" = "best") {
                           setForm((f) => ({ ...f, title: ghostTitle }));
                           setGhostTitle("");
                           setShowSuggest(false);
+                          setSuggestions([]); // ✅ clear old list
                           return;
                         }
+
 
                         if (showSuggest && suggestions.length) {
                           if (e.key === "ArrowDown") {
@@ -3430,7 +3443,10 @@ function MALRow({
                       const v = e.target.value;
                       if (v === "") return onUpdate({ progressTotal: undefined, progressTotalOverride: undefined });
                       const n = Math.max(0, Number(v) || 0);
-                      onUpdate({ progressTotalOverride: n });
+                      onUpdate({
+                        progressTotalOverride: n,
+                        progressCurOverride: undefined,
+                      });
                     }}
                     className="w-[min(6rem,100%)] text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
                     placeholder="—"
