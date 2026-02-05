@@ -19,20 +19,18 @@ type StackItem = {
   category?: string | null; // "completed" | "in_progress" | "planned" | "dropped" | ...
   type?: string | null; // "movie" | "tv" | "anime" | ...
 
+  // rating / progress / hours
   rating?: number | null; // score
-  created_at?: string | null;
-
-  // extras to match your main cards
-  note?: string | null;
-
-  posterUrl?: string | null; // full URL
-  posterPath?: string | null; // TMDB-style path (needs base URL)
-
   progress?: number | null;
   progressTotal?: number | null;
-
   totalHours?: number | null;
 
+  created_at?: string | null;
+
+  // extras
+  note?: string | null;
+  posterUrl?: string | null; // full URL
+  posterPath?: string | null; // TMDB-style path (needs base URL)
   genres?: string[] | null;
 };
 
@@ -61,7 +59,14 @@ function safeString(v: unknown): string | null {
 }
 
 function safeNumber(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (!s) return null;
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
 }
 
 function safeStringArray(v: unknown): string[] | null {
@@ -70,90 +75,159 @@ function safeStringArray(v: unknown): string[] | null {
   return out.length ? out : null;
 }
 
-function parseItemsFromData(data: unknown): StackItem[] {
-  // Expecting: { items: [...] }
-  if (!data || typeof data !== "object") return [];
-  const itemsUnknown = (data as Record<string, unknown>)["items"];
+function asObject(v: unknown): Record<string, unknown> | null {
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+}
+
+function parseMaybeJson(v: unknown): unknown {
+  if (typeof v !== "string") return v;
+  const s = v.trim();
+  if (!s) return v;
+  if (!(s.startsWith("{") || s.startsWith("["))) return v;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return v;
+  }
+}
+
+function pickFirstNumber(...vals: unknown[]): number | null {
+  for (const v of vals) {
+    const n = safeNumber(v);
+    if (n != null) return n;
+  }
+  return null;
+}
+
+function pickFirstString(...vals: unknown[]): string | null {
+  for (const v of vals) {
+    const s = safeString(v);
+    if (s) return s;
+  }
+  return null;
+}
+
+function parseItemsFromData(dataRaw: unknown): StackItem[] {
+  const data = parseMaybeJson(dataRaw);
+
+  // Support shapes:
+  // 1) { items: [...] }
+  // 2) { data: { items: [...] } }
+  // 3) [...] (array directly)
+  // 4) { media: [...] } / { list: [...] }
+  const rootObj = asObject(data);
+
+  let itemsUnknown: unknown = null;
+
+  if (Array.isArray(data)) {
+    itemsUnknown = data;
+  } else if (rootObj) {
+    itemsUnknown =
+      rootObj["items"] ??
+      asObject(rootObj["data"])?.["items"] ??
+      rootObj["media"] ??
+      rootObj["list"] ??
+      null;
+  }
+
   if (!Array.isArray(itemsUnknown)) return [];
 
   const out: StackItem[] = [];
 
   for (const raw of itemsUnknown) {
-    if (!raw || typeof raw !== "object") continue;
-    const obj = raw as Record<string, unknown>;
+    const obj = asObject(raw);
+    if (!obj) continue;
 
-    const id = safeString(obj["id"]) ?? crypto.randomUUID();
-    const title = safeString(obj["title"]) ?? "(untitled)";
+    const id = pickFirstString(obj["id"]) ?? crypto.randomUUID();
+    const title = pickFirstString(obj["title"], obj["name"]) ?? "(untitled)";
 
-    // category/status fallbacks
+    // status/category fallbacks
     const category =
-      safeString(obj["category"]) ??
-      safeString(obj["status"]) ??
-      safeString(obj["state"]) ??
-      null;
+      pickFirstString(obj["category"], obj["status"], obj["state"]) ?? null;
 
     // type fallbacks
     const type =
-      safeString(obj["type"]) ??
-      safeString(obj["mediaType"]) ??
-      safeString(obj["kind"]) ??
-      null;
+      pickFirstString(obj["type"], obj["mediaType"], obj["kind"]) ?? null;
 
-    // rating/score fallbacks
-    const rating =
-      safeNumber(obj["rating"]) ??
-      safeNumber(obj["score"]) ??
-      safeNumber(obj["stars"]) ??
-      null;
+    // rating/score fallbacks (IMPORTANT: accept number OR numeric string)
+    const rating = pickFirstNumber(
+      obj["rating"],
+      obj["score"],
+      obj["stars"],
+      obj["userScore"],
+      obj["user_score"]
+    );
 
     // created_at fallbacks
     const created_at =
-      safeString(obj["created_at"]) ??
-      safeString(obj["createdAt"]) ??
-      safeString(obj["date"]) ??
-      null;
+      pickFirstString(obj["created_at"], obj["createdAt"], obj["date"]) ?? null;
 
     // notes fallbacks
     const note =
-      safeString(obj["note"]) ??
-      safeString(obj["notes"]) ??
-      safeString(obj["review"]) ??
-      null;
+      pickFirstString(obj["note"], obj["notes"], obj["review"], obj["comment"]) ?? null;
 
     // poster fallbacks
     const posterUrl =
-      safeString(obj["posterUrl"]) ??
-      safeString(obj["poster_url"]) ??
-      safeString(obj["imageUrl"]) ??
-      safeString(obj["image_url"]) ??
-      safeString(obj["coverUrl"]) ??
-      safeString(obj["cover_url"]) ??
-      null;
+      pickFirstString(
+        obj["posterUrl"],
+        obj["poster_url"],
+        obj["imageUrl"],
+        obj["image_url"],
+        obj["coverUrl"],
+        obj["cover_url"]
+      ) ?? null;
 
     const posterPath =
-      safeString(obj["posterPath"]) ??
-      safeString(obj["poster_path"]) ??
-      safeString(obj["tmdbPosterPath"]) ??
-      null;
+      pickFirstString(obj["posterPath"], obj["poster_path"], obj["tmdbPosterPath"]) ?? null;
 
-    // progress fallbacks
-    const progress =
-      safeNumber(obj["progress"]) ??
-      safeNumber(obj["current"]) ??
-      safeNumber(obj["currentProgress"]) ??
-      null;
+    // progress fallbacks (handle lots of possible keys + nested objects)
+    const progressObj = asObject(obj["progress"]);
 
-    const progressTotal =
-      safeNumber(obj["progressTotal"]) ??
-      safeNumber(obj["total"]) ??
-      safeNumber(obj["totalProgress"]) ??
-      null;
+    const progress = pickFirstNumber(
+      // common
+      obj["progress"],
+      obj["current"],
+      obj["currentProgress"],
+      obj["progress_current"],
+      obj["current_episode"],
+      obj["currentEpisode"],
+      obj["episode"],
+      obj["episodesWatched"],
+      obj["watchedEpisodes"],
+      obj["chaptersRead"],
+      obj["currentChapter"],
+      progressObj?.["current"],
+      progressObj?.["value"]
+    );
 
-    const totalHours =
-      safeNumber(obj["totalHours"]) ??
-      safeNumber(obj["hours"]) ??
-      safeNumber(obj["time"]) ??
-      null;
+    const progressTotal = pickFirstNumber(
+      obj["progressTotal"],
+      obj["total"],
+      obj["totalProgress"],
+      obj["progress_total"],
+      obj["total_episode"],
+      obj["totalEpisode"],
+      obj["episodes"],
+      obj["episodeCount"],
+      obj["totalEpisodes"],
+      obj["chaptersTotal"],
+      obj["totalChapters"],
+      progressObj?.["total"],
+      progressObj?.["max"]
+    );
+
+    // hours fallbacks
+    const totalHours = pickFirstNumber(
+      obj["totalHours"],
+      obj["hours"],
+      obj["time"],
+      obj["timeSpent"],
+      obj["time_spent"],
+      obj["hoursPlayed"],
+      obj["playtime"],
+      obj["runtimeHours"],
+      obj["durationHours"]
+    );
 
     const genres =
       safeStringArray(obj["genres"]) ??
@@ -169,14 +243,14 @@ function parseItemsFromData(data: unknown): StackItem[] {
       title,
       category,
       type,
-      rating,
+      rating: rating ?? null,
       created_at,
       note,
       posterUrl,
       posterPath,
-      progress,
-      progressTotal,
-      totalHours,
+      progress: progress ?? null,
+      progressTotal: progressTotal ?? null,
+      totalHours: totalHours ?? null,
       genres,
     });
   }
@@ -195,7 +269,6 @@ function sortByTitle(a: StackItem, b: StackItem) {
 
 function formatDateShort(iso: string | null | undefined) {
   if (!iso) return null;
-  // safe: often stored like "2026-02-05..." or "2026-02-05"
   return iso.slice(0, 10);
 }
 
@@ -209,6 +282,17 @@ function previewNote(note: string | null | undefined, max = 140) {
   const t = (note ?? "").trim();
   if (!t) return "";
   return t.length > max ? t.slice(0, max) + "…" : t;
+}
+
+function formatProgressText(m: StackItem) {
+  const cur = m.progress;
+  const tot = m.progressTotal;
+
+  // FIX: do NOT default to 0 if cur is missing (that caused "0 / 1")
+  if (cur == null && tot == null) return "—";
+  if (cur != null && tot != null) return `${cur} / ${tot}`;
+  if (cur != null) return `${cur}`;
+  return `— / ${tot}`;
 }
 
 export default function ProfilePage() {
@@ -318,12 +402,10 @@ export default function ProfilePage() {
       map.set(key, arr);
     }
 
-    // sort each group by title (stable + clean)
     for (const [k, arr] of map) {
       map.set(k, [...arr].sort(sortByTitle));
     }
 
-    // build ordered groups: in_progress, planned, completed, dropped, then the rest
     const keys = Array.from(map.keys());
     const ordered: string[] = [];
 
@@ -418,7 +500,7 @@ export default function ProfilePage() {
                     <div className="text-xs text-neutral-500">{g.items.length}</div>
                   </div>
 
-                  {/* Column header row (like your screenshot) */}
+                  {/* Column header row */}
                   <div className="rounded-full border border-neutral-800 bg-neutral-950/40 px-6 py-3 text-sm text-neutral-300">
                     <div className="grid grid-cols-[1fr_140px_140px_220px] gap-4 items-center">
                       <div className="pl-16">Title</div>
@@ -435,13 +517,7 @@ export default function ProfilePage() {
                       const date = formatDateShort(m.created_at);
                       const notePrev = previewNote(m.note);
 
-                      const progressText =
-                        m.progressTotal != null
-                          ? `${m.progress ?? 0} / ${m.progressTotal}`
-                          : m.progress != null
-                          ? `${m.progress}`
-                          : "—";
-
+                      const progressText = formatProgressText(m);
                       const hoursText = m.totalHours != null ? `${m.totalHours}` : "—";
 
                       return (
@@ -473,9 +549,7 @@ export default function ProfilePage() {
                                   <span className="text-neutral-200">
                                     {formatCategory(m.category)}
                                   </span>
-                                  {date ? (
-                                    <span className="text-neutral-600"> • {date}</span>
-                                  ) : null}
+                                  {date ? <span className="text-neutral-600"> • {date}</span> : null}
                                 </div>
 
                                 {notePrev ? (
@@ -536,10 +610,7 @@ export default function ProfilePage() {
       {/* Note modal */}
       {openNote && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div
-            className="absolute inset-0 bg-black/70"
-            onClick={() => setOpenNote(null)}
-          />
+          <div className="absolute inset-0 bg-black/70" onClick={() => setOpenNote(null)} />
           <div className="relative w-full max-w-xl rounded-2xl border border-neutral-800 bg-neutral-950 p-5">
             <div className="flex items-start justify-between gap-4">
               <div className="min-w-0">
