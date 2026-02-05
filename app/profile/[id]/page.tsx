@@ -14,10 +14,26 @@ type Profile = {
 type StackItem = {
   id: string;
   title: string;
-  category?: string | null; // e.g. "completed", "in_progress", "planned", "dropped"
-  type?: string | null; // e.g. "movie" | "tv" | "anime" ...
-  rating?: number | null;
+
+  // status/category
+  category?: string | null; // "completed" | "in_progress" | "planned" | "dropped" | ...
+  type?: string | null; // "movie" | "tv" | "anime" | ...
+
+  rating?: number | null; // score
   created_at?: string | null;
+
+  // extras to match your main cards
+  note?: string | null;
+
+  posterUrl?: string | null; // full URL
+  posterPath?: string | null; // TMDB-style path (needs base URL)
+
+  progress?: number | null;
+  progressTotal?: number | null;
+
+  totalHours?: number | null;
+
+  genres?: string[] | null;
 };
 
 type MediaItemsRow = {
@@ -48,6 +64,12 @@ function safeNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+function safeStringArray(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null;
+  const out = v.filter((x) => typeof x === "string") as string[];
+  return out.length ? out : null;
+}
+
 function parseItemsFromData(data: unknown): StackItem[] {
   // Expecting: { items: [...] }
   if (!data || typeof data !== "object") return [];
@@ -62,12 +84,101 @@ function parseItemsFromData(data: unknown): StackItem[] {
 
     const id = safeString(obj["id"]) ?? crypto.randomUUID();
     const title = safeString(obj["title"]) ?? "(untitled)";
-    const category = safeString(obj["category"]) ?? safeString(obj["status"]); // support either key
-    const type = safeString(obj["type"]);
-    const rating = safeNumber(obj["rating"]);
-    const created_at = safeString(obj["created_at"]) ?? safeString(obj["createdAt"]);
 
-    out.push({ id, title, category, type, rating, created_at });
+    // category/status fallbacks
+    const category =
+      safeString(obj["category"]) ??
+      safeString(obj["status"]) ??
+      safeString(obj["state"]) ??
+      null;
+
+    // type fallbacks
+    const type =
+      safeString(obj["type"]) ??
+      safeString(obj["mediaType"]) ??
+      safeString(obj["kind"]) ??
+      null;
+
+    // rating/score fallbacks
+    const rating =
+      safeNumber(obj["rating"]) ??
+      safeNumber(obj["score"]) ??
+      safeNumber(obj["stars"]) ??
+      null;
+
+    // created_at fallbacks
+    const created_at =
+      safeString(obj["created_at"]) ??
+      safeString(obj["createdAt"]) ??
+      safeString(obj["date"]) ??
+      null;
+
+    // notes fallbacks
+    const note =
+      safeString(obj["note"]) ??
+      safeString(obj["notes"]) ??
+      safeString(obj["review"]) ??
+      null;
+
+    // poster fallbacks
+    const posterUrl =
+      safeString(obj["posterUrl"]) ??
+      safeString(obj["poster_url"]) ??
+      safeString(obj["imageUrl"]) ??
+      safeString(obj["image_url"]) ??
+      safeString(obj["coverUrl"]) ??
+      safeString(obj["cover_url"]) ??
+      null;
+
+    const posterPath =
+      safeString(obj["posterPath"]) ??
+      safeString(obj["poster_path"]) ??
+      safeString(obj["tmdbPosterPath"]) ??
+      null;
+
+    // progress fallbacks
+    const progress =
+      safeNumber(obj["progress"]) ??
+      safeNumber(obj["current"]) ??
+      safeNumber(obj["currentProgress"]) ??
+      null;
+
+    const progressTotal =
+      safeNumber(obj["progressTotal"]) ??
+      safeNumber(obj["total"]) ??
+      safeNumber(obj["totalProgress"]) ??
+      null;
+
+    const totalHours =
+      safeNumber(obj["totalHours"]) ??
+      safeNumber(obj["hours"]) ??
+      safeNumber(obj["time"]) ??
+      null;
+
+    const genres =
+      safeStringArray(obj["genres"]) ??
+      (safeString(obj["genres"])
+        ? safeString(obj["genres"])!
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : null);
+
+    out.push({
+      id,
+      title,
+      category,
+      type,
+      rating,
+      created_at,
+      note,
+      posterUrl,
+      posterPath,
+      progress,
+      progressTotal,
+      totalHours,
+      genres,
+    });
   }
 
   return out;
@@ -82,6 +193,24 @@ function sortByTitle(a: StackItem, b: StackItem) {
   return a.title.localeCompare(b.title, undefined, { sensitivity: "base" });
 }
 
+function formatDateShort(iso: string | null | undefined) {
+  if (!iso) return null;
+  // safe: often stored like "2026-02-05..." or "2026-02-05"
+  return iso.slice(0, 10);
+}
+
+function getPosterUrl(m: StackItem) {
+  if (m.posterUrl) return m.posterUrl;
+  if (m.posterPath) return `https://image.tmdb.org/t/p/w342${m.posterPath}`;
+  return null;
+}
+
+function previewNote(note: string | null | undefined, max = 140) {
+  const t = (note ?? "").trim();
+  if (!t) return "";
+  return t.length > max ? t.slice(0, max) + "…" : t;
+}
+
 export default function ProfilePage() {
   const params = useParams();
   const id = (params?.id as string | undefined) ?? undefined;
@@ -91,9 +220,14 @@ export default function ProfilePage() {
   const [loading, setLoading] = useState<boolean>(true);
   const [errorMsg, setErrorMsg] = useState<string>("");
 
-  // UI state (like the All page)
+  // UI state
   const [query, setQuery] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
+
+  // simple note modal
+  const [openNote, setOpenNote] = useState<{ title: string; note: string } | null>(
+    null
+  );
 
   useEffect(() => {
     if (!id) return;
@@ -197,7 +331,8 @@ export default function ProfilePage() {
     if (map.has("uncategorized")) ordered.push("uncategorized");
 
     for (const k of keys) {
-      if (!ordered.includes(k) && !CATEGORY_ORDER.includes(k) && k !== "uncategorized") ordered.push(k);
+      if (!ordered.includes(k) && !CATEGORY_ORDER.includes(k) && k !== "uncategorized")
+        ordered.push(k);
     }
 
     return ordered.map((k) => ({ key: k, items: map.get(k) ?? [] }));
@@ -216,7 +351,7 @@ export default function ProfilePage() {
           </div>
         )}
 
-        {/* Header card (matches the site vibe) */}
+        {/* Header card */}
         <div className="rounded-2xl border border-neutral-800 bg-neutral-950/40 p-5">
           <div className="flex items-center gap-4">
             <div className="h-12 w-12 rounded-full border border-neutral-700 bg-neutral-900 flex items-center justify-center font-semibold">
@@ -233,7 +368,7 @@ export default function ProfilePage() {
             </div>
           </div>
 
-          {/* Controls row (like All page) */}
+          {/* Controls row */}
           <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center">
             <input
               className="w-full sm:flex-1 rounded-lg bg-neutral-900 border border-neutral-700 px-3 py-2 text-sm outline-none focus:border-neutral-500"
@@ -272,36 +407,124 @@ export default function ProfilePage() {
               No media found.
             </div>
           ) : (
-            <div className="space-y-6">
+            <div className="space-y-8">
               {grouped.map((g) => (
-                <div key={g.key} className="space-y-2">
+                <div key={g.key} className="space-y-3">
+                  {/* Group header */}
                   <div className="flex items-center justify-between">
-                    <div className="text-sm font-medium text-neutral-200">{formatCategory(g.key)}</div>
+                    <div className="text-sm font-medium text-neutral-200">
+                      {formatCategory(g.key)}
+                    </div>
                     <div className="text-xs text-neutral-500">{g.items.length}</div>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {g.items.map((m) => (
-                      <div
-                        key={m.id}
-                        className="rounded-xl border border-neutral-800 bg-neutral-950/40 p-4 hover:bg-neutral-900/30 transition"
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0">
-                            <div className="font-medium truncate">{m.title || "(untitled)"}</div>
-                            <div className="mt-1 text-xs text-neutral-500">
-                              {m.type ? m.type : "media"}
-                              {m.rating != null ? ` • Rating: ${m.rating}` : ""}
+                  {/* Column header row (like your screenshot) */}
+                  <div className="rounded-full border border-neutral-800 bg-neutral-950/40 px-6 py-3 text-sm text-neutral-300">
+                    <div className="grid grid-cols-[1fr_140px_140px_220px] gap-4 items-center">
+                      <div className="pl-16">Title</div>
+                      <div className="text-center">Score</div>
+                      <div className="text-center">Type</div>
+                      <div className="text-center">Progress / Hours</div>
+                    </div>
+                  </div>
+
+                  {/* Cards */}
+                  <div className="space-y-3">
+                    {g.items.map((m) => {
+                      const img = getPosterUrl(m);
+                      const date = formatDateShort(m.created_at);
+                      const notePrev = previewNote(m.note);
+
+                      const progressText =
+                        m.progressTotal != null
+                          ? `${m.progress ?? 0} / ${m.progressTotal}`
+                          : m.progress != null
+                          ? `${m.progress}`
+                          : "—";
+
+                      const hoursText = m.totalHours != null ? `${m.totalHours}` : "—";
+
+                      return (
+                        <div
+                          key={m.id}
+                          className="rounded-2xl border border-neutral-800 bg-neutral-950/40 p-6"
+                        >
+                          <div className="grid grid-cols-[1fr_140px_140px_220px] gap-4 items-center">
+                            {/* Left block */}
+                            <div className="flex gap-4 min-w-0">
+                              <div className="h-20 w-14 rounded-lg border border-neutral-800 bg-neutral-900 overflow-hidden shrink-0">
+                                {img ? (
+                                  // eslint-disable-next-line @next/next/no-img-element
+                                  <img src={img} alt="" className="h-full w-full object-cover" />
+                                ) : (
+                                  <div className="h-full w-full flex items-center justify-center text-xs text-neutral-500">
+                                    No image
+                                  </div>
+                                )}
+                              </div>
+
+                              <div className="min-w-0 flex-1">
+                                <div className="text-xl font-semibold truncate">
+                                  {m.title || "(untitled)"}
+                                </div>
+
+                                <div className="mt-1 text-sm text-neutral-400">
+                                  Status:{" "}
+                                  <span className="text-neutral-200">
+                                    {formatCategory(m.category)}
+                                  </span>
+                                  {date ? (
+                                    <span className="text-neutral-600"> • {date}</span>
+                                  ) : null}
+                                </div>
+
+                                {notePrev ? (
+                                  <div className="mt-3 text-sm text-neutral-300">
+                                    {notePrev}
+                                    <div className="mt-2">
+                                      <button
+                                        onClick={() =>
+                                          setOpenNote({
+                                            title: m.title || "(untitled)",
+                                            note: (m.note ?? "").trim(),
+                                          })
+                                        }
+                                        className="text-sm text-neutral-300 border border-neutral-800 bg-neutral-900/30 rounded-md px-3 py-1.5 hover:bg-neutral-900/50"
+                                      >
+                                        Read full note
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : null}
+
+                                {m.genres?.length ? (
+                                  <div className="mt-3 text-xs text-neutral-500">
+                                    {m.genres.join(" • ")}
+                                  </div>
+                                ) : null}
+                              </div>
+                            </div>
+
+                            {/* Score */}
+                            <div className="text-center text-lg text-neutral-200">
+                              {m.rating != null ? m.rating : "—"}
+                            </div>
+
+                            {/* Type */}
+                            <div className="text-center text-lg text-neutral-200">
+                              {m.type ?? "—"}
+                            </div>
+
+                            {/* Progress / Hours */}
+                            <div className="text-center">
+                              <div className="text-lg text-neutral-200">{progressText}</div>
+                              <div className="text-xs text-neutral-500 mt-1">Total</div>
+                              <div className="text-sm text-neutral-200">{hoursText}</div>
                             </div>
                           </div>
-
-                          {/* subtle badge */}
-                          <div className="shrink-0 rounded-full border border-neutral-800 bg-neutral-900 px-2 py-1 text-[11px] text-neutral-300">
-                            {formatCategory(m.category)}
-                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               ))}
@@ -309,6 +532,34 @@ export default function ProfilePage() {
           )}
         </div>
       </div>
+
+      {/* Note modal */}
+      {openNote && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-black/70"
+            onClick={() => setOpenNote(null)}
+          />
+          <div className="relative w-full max-w-xl rounded-2xl border border-neutral-800 bg-neutral-950 p-5">
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <div className="text-lg font-semibold truncate">{openNote.title}</div>
+                <div className="text-xs text-neutral-500 mt-1">Full note</div>
+              </div>
+              <button
+                onClick={() => setOpenNote(null)}
+                className="px-3 py-1.5 rounded-md border border-neutral-800 bg-neutral-900/30 hover:bg-neutral-900/50 text-sm"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="mt-4 whitespace-pre-wrap text-sm text-neutral-200 leading-relaxed">
+              {openNote.note || "(No note)"}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

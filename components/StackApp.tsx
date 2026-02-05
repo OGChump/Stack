@@ -161,6 +161,44 @@ function uid() {
   return crypto.randomUUID();
 }
 
+async function anilistRandomManga(): Promise<{ title: string; anilistId: number; posterUrl?: string }> {
+  const page = 1 + Math.floor(Math.random() * 200);
+  const perPage = 25;
+
+  const query = `
+    query ($page: Int, $perPage: Int) {
+      Page(page: $page, perPage: $perPage) {
+        media(type: MANGA, sort: POPULARITY_DESC) {
+          id
+          title { romaji english native }
+          coverImage { extraLarge large medium }
+        }
+      }
+    }
+  `;
+
+  const res = await fetch("https://graphql.anilist.co", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ query, variables: { page, perPage } }),
+  });
+
+  if (!res.ok) throw new Error(`AniList random manga failed (${res.status}).`);
+
+  const json = (await res.json()) as any;
+  const list = (json?.data?.Page?.media ?? []).filter(Boolean);
+  if (!list.length) throw new Error("AniList random manga returned no results.");
+
+  const picked = list[Math.floor(Math.random() * list.length)];
+  const title =
+    (picked?.title?.english || picked?.title?.romaji || picked?.title?.native || "").trim() || "Unknown";
+  const posterUrl =
+    picked?.coverImage?.extraLarge || picked?.coverImage?.large || picked?.coverImage?.medium || undefined;
+
+  return { title, anilistId: picked.id, posterUrl };
+}
+
+
 function todayYMD() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -501,6 +539,45 @@ async function tmdbTrending(mediaType: "movie" | "tv"): Promise<TmdbTrendingResu
   return (await res.json()) as TmdbTrendingResult;
 }
 
+type TmdbGenreListResult = { genres?: Array<{ id: number; name: string }> };
+
+async function tmdbGenreList(type: "movie" | "tv"): Promise<Array<{ id: number; name: string }>> {
+  const key = process.env.NEXT_PUBLIC_TMDB_KEY;
+  if (!key) throw new Error("Missing TMDB key (NEXT_PUBLIC_TMDB_KEY).");
+
+  const url = new URL(`https://api.themoviedb.org/3/genre/${type}/list`);
+  url.searchParams.set("api_key", key);
+
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`TMDB genre list failed (${res.status}).`);
+
+  const json = (await res.json()) as TmdbGenreListResult;
+  return Array.isArray(json.genres) ? json.genres : [];
+}
+
+async function tmdbDiscoverByGenres(type: "movie" | "tv", genreIds: number[]) {
+  const key = process.env.NEXT_PUBLIC_TMDB_KEY;
+  if (!key) throw new Error("Missing TMDB key (NEXT_PUBLIC_TMDB_KEY).");
+
+  // keep it “fresh” and varied
+  const page = 1 + Math.floor(Math.random() * 50);
+
+  const url = new URL(`https://api.themoviedb.org/3/discover/${type}`);
+  url.searchParams.set("api_key", key);
+  url.searchParams.set("include_adult", "false");
+  url.searchParams.set("sort_by", "vote_count.desc"); // better than pure popularity for “good picks”
+  url.searchParams.set("page", String(page));
+
+  if (genreIds.length) url.searchParams.set("with_genres", genreIds.join(","));
+
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`TMDB discover-by-genres failed (${res.status}).`);
+
+  const json = (await res.json()) as TmdbDiscoverResult;
+  return (json.results ?? []).filter((x) => x && x.id);
+}
+
+
 function scoreCandidate(opts: { candidateTags: string[]; userTopTags: string[]; typeBoost: number }) {
   const cand = uniq(opts.candidateTags.map(normTag)).filter(Boolean);
   const user = uniq(opts.userTopTags.map(normTag)).filter(Boolean);
@@ -542,6 +619,8 @@ function diversifyPicks<T extends { score: number; tags: string[] }>(
 /* ================= APP ================= */
 
 export default function StackApp({ view = "all" }: { view?: StackView }) {
+  // ✅ Stats month filter ("all" = no filter)
+  const [statsMonth, setStatsMonth] = useState<string>("all");
   const [items, setItems] = useState<MediaItem[]>([]);
   const [userId, setUserId] = useState<string | null>(null);
 
@@ -686,6 +765,10 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
   useEffect(() => {
     formRef.current = form;
   }, [form]);
+
+  // ✅ Friends UI
+  const [friendsTab, setFriendsTab] = useState<"friends" | "requests">("friends");
+  const [friendsQuery, setFriendsQuery] = useState("");
   
 
   /* ================= NAV ================= */
@@ -1320,6 +1403,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
     const pool: Array<{ title: string; tmdbId: number; tmdbType: "movie" | "tv" }> = [];
 
+    // 1) Recommendations from your best seeds (what you already do)
     for (const i of seeds) {
       const tmdbId = i.tmdbId!;
       const tmdbType = i.tmdbType!;
@@ -1333,6 +1417,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
       }
     }
 
+    // 2) Trending injection (what you already do)
     const [trendMovie, trendTv] = await Promise.all([tmdbTrending("movie"), tmdbTrending("tv")]);
 
     for (const r of trendMovie.results ?? []) {
@@ -1347,6 +1432,40 @@ async function pickForMe(mode: "best" | "random" = "best") {
       if (!t) continue;
       if (existingTitles.has(t.toLowerCase())) continue;
       pool.push({ title: t, tmdbId: r.id, tmdbType: "tv" });
+    }
+
+    // 3) ✅ NEW: Discover based on your top genre tags (big “best pick” upgrade)
+    const [movieGenres, tvGenres] = await Promise.all([tmdbGenreList("movie"), tmdbGenreList("tv")]);
+
+    const toGenreIds = (type: "movie" | "tv") => {
+      const list = type === "movie" ? movieGenres : tvGenres;
+      const map = new Map(list.map((g) => [normTag(g.name), g.id]));
+      const ids = (taste.topTags ?? [])
+        .map((t) => map.get(normTag(t)))
+        .filter((x): x is number => typeof x === "number");
+      return Array.from(new Set(ids)).slice(0, 3); // top 3 genre IDs
+    };
+
+    const movieGenreIds = toGenreIds("movie");
+    const tvGenreIds = toGenreIds("tv");
+
+    const [discMovies, discTv] = await Promise.all([
+      tmdbDiscoverByGenres("movie", movieGenreIds),
+      tmdbDiscoverByGenres("tv", tvGenreIds),
+    ]);
+
+    for (const d of discMovies) {
+      const t = (d.title || d.name || "").trim();
+      if (!t) continue;
+      if (existingTitles.has(t.toLowerCase())) continue;
+      pool.push({ title: t, tmdbId: d.id, tmdbType: "movie" });
+    }
+
+    for (const d of discTv) {
+      const t = (d.title || d.name || "").trim();
+      if (!t) continue;
+      if (existingTitles.has(t.toLowerCase())) continue;
+      pool.push({ title: t, tmdbId: d.id, tmdbType: "tv" });
     }
 
     const seen = new Set<string>();
@@ -1421,21 +1540,66 @@ async function pickForMe(mode: "best" | "random" = "best") {
     }
 
     if (mode === "random") {
-      const chosen = enriched[Math.floor(Math.random() * enriched.length)];
+      setPickStatus("Rolling the dice…");
 
-      setPicks([
-        {
-          provider: "tmdb",
-          title: chosen.title,
-          tmdbId: chosen.tmdbId,
-          tmdbType: chosen.tmdbType,
-          posterUrl: chosen.posterUrl,
-        },
-      ]);
+      // ✅ Truly random: ignore your library/taste, pull from provider catalogs
+      // (Movie/TV: TMDB discover random. Anime/Manga: AniList random pages.)
+      // NOTE: Games “true random” needs a new IGDB endpoint; see note below.
+      const sources: Array<"tmdb_movie" | "tmdb_tv" | "anilist_anime" | "anilist_manga"> = [
+        "tmdb_movie",
+        "tmdb_tv",
+        "anilist_anime",
+        "anilist_manga",
+      ];
 
-      setPickStatus("Here you go.");
+      // try a few times in case we hit something already in your list
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const src = sources[Math.floor(Math.random() * sources.length)];
+
+        try {
+          if (src === "tmdb_movie") {
+            const r = await tmdbDiscoverRandom("movie");
+            if (existingTitles.has(r.title.toLowerCase())) continue;
+
+            setPicks([{ provider: "tmdb", title: r.title, tmdbId: r.tmdbId, tmdbType: "movie", posterUrl: r.posterUrl }]);
+            setPickStatus("Here you go.");
+            return;
+          }
+
+          if (src === "tmdb_tv") {
+            const r = await tmdbDiscoverRandom("tv");
+            if (existingTitles.has(r.title.toLowerCase())) continue;
+
+            setPicks([{ provider: "tmdb", title: r.title, tmdbId: r.tmdbId, tmdbType: "tv", posterUrl: r.posterUrl }]);
+            setPickStatus("Here you go.");
+            return;
+          }
+
+          if (src === "anilist_anime") {
+            const r = await anilistRandomAnime();
+            if (existingTitles.has(r.title.toLowerCase())) continue;
+
+            setPicks([{ provider: "anilist", title: r.title, anilistId: r.anilistId, anilistType: "ANIME", posterUrl: r.posterUrl }]);
+            setPickStatus("Here you go.");
+            return;
+          }
+
+          // anilist_manga
+          const r = await anilistRandomManga();
+          if (existingTitles.has(r.title.toLowerCase())) continue;
+
+          setPicks([{ provider: "anilist", title: r.title, anilistId: r.anilistId, anilistType: "MANGA", posterUrl: r.posterUrl }]);
+          setPickStatus("Here you go.");
+          return;
+        } catch {
+          // try another source/attempt
+        }
+      }
+
+      setPickStatus("Couldn’t find a new random pick (try again).");
       return;
     }
+
   } catch {
     setPickStatus("Something went wrong.");
   }
@@ -1789,6 +1953,27 @@ async function pickForMe(mode: "best" | "random" = "best") {
   );
 
   /* ================= FILTER ================= */
+  const filteredFriendsList = useMemo(() => {
+    const q = friendsQuery.trim().toLowerCase();
+    if (!q) return friendsList;
+
+    return friendsList.filter((f) => {
+      const name = (f.friend?.username ?? "").toLowerCase();
+      const id = (f.friend_id ?? "").toLowerCase();
+      return name.includes(q) || id.includes(q);
+    });
+  }, [friendsList, friendsQuery]);
+
+  const filteredIncomingRequests = useMemo(() => {
+    const q = friendsQuery.trim().toLowerCase();
+    if (!q) return incomingRequests;
+
+    return incomingRequests.filter((r) => {
+      const name = (r.requester?.username ?? "").toLowerCase();
+      const id = (r.requester_id ?? "").toLowerCase();
+      return name.includes(q) || id.includes(q);
+    });
+  }, [incomingRequests, friendsQuery]);
 
   const filtered = useMemo(() => {
     let out = items.slice();
@@ -1837,24 +2022,51 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
 
   /* ================= STATS ================= */
+  // ✅ Month options for stats filter
+  const statsMonthOptions = useMemo(() => {
+    // build from all items using: dateFinished if set, else createdAt
+    const months = new Set<string>();
+    for (const i of items) {
+      const key = (i.dateFinished ?? i.createdAt ?? "").slice(0, 7);
+      if (key) months.add(key);
+    }
+
+    const sorted = Array.from(months).sort((a, b) => (a < b ? 1 : -1)); // desc YYYY-MM
+    return [
+      { value: "all", label: "All time" },
+      ...sorted.map((m) => ({ value: m, label: m })), // label "YYYY-MM" (simple + clean)
+    ];
+  }, [items]);
+
+  // ✅ Stats-filtered view of items
+  const statsItems = useMemo(() => {
+    if (statsMonth === "all") return items;
+
+    return items.filter((i) => {
+      const key = (i.dateFinished ?? i.createdAt ?? "").slice(0, 7);
+      return key === statsMonth;
+    });
+  }, [items, statsMonth]);
 
   const statusCounts = useMemo(() => {
     const base: Record<Status, number> = { completed: 0, in_progress: 0, planned: 0, dropped: 0 };
-    for (const i of items) base[i.status] += 1;
+    for (const i of statsItems) base[i.status] += 1;
     return base;
-  }, [items]);
+  }, [statsItems]);
+
 
   const typeCounts = useMemo(() => {
     const map = new Map<MediaType, number>();
-    for (const i of items) map.set(i.type, (map.get(i.type) ?? 0) + 1);
+    for (const i of statsItems) map.set(i.type, (map.get(i.type) ?? 0) + 1);
     return Array.from(map.entries())
       .map(([type, count]) => ({ type, count }))
       .sort((a, b) => b.count - a.count);
-  }, [items]);
+  }, [statsItems]);
+
 
   const avgByType = useMemo(() => {
     const map = new Map<MediaType, { sum: number; count: number }>();
-    for (const i of items) {
+    for (const i of statsItems) {
       if (typeof i.rating !== "number") continue;
       const cur = map.get(i.type) ?? { sum: 0, count: 0 };
       cur.sum += i.rating;
@@ -1864,36 +2076,35 @@ async function pickForMe(mode: "best" | "random" = "best") {
     return Array.from(map.entries())
       .map(([type, v]) => ({ type, avg: v.count ? v.sum / v.count : 0, count: v.count }))
       .sort((a, b) => b.avg - a.avg);
-  }, [items]);
+  }, [statsItems]);
+
 
   const totalCompleted = useMemo(() => {
-    return items.filter((i) => {
+    return statsItems.filter((i) => {
       if (excludeTypes.has(i.type)) return false;
       return i.status === "completed";
     }).length;
-  }, [items, excludeTypes]);
+  }, [statsItems, excludeTypes]);
+
 
   const totalRuntimeMinutesCompleted = useMemo(() => {
     let sum = 0;
 
-    for (const i of items) {
+    for (const i of statsItems) {
       if (i.status !== "completed") continue;
       if (excludeTypes.has(i.type)) continue;
 
-      // Games: use hoursPlayed if available
       if (i.type === "game") {
         const h = typeof i.hoursPlayed === "number" ? i.hoursPlayed : undefined;
         if (typeof h === "number" && Number.isFinite(h) && h > 0) sum += h * 60;
         continue;
       }
 
-      // Movie: runtime is full runtime
       if (i.type === "movie") {
         if (typeof i.runtime === "number" && Number.isFinite(i.runtime) && i.runtime > 0) sum += i.runtime;
         continue;
       }
 
-      // TV/Anime: runtime is minutes per episode (approx)
       if (i.type === "tv" || i.type === "anime") {
         const perEp = typeof i.runtime === "number" && i.runtime > 0 ? i.runtime : 0;
 
@@ -1916,17 +2127,16 @@ async function pickForMe(mode: "best" | "random" = "best") {
         if (perEp > 0 && episodes > 0) sum += perEp * episodes;
         continue;
       }
-
-      // Books/Manga: not counted in "time watched" (yet)
     }
 
     return Math.round(sum);
-  }, [items, excludeTypes]);
+  }, [statsItems, excludeTypes]);
+
 
   const rewatchTotals = useMemo(() => {
     let rewatches = 0;
     let itemsRewatched = 0;
-    for (const i of items) {
+    for (const i of statsItems) {
       const c = Math.max(0, Number(i.rewatchCount ?? 0) || 0);
       if (c > 0) {
         itemsRewatched += 1;
@@ -1934,11 +2144,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
       }
     }
     return { itemsRewatched, rewatches };
-  }, [items]);
+  }, [statsItems]);
+
 
   const topTags = useMemo(() => {
     const map = new Map<string, number>();
-    for (const i of items) {
+    for (const i of statsItems) {
       if (i.status !== "completed") continue;
       if (excludeTypes.has(i.type)) continue;
 
@@ -1952,11 +2163,11 @@ async function pickForMe(mode: "best" | "random" = "best") {
       .map(([tag, count]) => ({ tag, count }))
       .sort((a, b) => b.count - a.count)
       .slice(0, 12);
-  }, [items, excludeTypes]);
+  }, [statsItems, excludeTypes]);
 
   const genreCounts = useMemo(() => {
     const map = new Map<string, number>();
-    for (const i of items) {
+    for (const i of statsItems) {
       if (i.status !== "completed") continue;
       if (excludeTypes.has(i.type)) continue;
 
@@ -1970,7 +2181,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
       .map(([label, value]) => ({ label, value }))
       .sort((a, b) => b.value - a.value)
       .slice(0, 8);
-  }, [items, excludeTypes]);
+  }, [statsItems, excludeTypes]);
+
 
   const monthlyCompleted = useMemo(() => {
     const now = new Date();
@@ -2122,7 +2334,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
   }, [autoTags, manualTags]);
 
   return (
-    <div className="min-h-screen text-neutral-100 bg-black">
+    <div className="min-h-screen stack-bg">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-6">
         {/* Header */}
         <header className="space-y-3">
@@ -2181,6 +2393,27 @@ async function pickForMe(mode: "best" | "random" = "best") {
         {/* STATS PAGE */}
         {view === "stats" ? (
           <div className="space-y-6">
+            {/* ✅ Stats filter bar */}
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div>
+                <div className="text-sm text-neutral-200 font-medium">Stats</div>
+                <div className="text-xs text-neutral-500">
+                  Filter:
+                  <span className="text-neutral-300 ml-1">
+                    {statsMonth === "all" ? "All time" : statsMonth}
+                  </span>
+                </div>
+              </div>
+
+              <div className="w-full sm:w-[220px]">
+                <Select
+                  label="Month"
+                  value={statsMonth}
+                  onChange={setStatsMonth}
+                  options={statsMonthOptions}
+                />
+              </div>
+            </div>
             {/* Top KPIs */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
               <StatCard title="Total items" value={items.length.toString()} sub={`${statusCounts.completed} completed`} />
@@ -2221,25 +2454,28 @@ async function pickForMe(mode: "best" | "random" = "best") {
               <Panel
                 title="Monthly completions"
                 right={<span className="text-xs text-neutral-500">Last 12 months</span>}
-                className="lg:col-span-2"
+                className="lg:col-span-2 flex flex-col"
               >
-                <div className="flex items-end gap-2 h-32">
-                  {monthlyCompleted.months.map((m) => {
-                    const h = Math.round((m.count / monthlyCompleted.max) * 96);
-                    return (
-                      <div key={m.key} className="flex-1 min-w-[18px] text-center">
-                        <div
-                          className="rounded-lg bg-white/10 border border-white/10 mx-auto"
-                          style={{ height: `${Math.max(6, h)}px` }}
-                          title={`${m.key}: ${m.count}`}
-                        />
-                        <div className="text-[10px] text-neutral-500 mt-2">{m.label}</div>
-                      </div>
-                    );
-                  })}
+                <div className="flex-1 flex items-end">
+                  <div className="flex items-end gap-2 w-full">
+                    {monthlyCompleted.months.map((m) => {
+                      const h = Math.round((m.count / monthlyCompleted.max) * 96);
+                      return (
+                        <div key={m.key} className="flex-1 min-w-[18px] text-center">
+                          <div
+                            className="rounded-lg bg-white/10 border border-white/10 mx-auto"
+                            style={{ height: `${Math.max(6, h)}px` }}
+                            title={`${m.key}: ${m.count}`}
+                          />
+                          <div className="text-[10px] text-neutral-500 mt-2">{m.label}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
                 <div className="text-xs text-neutral-500 mt-3">
-                  Uses <span className="text-neutral-400">date watched</span> if set; otherwise <span className="text-neutral-400">created date</span>.
+                  Uses <span className="text-neutral-400">date watched</span> if set; otherwise{" "}
+                  <span className="text-neutral-400">created date</span>.
                 </div>
               </Panel>
             </div>
@@ -2375,27 +2611,9 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
         {/* ADD PAGE */}
         {view === "add" ? (
-          <div className="relative overflow-hidden rounded-3xl ring-1 ring-neutral-800/70 bg-[#2a2f8f]/40">
-            {/* side curtains */}
-            <div className="absolute inset-0 pointer-events-none">
-              <div className="absolute inset-y-0 left-0 w-[18%] bg-[#2a2f8f]/90" />
-              <div className="absolute inset-y-0 right-0 w-[18%] bg-[#2a2f8f]/90" />
-              <div className="absolute inset-y-0 left-[18%] w-[6%] bg-neutral-700/60 blur-2xl" />
-              <div className="absolute inset-y-0 right-[18%] w-[6%] bg-neutral-700/60 blur-2xl" />
-            </div>
-
-            {/* mascots */}
-            <div className="absolute inset-y-0 left-0 w-[18%] hidden md:flex items-center justify-center pointer-events-none">
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src="/mascot-left.png" alt="Mascot left" className="max-h-[520px] w-auto object-contain opacity-95 drop-shadow-2xl" />
-            </div>
-            <div className="absolute inset-y-0 right-0 w-[18%] hidden md:flex items-center justify-center pointer-events-none">
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src="/mascot-right.png" alt="Mascot right" className="max-h-[520px] w-auto object-contain opacity-95 drop-shadow-2xl" />
-            </div>
-
+          <div className="rounded-3xl stack-accent ring-1 ring-white/10">
             {/* center content */}
-            <div className="relative px-4 sm:px-6 py-6 md:px-10 md:py-10 mx-auto max-w-3xl space-y-4">
+            <div className="px-4 sm:px-6 py-6 md:px-10 md:py-10 mx-auto max-w-3xl space-y-4">
               <div className="text-center">
                 <div className="text-2xl font-semibold tracking-tight">Add to Stack</div>
                 <div className="text-sm text-neutral-200/70 mt-1">
@@ -2403,7 +2621,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 </div>
               </div>
 
-              <form onSubmit={addItem} className="bg-neutral-950/40 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-4">
+              <form onSubmit={addItem} className="bg-neutral-950/55 backdrop-blur-sm p-5 sm:p-7 rounded-2xl ring-1 ring-neutral-800/80 shadow-lg space-y-5">
                 <div className="space-y-2">
                   <div className="relative">
                     {ghostTitle && normTitle(ghostTitle).startsWith(normTitle(String(form.title || ""))) ? (
@@ -2507,6 +2725,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   </div>
 
                   {autofillStatus ? <div className="text-xs text-neutral-300">{autofillStatus}</div> : null}
+                  <div className="h-px bg-white/10" />
+                  <div className="text-xs text-neutral-400 font-medium">Basics</div>
                 </div>
 
                 {((form.posterOverrideUrl || "").trim() || (form.posterUrl || "").trim()) ? (
@@ -2625,6 +2845,11 @@ async function pickForMe(mode: "best" | "random" = "best") {
                     }
                   />
                 </div>
+                
+                <div className="h-px bg-white/10 mt-2" />
+                <div className="text-xs text-neutral-400 font-medium">Details</div>
+                <div className="h-px bg-white/10 mt-2" />
+                <div className="text-xs text-neutral-400 font-medium">Progress</div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <Text
@@ -2645,7 +2870,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   ) : null}
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <TextNumberInput
                     label="Count"
                     value={rewatchText}
@@ -2670,7 +2895,28 @@ async function pickForMe(mode: "best" | "random" = "best") {
                     helper={isRewatch ? "Rewatch count (min 1)." : "Enable Rewatch to edit."}
                   />
 
-                  <div />
+                  <label className="block">
+                    <div className="text-xs text-neutral-400 mb-1">Rewatch</div>
+                    <Toggle
+                      label="Rewatch"
+                      checked={isRewatch}
+                      onChange={(nextOn) => {
+                        setIsRewatch(nextOn);
+
+                        if (nextOn) {
+                          setRewatchText((prev) => {
+                            const restored = (lastRewatchOnRef.current || "1").trim();
+                            if (prev.trim() === "" || Number(prev) === 0) return restored;
+                            return prev;
+                          });
+                        } else {
+                          const n = Math.floor(Number(rewatchText));
+                          if (Number.isFinite(n) && n > 0) lastRewatchOnRef.current = String(n);
+                          setRewatchText("0");
+                        }
+                      }}
+                    />
+                  </label>
                 </div>
 
                 <TagEditor
@@ -2680,27 +2926,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   helper="Auto-filled genres show below; add your own tags too."
                 />
 
-                <Toggle
-                  label="Rewatch"
-                  checked={isRewatch}
-                  onChange={(nextOn) => {
-                    setIsRewatch(nextOn);
-
-                    if (nextOn) {
-                      // turning ON: restore last ON count (default 1)
-                      setRewatchText((prev) => {
-                        const restored = (lastRewatchOnRef.current || "1").trim();
-                        if (prev.trim() === "" || Number(prev) === 0) return restored;
-                        return prev;
-                      });
-                    } else {
-                      // turning OFF: remember current value if valid, then show 0
-                      const n = Math.floor(Number(rewatchText));
-                      if (Number.isFinite(n) && n > 0) lastRewatchOnRef.current = String(n);
-                      setRewatchText("0");
-                    }
-                  }}
-                />
 
 
                 <TextArea
@@ -2713,7 +2938,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <button
                     type="submit"
-                    className="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
+                    className="px-4 py-2 rounded-xl stack-good hover:opacity-95"
                   >
                     Add to Stack
                   </button>
@@ -2782,14 +3007,16 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
         {/* FRIENDS PAGE */}
         {view === "friends" ? (
-          <div className="space-y-4 rounded-2xl bg-neutral-900/50 ring-1 ring-neutral-800/80 p-4 sm:p-6">
-            <div className="flex items-center justify-between gap-3">
+          <div className="space-y-4">
+            {/* Top bar (matches main pages vibe) */}
+            <div className="flex flex-wrap items-end justify-between gap-3">
               <div>
-                <div className="text-lg font-semibold">Friends</div>
-                <div className="text-sm text-neutral-400">
-                  Add friends by their <span className="text-neutral-200">Stack username</span> (stored in <code>profiles.username</code>).
+                <div className="text-lg font-semibold text-neutral-200">Friends</div>
+                <div className="text-sm text-neutral-500">
+                  Add friends by their <span className="text-neutral-200">Stack username</span>.
                 </div>
               </div>
+
               <button
                 type="button"
                 onClick={() => {
@@ -2802,82 +3029,155 @@ async function pickForMe(mode: "best" | "random" = "best") {
               </button>
             </div>
 
-            {/* Send request */}
-            <div className="flex flex-col sm:flex-row gap-2">
+            {/* Search + Tabs (same control style as main) */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <input
-                value={inputUsername}
-                onChange={(e) => setInputUsername(e.target.value)}
-                placeholder="Enter username (e.g., OGChump)"
-                className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+                value={friendsQuery}
+                onChange={(e) => setFriendsQuery(e.target.value)}
+                placeholder="Search friends / requests..."
+                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
               />
-              <button
-                type="button"
-                onClick={sendFriendRequest}
-                className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-              >
-                Send request
-              </button>
+
+              <div className="flex items-center gap-2 justify-start sm:justify-end">
+                <button
+                  type="button"
+                  onClick={() => setFriendsTab("friends")}
+                  className={[
+                    "px-3 py-2 rounded-xl border text-sm transition",
+                    friendsTab === "friends"
+                      ? "bg-white/15 border-white/20"
+                      : "bg-white/5 border-white/10 hover:bg-white/10",
+                  ].join(" ")}
+                >
+                  Friends <span className="text-xs text-neutral-500 ml-1">({friendsList.length})</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setFriendsTab("requests")}
+                  className={[
+                    "px-3 py-2 rounded-xl border text-sm transition",
+                    friendsTab === "requests"
+                      ? "bg-white/15 border-white/20"
+                      : "bg-white/5 border-white/10 hover:bg-white/10",
+                  ].join(" ")}
+                >
+                  Requests <span className="text-xs text-neutral-500 ml-1">({incomingRequests.length})</span>
+                </button>
+              </div>
             </div>
 
-            {friendStatus ? <div className="text-sm text-neutral-300">{friendStatus}</div> : null}
+            {/* Send request panel (same surface look) */}
+            <div className="rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/80 p-4 sm:p-6">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium text-neutral-200">Add a friend</div>
+                  <div className="text-xs text-neutral-500">Enter their Stack username (profiles.username)</div>
+                </div>
+              </div>
 
-            {/* Incoming requests */}
-            <div className="pt-2">
-              <div className="text-sm font-semibold text-neutral-200">Incoming requests</div>
-              {incomingRequests.length ? (
-                <div className="mt-2 space-y-2">
-                  {incomingRequests.map((r) => (
+              <div className="mt-3 flex flex-col sm:flex-row gap-2">
+                <input
+                  value={inputUsername}
+                  onChange={(e) => setInputUsername(e.target.value)}
+                  placeholder="Enter username (e.g., OGChump)"
+                  className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+                />
+                <button
+                  type="button"
+                  onClick={sendFriendRequest}
+                  className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+                >
+                  Send request
+                </button>
+              </div>
+
+              {friendStatus ? <div className="mt-3 text-sm text-neutral-300">{friendStatus}</div> : null}
+            </div>
+
+            {/* List panel (table header row like main pages) */}
+            <div className="rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/80 p-4 sm:p-6">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-sm font-medium text-neutral-200">
+                  {friendsTab === "friends" ? "Your friends" : "Incoming requests"}
+                </div>
+                <div className="text-xs text-neutral-500">
+                  {friendsTab === "friends" ? filteredFriendsList.length : filteredIncomingRequests.length}
+                </div>
+              </div>
+
+              <div className="mt-3 hidden sm:grid grid-cols-[minmax(0,1fr)_minmax(180px,240px)] gap-3 px-3 py-2 rounded-xl bg-neutral-950/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
+                <div>{friendsTab === "friends" ? "Friend" : "Requester"}</div>
+                <div className="text-right">Actions</div>
+              </div>
+
+              <div className="mt-2 space-y-2">
+                {friendsTab === "friends" ? (
+                  filteredFriendsList.length ? (
+                    filteredFriendsList.map((f) => (
+                      <div
+                        key={f.friend_id}
+                        className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3"
+                      >
+                        <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(180px,240px)] gap-3 items-center">
+                          <div className="min-w-0">
+                            <div className="text-sm text-neutral-200 truncate">
+                              {f.friend?.username ?? "Unknown user"}
+                            </div>
+                            <div className="text-[11px] text-neutral-600 truncate">{f.friend_id}</div>
+                          </div>
+
+                          <div className="flex sm:justify-end">
+                            <div className="text-xs text-neutral-500">
+                              (No actions yet)
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-xs text-neutral-500 mt-2">No friends yet.</div>
+                  )
+                ) : filteredIncomingRequests.length ? (
+                  filteredIncomingRequests.map((r) => (
                     <div
                       key={r.id}
-                      className="flex items-center justify-between gap-3 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2"
+                      className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3"
                     >
-                      <div className="text-sm text-neutral-200 truncate">
-                        {r.requester?.username ? r.requester.username : r.requester_id}
-                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(180px,240px)] gap-3 items-center">
+                        <div className="min-w-0">
+                          <div className="text-sm text-neutral-200 truncate">
+                            {r.requester?.username ?? r.requester_id}
+                          </div>
+                          <div className="text-[11px] text-neutral-600 truncate">{r.requester_id}</div>
+                        </div>
 
-                      <div className="flex items-center gap-2 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => acceptFriendRequest(r.id, r.requester_id)}
-                          className="text-xs px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
-                        >
-                          Accept
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => declineFriendRequest(r.id)}
-                          className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                        >
-                          Decline
-                        </button>
+                        <div className="flex items-center gap-2 sm:justify-end">
+                          <button
+                            type="button"
+                            onClick={() => acceptFriendRequest(r.id, r.requester_id)}
+                            className="text-xs px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
+                          >
+                            Accept
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => declineFriendRequest(r.id)}
+                            className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                          >
+                            Decline
+                          </button>
+                        </div>
                       </div>
                     </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-xs text-neutral-500 mt-2">No incoming requests.</div>
-              )}
-            </div>
-
-            {/* Friends list */}
-            <div className="pt-2">
-              <div className="text-sm font-semibold text-neutral-200">Your friends</div>
-              {friendsList.length ? (
-                <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {friendsList.map((f) => (
-                    <div key={f.friend_id} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
-                      <div className="text-sm text-neutral-200 truncate">{f.friend?.username ?? f.friend_id}</div>
-                      <div className="text-[11px] text-neutral-500 truncate">{f.friend_id}</div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-xs text-neutral-500 mt-2">No friends yet.</div>
-              )}
+                  ))
+                ) : (
+                  <div className="text-xs text-neutral-500 mt-2">No incoming requests.</div>
+                )}
+              </div>
             </div>
           </div>
         ) : null}
-
 
         {/* LIST PAGES */}
         {view !== "stats" && view !== "add" && view !== "friends" ? (
@@ -3339,7 +3639,7 @@ function MALRow({
                     </button>
                     <button
                       onClick={onDelete}
-                      className="text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+                      className="text-xs px-3 py-2 rounded-xl stack-bad hover:opacity-95"
                       title="Delete"
                       type="button"
                     >
@@ -3503,70 +3803,171 @@ function CardDraggable({
         : `${cur ?? 0}`
       : "—";
 
-  return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      className={[
-        "rounded-2xl bg-neutral-950/60 border border-neutral-800 shadow-sm overflow-hidden",
-        isDragging ? "opacity-70" : "opacity-100",
-      ].join(" ")}
-    >
-      {/* drag handle row */}
-      <div
-        className="flex items-center justify-between gap-2 px-3 py-2 bg-neutral-950 border-b border-neutral-800"
-        {...listeners}
-        {...attributes}
-        style={{ cursor: "grab" }}
-      >
-        <div className="text-xs text-neutral-500">Drag</div>
-        <div className="text-xs text-neutral-400">{TYPE_LABEL[item.type]}</div>
-      </div>
+        // ---------------- NOTES (BOARD VIEW) ----------------
+  const [showNote, setShowNote] = React.useState(false);
+  const [draftNote, setDraftNote] = React.useState(item.notes ?? "");
 
-      <div className="p-3 flex gap-3">
-        <div className="w-12 h-16 rounded-xl overflow-hidden bg-neutral-900 border border-neutral-800 shrink-0">
-          {displayPoster ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
-          ) : (
-            <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">—</div>
-          )}
+  useEffect(() => {
+    if (showNote) return;
+    setDraftNote(item.notes ?? "");
+  }, [item.notes, showNote]);
+
+  return (
+    <>
+      {/* NOTE MODAL */}
+      {showNote ? (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4"
+          onMouseDown={() => setShowNote(false)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <div
+            className="w-full max-w-2xl rounded-2xl bg-neutral-950 border border-neutral-800 shadow-2xl overflow-hidden"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-neutral-800">
+              <div className="text-sm text-neutral-200 font-medium truncate">Note — {item.title}</div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const trimmed = draftNote.trim();
+                    onUpdate({ notes: trimmed ? trimmed : undefined });
+                    setShowNote(false);
+                  }}
+                  className="text-xs px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowNote(false)}
+                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+
+            <div className="p-4 space-y-2">
+              <div className="text-[11px] text-neutral-500">Edit note</div>
+              <textarea
+                value={draftNote}
+                onChange={(e) => setDraftNote(e.target.value)}
+                rows={8}
+                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500 resize-none"
+                placeholder="Write anything you want to remember…"
+              />
+
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-[11px] text-neutral-600">Leave blank + Save to remove the note.</div>
+                {item.notes ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDraftNote("");
+                      onUpdate({ notes: undefined });
+                      setShowNote(false);
+                    }}
+                    className="text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+                  >
+                    Clear note
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <div
+        ref={setNodeRef}
+        style={style}
+        className={[
+          "rounded-2xl bg-neutral-950/60 border border-neutral-800 shadow-sm overflow-hidden",
+          isDragging ? "opacity-70" : "opacity-100",
+        ].join(" ")}
+      >
+        {/* drag handle row */}
+        <div
+          className="flex items-center justify-between gap-2 px-3 py-2 bg-neutral-950 border-b border-neutral-800"
+          {...listeners}
+          {...attributes}
+          style={{ cursor: "grab" }}
+        >
+          <div className="text-xs text-neutral-500">Drag</div>
+          <div className="text-xs text-neutral-400">{TYPE_LABEL[item.type]}</div>
         </div>
 
-        <div className="min-w-0 flex-1">
-          <div className="font-semibold text-sm text-neutral-200 truncate">{item.title}</div>
-          <div className="text-[11px] text-neutral-500 mt-1">
-            {item.type === "game"
-              ? `Hours: ${typeof item.hoursPlayed === "number" ? `${item.hoursPlayed.toFixed(1)}h` : "—"}`
-              : `Progress: ${progressText}`}
-            {(Number(item.rewatchCount ?? 0) || 0) > 0 ? ` • Rewatch x${Number(item.rewatchCount ?? 0) || 0}` : ""}
-          </div>
-
-
-          <div className="flex items-center justify-between mt-3">
-            <select
-              value={item.status}
-              onChange={(e) => onUpdate({ status: e.target.value as Status })}
-              className="rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
-            >
-              <option value="completed">Completed</option>
-              <option value="in_progress">In Progress</option>
-              <option value="planned">Planned</option>
-              <option value="dropped">Dropped</option>
-            </select>
+        <div className="p-3 flex gap-3">
+          {/* LEFT: poster + note button */}
+          <div className="shrink-0 space-y-2">
+            <div className="w-12 h-16 rounded-xl overflow-hidden bg-neutral-900 border border-neutral-800">
+              {displayPoster ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
+              ) : (
+                <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">—</div>
+              )}
+            </div>
 
             <button
               type="button"
-              onClick={onDelete}
-              className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+              onClick={() => setShowNote(true)}
+              className={[
+                "w-12 rounded-lg px-2 py-1 text-[11px] border transition",
+                item.notes
+                  ? "bg-white/10 border-white/10 hover:bg-white/15 text-neutral-200"
+                  : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-400",
+              ].join(" ")}
+              title={item.notes ? "View/Edit note" : "Add note"}
             >
-              Delete
+              Note ≡
             </button>
+          </div>
+
+          <div className="min-w-0 flex-1">
+            <div className="font-semibold text-sm text-neutral-200 truncate">{item.title}</div>
+
+            <div className="text-[11px] text-neutral-500 mt-1">
+              {item.type === "game"
+                ? `Hours: ${typeof item.hoursPlayed === "number" ? `${item.hoursPlayed.toFixed(1)}h` : "—"}`
+                : `Progress: ${progressText}`}
+              {(Number(item.rewatchCount ?? 0) || 0) > 0 ? ` • Rewatch x${Number(item.rewatchCount ?? 0) || 0}` : ""}
+            </div>
+
+            {/* tiny note preview */}
+            {item.notes ? (
+              <div className="text-[11px] text-neutral-400 mt-1 line-clamp-1">{item.notes}</div>
+            ) : null}
+
+            <div className="flex items-center justify-between mt-3">
+              <select
+                value={item.status}
+                onChange={(e) => onUpdate({ status: e.target.value as Status })}
+                className="rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+              >
+                <option value="completed">Completed</option>
+                <option value="in_progress">In Progress</option>
+                <option value="planned">Planned</option>
+                <option value="dropped">Dropped</option>
+              </select>
+
+              <button
+                type="button"
+                onClick={onDelete}
+                className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+              >
+                Delete
+              </button>
+            </div>
           </div>
         </div>
       </div>
-    </div>
+    </>
   );
+
 }
 
 /* ================= SMALL UI COMPONENTS ================= */
@@ -3585,7 +3986,7 @@ function Panel({
   return (
     <div
       className={[
-        "bg-neutral-900/50 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm",
+        "stack-surface p-4 sm:p-6 rounded-2xl shadow-sm",
         className || "",
       ].join(" ")}
     >
@@ -3637,7 +4038,7 @@ function BarRow({ label, value, total }: { label: string; value: number; total: 
 }
 
 /**
- * Simple pie chart (SVG) — no colors specified manually; uses opacity variations.
+ * Simple pie chart (SVG) — colored slices.
  */
 function PieChartSimple({ data }: { data: Array<{ label: string; value: number }> }) {
   const total = Math.max(1, data.reduce((a, b) => a + (b.value || 0), 0));
@@ -3646,6 +4047,18 @@ function PieChartSimple({ data }: { data: Array<{ label: string; value: number }
   const r = 38;
   const cx = 45;
   const cy = 45;
+
+  // ✅ Nice, readable palette (loops if > length)
+  const COLORS = [
+    "#60a5fa", // blue
+    "#34d399", // green
+    "#fbbf24", // amber
+    "#f87171", // red
+    "#a78bfa", // purple
+    "#22d3ee", // cyan
+    "#fb7185", // pink
+    "#c084fc", // violet
+  ];
 
   const slices = data.map((d, idx) => {
     const v = Math.max(0, d.value || 0);
@@ -3661,11 +4074,9 @@ function PieChartSimple({ data }: { data: Array<{ label: string; value: number }
     const largeArc = end - start > Math.PI ? 1 : 0;
 
     const path = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} Z`;
+    const fill = COLORS[idx % COLORS.length];
 
-    // opacity ladder for visual distinction without hardcoding colors
-    const opacity = 0.08 + (idx % 8) * 0.06;
-
-    return <path key={d.label} d={path} fill="white" fillOpacity={opacity} stroke="white" strokeOpacity={0.08} />;
+    return <path key={d.label} d={path} fill={fill} fillOpacity={0.9} stroke="white" strokeOpacity={0.08} />;
   });
 
   return (
@@ -3677,6 +4088,7 @@ function PieChartSimple({ data }: { data: Array<{ label: string; value: number }
     </div>
   );
 }
+
 
 function Select({
   label,
