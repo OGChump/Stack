@@ -1769,6 +1769,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
           const list: Suggestion[] = results.map((r) => {
             const t = (r.title || r.name || "").trim();
+
+            // ✅ ADD THIS
+            const posterUrl = (r as any).poster_path
+              ? `https://image.tmdb.org/t/p/w185${(r as any).poster_path}`
+              : undefined;
+
             return {
               key: `tmdb:${tmdbType}:${r.id}`,
               provider: "tmdb",
@@ -1781,6 +1787,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   : r.first_air_date
                   ? r.first_air_date.slice(0, 4)
                   : "",
+              posterUrl, // ✅ THIS IS THE FIX
               tmdbId: r.id,
               tmdbType,
             };
@@ -1789,6 +1796,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
           await pushSuggestions(list);
           return;
         }
+
 
         if (type === "game") {
           const res = await fetch(`/api/igdb/search?q=${encodeURIComponent(title)}&limit=7`, { method: "GET" });
