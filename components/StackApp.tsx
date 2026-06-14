@@ -306,7 +306,7 @@ const STACK_COLOR_THEMES: Record<
   midnight: {
     bg: "radial-gradient(circle at top left, rgba(59,130,246,0.18), transparent 32%), radial-gradient(circle at top right, rgba(148,163,184,0.10), transparent 30%), #05070d",
     fg: "#e5e7eb",
-    surface: "rgba(17, 24, 39, 0.62)",
+    surface: "rgba(12, 18, 32, 0.78)",
     accent: "linear-gradient(135deg, rgba(37,99,235,0.28), rgba(17,24,39,0.78))",
     good: "rgba(16,185,129,0.22)",
     goodBorder: "rgba(16,185,129,0.35)",
@@ -318,7 +318,7 @@ const STACK_COLOR_THEMES: Record<
   ocean: {
     bg: "radial-gradient(circle at top left, rgba(34,211,238,0.20), transparent 34%), radial-gradient(circle at bottom right, rgba(59,130,246,0.18), transparent 30%), #031018",
     fg: "#e6fbff",
-    surface: "rgba(8, 32, 46, 0.68)",
+    surface: "rgba(6, 25, 38, 0.78)",
     accent: "linear-gradient(135deg, rgba(14,165,233,0.32), rgba(8,47,73,0.76))",
     good: "rgba(34,211,238,0.18)",
     goodBorder: "rgba(34,211,238,0.35)",
@@ -330,7 +330,7 @@ const STACK_COLOR_THEMES: Record<
   emerald: {
     bg: "radial-gradient(circle at top left, rgba(16,185,129,0.20), transparent 34%), radial-gradient(circle at bottom right, rgba(20,184,166,0.14), transparent 32%), #04120d",
     fg: "#ecfdf5",
-    surface: "rgba(6, 34, 25, 0.70)",
+    surface: "rgba(5, 30, 22, 0.78)",
     accent: "linear-gradient(135deg, rgba(16,185,129,0.30), rgba(6,78,59,0.75))",
     good: "rgba(16,185,129,0.24)",
     goodBorder: "rgba(16,185,129,0.40)",
@@ -342,7 +342,7 @@ const STACK_COLOR_THEMES: Record<
   violet: {
     bg: "radial-gradient(circle at top left, rgba(167,139,250,0.22), transparent 34%), radial-gradient(circle at bottom right, rgba(236,72,153,0.12), transparent 32%), #0b0714",
     fg: "#f5f3ff",
-    surface: "rgba(31, 18, 53, 0.70)",
+    surface: "rgba(27, 15, 49, 0.78)",
     accent: "linear-gradient(135deg, rgba(124,58,237,0.34), rgba(49,46,129,0.72))",
     good: "rgba(168,85,247,0.22)",
     goodBorder: "rgba(168,85,247,0.38)",
@@ -354,7 +354,7 @@ const STACK_COLOR_THEMES: Record<
   rose: {
     bg: "radial-gradient(circle at top left, rgba(244,63,94,0.20), transparent 34%), radial-gradient(circle at bottom right, rgba(251,113,133,0.14), transparent 32%), #14070b",
     fg: "#fff1f2",
-    surface: "rgba(48, 16, 24, 0.70)",
+    surface: "rgba(42, 13, 22, 0.78)",
     accent: "linear-gradient(135deg, rgba(225,29,72,0.32), rgba(76,5,25,0.74))",
     good: "rgba(244,63,94,0.20)",
     goodBorder: "rgba(244,63,94,0.36)",
@@ -366,7 +366,7 @@ const STACK_COLOR_THEMES: Record<
   amber: {
     bg: "radial-gradient(circle at top left, rgba(245,158,11,0.20), transparent 34%), radial-gradient(circle at bottom right, rgba(217,119,6,0.14), transparent 32%), #120b03",
     fg: "#fffbeb",
-    surface: "rgba(43, 28, 8, 0.72)",
+    surface: "rgba(37, 24, 8, 0.78)",
     accent: "linear-gradient(135deg, rgba(217,119,6,0.30), rgba(69,26,3,0.74))",
     good: "rgba(245,158,11,0.22)",
     goodBorder: "rgba(245,158,11,0.38)",
@@ -4147,7 +4147,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
             </div>
 
             {/* Send request panel (same surface look) */}
-            <div className="rounded-3xl bg-neutral-900/45 ring-1 ring-white/10 shadow-xl shadow-black/10 backdrop-blur-xl p-4 sm:p-6">
+            <div className="rounded-3xl bg-neutral-950/68 ring-1 ring-white/10 shadow-xl shadow-black/10 backdrop-blur-xl p-4 sm:p-6">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-sm font-medium text-neutral-200">Add a friend</div>
@@ -4175,7 +4175,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
             </div>
 
             {/* List panel (table header row like main pages) */}
-            <div className="rounded-3xl bg-neutral-900/45 ring-1 ring-white/10 shadow-xl shadow-black/10 backdrop-blur-xl p-4 sm:p-6">
+            <div className="rounded-3xl bg-neutral-950/68 ring-1 ring-white/10 shadow-xl shadow-black/10 backdrop-blur-xl p-4 sm:p-6">
               <div className="flex items-center justify-between gap-3">
                 <div className="text-sm font-medium text-neutral-200">
                   {friendsTab === "friends" ? "Your friends" : "Incoming requests"}
@@ -4586,7 +4586,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
             <Panel title="Site preferences">
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-stretch">
-                <div className="rounded-2xl bg-neutral-950/60 border border-white/10 p-4 flex flex-col justify-between min-h-[152px]">
+                <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 flex flex-col justify-between min-h-[152px]">
                   <Select
                     label="Rating display"
                     value={settings.ratingFormat ?? "ten"}
@@ -4603,7 +4603,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   </div>
                 </div>
 
-                <div className="rounded-2xl bg-neutral-950/60 border border-white/10 p-4 flex flex-col justify-between min-h-[152px]">
+                <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 flex flex-col justify-between min-h-[152px]">
                   <Select
                     label="Color theme"
                     value={settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme}
@@ -4637,7 +4637,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   </div>
                 </div>
 
-                <div className="rounded-2xl bg-neutral-950/60 border border-white/10 p-4 min-h-[152px] space-y-3">
+                <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
                   <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                     <div>
                       <div className="text-xs text-neutral-400 mb-1">Sound effects</div>
@@ -5035,7 +5035,7 @@ function MALRow({
         </div>
       ) : null}
 
-      <div className="rounded-2xl bg-neutral-900/50 ring-1 ring-neutral-800/80 overflow-hidden">
+      <div className="rounded-2xl bg-neutral-950/72 ring-1 ring-neutral-800/80 overflow-hidden">
         <div className="grid grid-cols-1 sm:grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 p-3 items-center">
           {/* Poster */}
           <div className="w-[72px] h-[96px] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
@@ -5458,7 +5458,7 @@ function CardDraggable({
         ref={setNodeRef}
         style={style}
         className={[
-          "rounded-2xl bg-neutral-950/60 border border-neutral-800 shadow-sm overflow-hidden",
+          "rounded-2xl bg-neutral-950/74 border border-neutral-800 shadow-sm overflow-hidden",
           isDragging ? "opacity-70" : "opacity-100",
         ].join(" ")}
       >
@@ -5629,7 +5629,7 @@ function MiniStat({ label, value, sub }: { label: string; value: string; sub?: s
 
 function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
   return (
-    <div className="bg-neutral-900/50 p-4 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm text-center">
+    <div className="bg-neutral-950/72 p-4 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm text-center">
       <div className="text-xs text-neutral-400">{title}</div>
       <div className="text-2xl font-semibold tracking-tight mt-1">{value}</div>
       {sub ? <div className="text-[11px] text-neutral-500 mt-1">{sub}</div> : null}
