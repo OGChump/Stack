@@ -22,6 +22,7 @@ type MediaType = "movie" | "tv" | "anime" | "manga" | "book" | "game";
 type GroupMode = "none" | "day" | "month" | "year";
 type SortMode = "newest" | "oldest" | "title" | "rating_high" | "rating_low" | "updated" | "favorites";
 type RatingFormat = "ten" | "five" | "stars" | "percent";
+type StackColorTheme = "midnight" | "ocean" | "emerald" | "violet" | "rose" | "amber";
 
 export type StackView =
   | "all"
@@ -166,7 +167,9 @@ type StackSettings = {
   usernameTag?: string;
   profileBio?: string;
   soundEffects?: boolean;
+  soundVolume?: number;
   ratingFormat?: RatingFormat;
+  colorTheme?: StackColorTheme;
   friendNicknames?: Record<string, string>;
 };
 
@@ -200,10 +203,33 @@ type ActivityEntry = {
 };
 
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
+const LOCAL_LAST_GOOD_KEY = "stack-items-backup-v1-last-good";
 const LOCAL_BOARD_VIEW_KEY = "stack-board-view-v1";
+const LOCAL_COLOR_THEME_KEY = "stack-color-theme-v1";
 
 function backupKeyForUser(uid?: string | null) {
   return uid ? `${LOCAL_BACKUP_KEY}:${uid}` : LOCAL_BACKUP_KEY;
+}
+
+function lastGoodKeyForUser(uid?: string | null) {
+  return uid ? `${LOCAL_LAST_GOOD_KEY}:${uid}` : LOCAL_LAST_GOOD_KEY;
+}
+
+function parseBackupItems(raw: string | null): MediaItem[] | null {
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return null;
+
+    const cleaned = parsed
+      .filter((x) => x && typeof x.id === "string" && typeof x.title === "string")
+      .map((x) => x as MediaItem);
+
+    return cleaned;
+  } catch {
+    return null;
+  }
 }
 
 const TYPE_LABEL: Record<MediaType, string> = {
@@ -216,23 +242,150 @@ const TYPE_LABEL: Record<MediaType, string> = {
 };
 
 const PIE_COLORS = [
-  "#60a5fa",
-  "#34d399",
-  "#fbbf24",
-  "#f87171",
-  "#a78bfa",
-  "#22d3ee",
-  "#fb7185",
-  "#c084fc",
+  "#22d3ee", // bright cyan
+  "#f97316", // orange
+  "#a78bfa", // violet
+  "#84cc16", // lime
+  "#f43f5e", // rose
+  "#facc15", // yellow
+  "#38bdf8", // sky
+  "#e879f9", // fuchsia
+  "#10b981", // emerald
+  "#ef4444", // red
 ];
 
-const DEFAULT_SETTINGS: Required<Pick<StackSettings, "soundEffects" | "ratingFormat">> &
-  Omit<StackSettings, "soundEffects" | "ratingFormat"> = {
+const STACK_COLOR_THEME_OPTIONS: Array<{ value: StackColorTheme; label: string; description: string }> = [
+  { value: "midnight", label: "Midnight", description: "Original blue-gray dark theme" },
+  { value: "ocean", label: "Ocean", description: "Blue and cyan glow" },
+  { value: "emerald", label: "Emerald", description: "Green glow" },
+  { value: "violet", label: "Violet", description: "Purple glow" },
+  { value: "rose", label: "Rose", description: "Pink-red glow" },
+  { value: "amber", label: "Amber", description: "Gold glow" },
+];
+
+const STACK_COLOR_THEME_VALUES = STACK_COLOR_THEME_OPTIONS.map((t) => t.value);
+
+function isStackColorTheme(value: unknown): value is StackColorTheme {
+  return typeof value === "string" && STACK_COLOR_THEME_VALUES.includes(value as StackColorTheme);
+}
+
+function loadLocalColorTheme(): StackColorTheme {
+  if (typeof window === "undefined") return "midnight";
+
+  try {
+    const stored = localStorage.getItem(LOCAL_COLOR_THEME_KEY);
+    return isStackColorTheme(stored) ? stored : "midnight";
+  } catch {
+    return "midnight";
+  }
+}
+
+function saveLocalColorTheme(theme: StackColorTheme) {
+  if (typeof window === "undefined") return;
+
+  try {
+    localStorage.setItem(LOCAL_COLOR_THEME_KEY, theme);
+  } catch {}
+}
+
+const STACK_COLOR_THEMES: Record<
+  StackColorTheme,
+  {
+    bg: string;
+    fg: string;
+    surface: string;
+    accent: string;
+    good: string;
+    goodBorder: string;
+    bad: string;
+    badBorder: string;
+    focus: string;
+    ring: string;
+  }
+> = {
+  midnight: {
+    bg: "radial-gradient(circle at top left, rgba(59,130,246,0.18), transparent 32%), radial-gradient(circle at top right, rgba(148,163,184,0.10), transparent 30%), #05070d",
+    fg: "#e5e7eb",
+    surface: "rgba(17, 24, 39, 0.62)",
+    accent: "linear-gradient(135deg, rgba(37,99,235,0.28), rgba(17,24,39,0.78))",
+    good: "rgba(16,185,129,0.22)",
+    goodBorder: "rgba(16,185,129,0.35)",
+    bad: "rgba(239,68,68,0.18)",
+    badBorder: "rgba(239,68,68,0.32)",
+    focus: "#64748b",
+    ring: "rgba(255,255,255,0.10)",
+  },
+  ocean: {
+    bg: "radial-gradient(circle at top left, rgba(34,211,238,0.20), transparent 34%), radial-gradient(circle at bottom right, rgba(59,130,246,0.18), transparent 30%), #031018",
+    fg: "#e6fbff",
+    surface: "rgba(8, 32, 46, 0.68)",
+    accent: "linear-gradient(135deg, rgba(14,165,233,0.32), rgba(8,47,73,0.76))",
+    good: "rgba(34,211,238,0.18)",
+    goodBorder: "rgba(34,211,238,0.35)",
+    bad: "rgba(244,63,94,0.18)",
+    badBorder: "rgba(244,63,94,0.32)",
+    focus: "#22d3ee",
+    ring: "rgba(34,211,238,0.12)",
+  },
+  emerald: {
+    bg: "radial-gradient(circle at top left, rgba(16,185,129,0.20), transparent 34%), radial-gradient(circle at bottom right, rgba(20,184,166,0.14), transparent 32%), #04120d",
+    fg: "#ecfdf5",
+    surface: "rgba(6, 34, 25, 0.70)",
+    accent: "linear-gradient(135deg, rgba(16,185,129,0.30), rgba(6,78,59,0.75))",
+    good: "rgba(16,185,129,0.24)",
+    goodBorder: "rgba(16,185,129,0.40)",
+    bad: "rgba(248,113,113,0.18)",
+    badBorder: "rgba(248,113,113,0.32)",
+    focus: "#10b981",
+    ring: "rgba(16,185,129,0.12)",
+  },
+  violet: {
+    bg: "radial-gradient(circle at top left, rgba(167,139,250,0.22), transparent 34%), radial-gradient(circle at bottom right, rgba(236,72,153,0.12), transparent 32%), #0b0714",
+    fg: "#f5f3ff",
+    surface: "rgba(31, 18, 53, 0.70)",
+    accent: "linear-gradient(135deg, rgba(124,58,237,0.34), rgba(49,46,129,0.72))",
+    good: "rgba(168,85,247,0.22)",
+    goodBorder: "rgba(168,85,247,0.38)",
+    bad: "rgba(244,63,94,0.18)",
+    badBorder: "rgba(244,63,94,0.32)",
+    focus: "#a78bfa",
+    ring: "rgba(167,139,250,0.14)",
+  },
+  rose: {
+    bg: "radial-gradient(circle at top left, rgba(244,63,94,0.20), transparent 34%), radial-gradient(circle at bottom right, rgba(251,113,133,0.14), transparent 32%), #14070b",
+    fg: "#fff1f2",
+    surface: "rgba(48, 16, 24, 0.70)",
+    accent: "linear-gradient(135deg, rgba(225,29,72,0.32), rgba(76,5,25,0.74))",
+    good: "rgba(244,63,94,0.20)",
+    goodBorder: "rgba(244,63,94,0.36)",
+    bad: "rgba(239,68,68,0.20)",
+    badBorder: "rgba(239,68,68,0.34)",
+    focus: "#fb7185",
+    ring: "rgba(244,63,94,0.13)",
+  },
+  amber: {
+    bg: "radial-gradient(circle at top left, rgba(245,158,11,0.20), transparent 34%), radial-gradient(circle at bottom right, rgba(217,119,6,0.14), transparent 32%), #120b03",
+    fg: "#fffbeb",
+    surface: "rgba(43, 28, 8, 0.72)",
+    accent: "linear-gradient(135deg, rgba(217,119,6,0.30), rgba(69,26,3,0.74))",
+    good: "rgba(245,158,11,0.22)",
+    goodBorder: "rgba(245,158,11,0.38)",
+    bad: "rgba(239,68,68,0.18)",
+    badBorder: "rgba(239,68,68,0.32)",
+    focus: "#f59e0b",
+    ring: "rgba(245,158,11,0.13)",
+  },
+};
+
+const DEFAULT_SETTINGS: Required<Pick<StackSettings, "soundEffects" | "soundVolume" | "ratingFormat" | "colorTheme">> &
+  Omit<StackSettings, "soundEffects" | "soundVolume" | "ratingFormat" | "colorTheme"> = {
   displayName: "",
   usernameTag: "",
   profileBio: "",
   soundEffects: false,
+  soundVolume: 1,
   ratingFormat: "ten",
+  colorTheme: "midnight",
   friendNicknames: {},
 };
 
@@ -250,6 +403,9 @@ function normalizeSettings(raw: unknown): StackSettings {
   const ratingFormat = ["ten", "five", "stars", "percent"].includes(obj.ratingFormat)
     ? (obj.ratingFormat as RatingFormat)
     : DEFAULT_SETTINGS.ratingFormat;
+  const colorTheme = isStackColorTheme(obj.colorTheme)
+    ? obj.colorTheme
+    : loadLocalColorTheme();
 
   return {
     ...DEFAULT_SETTINGS,
@@ -257,7 +413,12 @@ function normalizeSettings(raw: unknown): StackSettings {
     usernameTag: typeof obj.usernameTag === "string" ? obj.usernameTag : "",
     profileBio: typeof obj.profileBio === "string" ? obj.profileBio : "",
     soundEffects: typeof obj.soundEffects === "boolean" ? obj.soundEffects : DEFAULT_SETTINGS.soundEffects,
+    soundVolume:
+      typeof obj.soundVolume === "number" && Number.isFinite(obj.soundVolume)
+        ? clamp(obj.soundVolume, 0.25, 2)
+        : DEFAULT_SETTINGS.soundVolume,
     ratingFormat,
+    colorTheme,
     friendNicknames:
       obj.friendNicknames && typeof obj.friendNicknames === "object" && !Array.isArray(obj.friendNicknames)
         ? (Object.fromEntries(
@@ -315,7 +476,7 @@ function sortMediaItems<T extends MediaItem>(list: T[], sortMode: SortMode): T[]
   return out;
 }
 
-function playStackSoundEffect(kind: "hover" | "click" = "click") {
+function playStackSoundEffect(kind: "hover" | "click" = "click", volume = 1) {
   if (typeof window === "undefined") return;
 
   try {
@@ -325,23 +486,24 @@ function playStackSoundEffect(kind: "hover" | "click" = "click") {
     const ctx = new AudioCtor();
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
+    const safeVolume = clamp(Number.isFinite(volume) ? volume : 1, 0.25, 2);
 
     osc.type = "sine";
-    osc.frequency.value = kind === "click" ? 520 : 420;
-    gain.gain.value = kind === "click" ? 0.035 : 0.018;
+    osc.frequency.value = kind === "click" ? 620 : 430;
+    gain.gain.value = (kind === "click" ? 0.075 : 0.03) * safeVolume;
 
     osc.connect(gain);
     gain.connect(ctx.destination);
 
     osc.start();
-    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + (kind === "click" ? 0.055 : 0.035));
-    osc.stop(ctx.currentTime + (kind === "click" ? 0.06 : 0.04));
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + (kind === "click" ? 0.075 : 0.045));
+    osc.stop(ctx.currentTime + (kind === "click" ? 0.08 : 0.05));
 
     window.setTimeout(() => {
       try {
         ctx.close();
       } catch {}
-    }, 120);
+    }, 140);
   } catch {}
 }
 
@@ -824,7 +986,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [statsMonth, setStatsMonth] = useState<string>("all");
   const [items, setItems] = useState<MediaItem[]>([]);
   const [userId, setUserId] = useState<string | null>(null);
-  const [settings, setSettings] = useState<StackSettings>(DEFAULT_SETTINGS);
+  const [settings, setSettings] = useState<StackSettings>(() => ({
+    ...DEFAULT_SETTINGS,
+    colorTheme: loadLocalColorTheme(),
+  }));
   const [feedbackEntries, setFeedbackEntries] = useState<FeedbackEntry[]>([]);
   const [cloudExtraData, setCloudExtraData] = useState<Record<string, any>>({});
 
@@ -867,7 +1032,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       requested_id: string;
       status: string;
       created_at?: string;
-      requester?: { username?: string | null } | null;
+      requester?: { username?: string | null; display_name?: string | null } | null;
     }>
   >([]);
 
@@ -878,14 +1043,14 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       requested_id: string;
       status: string;
       created_at?: string;
-      requested?: { username?: string | null } | null;
+      requested?: { username?: string | null; display_name?: string | null } | null;
     }>
   >([]);
 
   const [friendsList, setFriendsList] = useState<
     Array<{
       friend_id: string;
-      friend?: { username?: string | null } | null;
+      friend?: { username?: string | null; display_name?: string | null } | null;
     }>
   >([]);
 
@@ -1015,31 +1180,86 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
     useSensor(TouchSensor, { activationConstraint: { delay: 180, tolerance: 8 } })
   );
 
-  const friendsNameById = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const f of friendsList) {
-      const nickname = settings.friendNicknames?.[f.friend_id]?.trim();
-      map.set(f.friend_id, nickname || f.friend?.username || f.friend_id);
+  const friendSettingsById = useMemo(() => {
+    const map = new Map<string, StackSettings>();
+
+    for (const row of friendActivityRows) {
+      const settingsFromFriend = normalizeSettings(row?.data?.settings);
+      map.set(row.user_id, settingsFromFriend);
     }
+
     return map;
-  }, [friendsList, settings.friendNicknames]);
+  }, [friendActivityRows]);
 
   const getFriendDisplay = useCallback(
-    (friendId: string, username?: string | null) => {
+    (
+      friendId: string,
+      profile?: { username?: string | null; display_name?: string | null } | null
+    ) => {
       const nickname = settings.friendNicknames?.[friendId]?.trim();
-      const fallbackName = username?.trim() || friendId;
+      const friendSettings = friendSettingsById.get(friendId);
+      const settingsDisplayName = friendSettings?.displayName?.trim();
+      const settingsTag = friendSettings?.usernameTag?.trim();
+      const profileDisplayName = profile?.display_name?.trim();
+      const username = profile?.username?.trim();
+
+      const baseName = settingsDisplayName || profileDisplayName || username || friendId;
+      const tagLabel = settingsTag || (username ? `@${username}` : "");
+      const primary = nickname || baseName;
+
+      const secondaryParts = nickname
+        ? [baseName, tagLabel, friendId]
+        : [tagLabel, friendId];
+
+      const secondary = secondaryParts
+        .filter((x): x is string => !!x && x !== primary)
+        .filter((x, idx, arr) => arr.indexOf(x) === idx)
+        .join(" • ");
 
       return {
-        primary: nickname || fallbackName,
-        secondary: nickname ? `${fallbackName} • ${friendId}` : friendId,
+        primary,
+        secondary: secondary || friendId,
+        baseName,
+        idTag: tagLabel,
         hasCustomTag: !!nickname,
       };
     },
-    [settings.friendNicknames]
+    [friendSettingsById, settings.friendNicknames]
   );
 
+  const friendsNameById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const f of friendsList) {
+      map.set(f.friend_id, getFriendDisplay(f.friend_id, f.friend).primary);
+    }
+    return map;
+  }, [friendsList, getFriendDisplay]);
+
   const updateSettings = useCallback((patch: Partial<StackSettings>) => {
+    if (isStackColorTheme(patch.colorTheme)) {
+      saveLocalColorTheme(patch.colorTheme);
+    }
+
     setSettings((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  useEffect(() => {
+    const theme = settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme;
+    if (isStackColorTheme(theme)) saveLocalColorTheme(theme);
+  }, [settings.colorTheme]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== LOCAL_COLOR_THEME_KEY) return;
+      if (!isStackColorTheme(e.newValue)) return;
+
+      setSettings((prev) => ({ ...prev, colorTheme: e.newValue as StackColorTheme }));
+    };
+
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
 
   const updateFriendNickname = useCallback((friendId: string, nickname: string) => {
@@ -1087,11 +1307,11 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
 
   const navActions = useMemo(
     () => [
-      { href: "/stats", label: "Stats", key: "stats" as StackView, icon: "pie" as const },
-      { href: "/add", label: "Add", key: "add" as StackView, icon: "plus" as const },
-      { href: "/friends", label: "Friends", key: "friends" as StackView, icon: "users" as const },
       { href: "/feed", label: "Feed", key: "feed" as StackView, icon: "feed" as const },
       { href: "/discover", label: "Discover", key: "discover" as StackView, icon: "discover" as const },
+      { href: "/add", label: "Add", key: "add" as StackView, icon: "plus" as const },
+      { href: "/stats", label: "Stats", key: "stats" as StackView, icon: "pie" as const },
+      { href: "/friends", label: "Friends", key: "friends" as StackView, icon: "users" as const },
       { href: "/feedback", label: "Feedback", key: "feedback" as StackView, icon: "feedback" as const },
       { href: "/settings", label: "Settings", key: "settings" as StackView, icon: "settings" as const },
     ],
@@ -1103,12 +1323,21 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
 
   const loadLocalBackup = useCallback((uid?: string | null): MediaItem[] | null => {
     try {
-      const primary = localStorage.getItem(backupKeyForUser(uid));
-      const fallback = uid ? localStorage.getItem(LOCAL_BACKUP_KEY) : null;
-      const raw = primary || fallback;
-      if (!raw) return null;
-      const parsed = JSON.parse(raw) as unknown;
-      return Array.isArray(parsed) ? (parsed as MediaItem[]) : null;
+      const keys = uid
+        ? [
+            backupKeyForUser(uid),
+            lastGoodKeyForUser(uid),
+            LOCAL_BACKUP_KEY,
+            LOCAL_LAST_GOOD_KEY,
+          ]
+        : [LOCAL_BACKUP_KEY, LOCAL_LAST_GOOD_KEY];
+
+      for (const key of Array.from(new Set(keys))) {
+        const parsed = parseBackupItems(localStorage.getItem(key));
+        if (parsed && parsed.length > 0) return parsed;
+      }
+
+      return null;
     } catch {
       return null;
     }
@@ -1116,13 +1345,38 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
 
   const saveLocalBackup = useCallback((next: MediaItem[], uid?: string | null) => {
     try {
-      localStorage.setItem(backupKeyForUser(uid), JSON.stringify(next));
+      const primaryKey = backupKeyForUser(uid);
+      const lastGoodKey = lastGoodKeyForUser(uid);
+
+      const existingPrimary = parseBackupItems(localStorage.getItem(primaryKey));
+      const existingLastGood = parseBackupItems(localStorage.getItem(lastGoodKey));
+      const existingGeneral = uid ? parseBackupItems(localStorage.getItem(LOCAL_BACKUP_KEY)) : null;
+      const existingGeneralLastGood = uid ? parseBackupItems(localStorage.getItem(LOCAL_LAST_GOOD_KEY)) : null;
+
+      const bestExisting = [existingPrimary, existingLastGood, existingGeneral, existingGeneralLastGood]
+        .filter((x): x is MediaItem[] => Array.isArray(x) && x.length > 0)
+        .sort((a, b) => b.length - a.length)[0];
+
+      if (next.length === 0 && bestExisting && bestExisting.length > 0) {
+        console.warn(
+          `Blocked empty local backup overwrite. Existing backup has ${bestExisting.length} items.`
+        );
+        return;
+      }
+
+      localStorage.setItem(primaryKey, JSON.stringify(next));
+
+      if (next.length > 0) {
+        localStorage.setItem(lastGoodKey, JSON.stringify(next));
+        localStorage.setItem(LOCAL_BACKUP_KEY, JSON.stringify(next));
+        localStorage.setItem(LOCAL_LAST_GOOD_KEY, JSON.stringify(next));
+      }
     } catch {}
   }, []);
 
 /* ================= SUPABASE ================= */
 
-type ProfileRow = { id: string; username: string | null };
+type ProfileRow = { id: string; username: string | null; display_name?: string | null };
 
 type IncomingRequestRow = {
   id: string;
@@ -1130,12 +1384,12 @@ type IncomingRequestRow = {
   requested_id: string;
   status: "pending" | "accepted" | "declined";
   created_at?: string;
-  requester?: { username?: string | null } | null;
+  requester?: { username?: string | null; display_name?: string | null } | null;
 };
 
 type FriendRow = {
   friend_id: string;
-  friend?: { username?: string | null } | null;
+  friend?: { username?: string | null; display_name?: string | null } | null;
 };
 
 const AUTO_ACCEPT_FRIEND_REQUESTS = true;
@@ -1147,7 +1401,7 @@ const findProfileByUsername = useCallback(async (username: string): Promise<Prof
 
   const { data, error } = await supabase
     .from("profiles")
-    .select("id, username")
+    .select("id, username, display_name")
     .eq("username", u)
     .maybeSingle();
 
@@ -1167,7 +1421,7 @@ const loadFriends = useCallback(
 
     const { data, error } = await supabase
       .from("friends")
-      .select("friend_id, friend:friend_id(username)")
+      .select("friend_id, friend:friend_id(username, display_name)")
       .eq("user_id", me);
 
     if (error) {
@@ -1187,7 +1441,7 @@ const loadIncomingFriendRequests = useCallback(
 
     const { data, error } = await supabase
       .from("friend_requests")
-      .select("id, requester_id, requested_id, status, created_at, requester:requester_id(username)")
+      .select("id, requester_id, requested_id, status, created_at, requester:requester_id(username, display_name)")
       .eq("requested_id", me)
       .eq("status", "pending")
       .order("created_at", { ascending: false });
@@ -1223,7 +1477,7 @@ const loadOutgoingFriendRequests = useCallback(
 
     const { data, error } = await supabase
       .from("friend_requests")
-      .select("id, requester_id, requested_id, status, created_at, requested:requested_id(username)")
+      .select("id, requester_id, requested_id, status, created_at, requested:requested_id(username, display_name)")
       .eq("requester_id", me)
       .eq("status", "pending")
       .order("created_at", { ascending: false });
@@ -1434,10 +1688,27 @@ async function sendFriendRequest() {
   await loadOutgoingFriendRequests(userId);
 }
 
+const parseFeedbackEntries = (rawFeedback: unknown): FeedbackEntry[] => {
+  return Array.isArray(rawFeedback)
+    ? (rawFeedback as any[])
+        .filter((x) => x && typeof x.id === "string" && typeof x.message === "string")
+        .map((x) => ({
+          id: x.id,
+          type: x.type === "problem" ? "problem" : "suggestion",
+          message: String(x.message),
+          createdAt: typeof x.createdAt === "string" ? x.createdAt : new Date().toISOString(),
+          status: x.status === "reviewed" || x.status === "done" ? x.status : "new",
+        }))
+    : [];
+};
+
 const loadCloud = useCallback(
   async (uidStr: string) => {
     setSaveStatus("Loading…");
     setCloudLoaded(false);
+
+    const localBackup = loadLocalBackup(uidStr);
+    const localBackupCount = localBackup?.length ?? 0;
 
     const { data, error } = await supabase
       .from("media_items")
@@ -1447,10 +1718,12 @@ const loadCloud = useCallback(
 
     if (error) {
       console.error(error);
-      const backup = loadLocalBackup(uidStr);
-      if (backup) setItems(backup);
+      if (localBackupCount > 0) {
+        setItems(localBackup!);
+        saveLocalBackup(localBackup!, uidStr);
+      }
       setCloudLoaded(true);
-      setSaveStatus("Loaded (local backup)");
+      setSaveStatus(localBackupCount > 0 ? `Loaded local backup (${localBackupCount})` : "Cloud load error");
       return;
     }
 
@@ -1464,28 +1737,42 @@ const loadCloud = useCallback(
         ? (rawObj.items as any[])
             .filter((x) => x && typeof x.id === "string" && typeof x.title === "string")
             .map((x) => x as MediaItem)
-        : null;
+        : Array.isArray(raw)
+          ? (raw as any[])
+              .filter((x) => x && typeof x.id === "string" && typeof x.title === "string")
+              .map((x) => x as MediaItem)
+          : null;
 
     if (parsedItems) {
+      if (parsedItems.length === 0 && localBackupCount > 0) {
+        setItems(localBackup!);
+        setSettings(normalizeSettings(rawObj?.settings));
+        setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
+        setCloudExtraData(omitKnownDataKeys(raw));
+        saveLocalBackup(localBackup!, uidStr);
+        setCloudLoaded(true);
+        setSaveStatus(`Recovery mode: cloud was empty, showing backup (${localBackupCount})`);
+        return;
+      }
+
       setItems(parsedItems);
       setSettings(normalizeSettings(rawObj?.settings));
-      setFeedbackEntries(
-        Array.isArray(rawObj?.feedback)
-          ? (rawObj.feedback as any[])
-              .filter((x) => x && typeof x.id === "string" && typeof x.message === "string")
-              .map((x) => ({
-                id: x.id,
-                type: x.type === "problem" ? "problem" : "suggestion",
-                message: String(x.message),
-                createdAt: typeof x.createdAt === "string" ? x.createdAt : new Date().toISOString(),
-                status: x.status === "reviewed" || x.status === "done" ? x.status : "new",
-              }))
-          : []
-      );
+      setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
       setCloudExtraData(omitKnownDataKeys(raw));
       saveLocalBackup(parsedItems, uidStr);
       setCloudLoaded(true);
       setSaveStatus("Loaded");
+      return;
+    }
+
+    if (localBackupCount > 0) {
+      setItems(localBackup!);
+      setSettings(normalizeSettings(rawObj?.settings));
+      setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
+      setCloudExtraData(omitKnownDataKeys(raw));
+      saveLocalBackup(localBackup!, uidStr);
+      setCloudLoaded(true);
+      setSaveStatus(`Recovery mode: missing cloud items, showing backup (${localBackupCount})`);
       return;
     }
 
@@ -1496,10 +1783,8 @@ const loadCloud = useCallback(
 
     if (up.error) {
       console.error(up.error);
-      const backup = loadLocalBackup(uidStr);
-      if (backup) setItems(backup);
       setCloudLoaded(true);
-      setSaveStatus("Loaded (local backup)");
+      setSaveStatus("Cloud setup error");
       return;
     }
 
@@ -1507,7 +1792,6 @@ const loadCloud = useCallback(
     setSettings(DEFAULT_SETTINGS);
     setFeedbackEntries([]);
     setCloudExtraData({});
-    saveLocalBackup([], uidStr);
     setCloudLoaded(true);
     setSaveStatus("Loaded");
   },
@@ -1516,6 +1800,17 @@ const loadCloud = useCallback(
 
 const saveCloud = useCallback(
   async (uidStr: string, next: MediaItem[], nextSettings: StackSettings, nextFeedback: FeedbackEntry[]) => {
+    if (next.length === 0) {
+      const backup = loadLocalBackup(uidStr);
+
+      if (backup && backup.length > 0) {
+        setItems(backup);
+        saveLocalBackup(backup, uidStr);
+        setSaveStatus(`Blocked empty save; restored backup (${backup.length})`);
+        return;
+      }
+    }
+
     saveLocalBackup(next, uidStr);
     if (!cloudLoaded) return;
 
@@ -1540,7 +1835,7 @@ const saveCloud = useCallback(
 
     setSaveStatus("Saved");
   },
-  [cloudLoaded, saveLocalBackup, cloudExtraData]
+  [cloudLoaded, saveLocalBackup, loadLocalBackup, cloudExtraData]
 );
 
 useEffect(() => {
@@ -2402,12 +2697,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
       const now = Date.now();
       if (now - lastHover < 120) return;
       lastHover = now;
-      playStackSoundEffect("hover");
+      playStackSoundEffect("hover", settings.soundVolume ?? 1);
     };
 
     const onClick = (e: MouseEvent) => {
       if (!isInteractive(e.target)) return;
-      playStackSoundEffect("click");
+      playStackSoundEffect("click", settings.soundVolume ?? 1);
     };
 
     document.addEventListener("mouseover", onMouseOver, true);
@@ -2417,7 +2712,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
       document.removeEventListener("mouseover", onMouseOver, true);
       document.removeEventListener("click", onClick, true);
     };
-  }, [settings.soundEffects]);
+  }, [settings.soundEffects, settings.soundVolume]);
 
   useEffect(() => {
     if (view !== "discover") return;
@@ -2617,29 +2912,50 @@ async function pickForMe(mode: "best" | "random" = "best") {
     return friendsList
       .slice()
       .sort((a, b) => {
-        const aName = settings.friendNicknames?.[a.friend_id]?.trim() || a.friend?.username || a.friend_id;
-        const bName = settings.friendNicknames?.[b.friend_id]?.trim() || b.friend?.username || b.friend_id;
+        const aName = getFriendDisplay(a.friend_id, a.friend).primary;
+        const bName = getFriendDisplay(b.friend_id, b.friend).primary;
         return aName.localeCompare(bName);
       })
       .filter((f) => {
         if (!q) return true;
-        const name = (f.friend?.username ?? "").toLowerCase();
-        const nickname = (settings.friendNicknames?.[f.friend_id] ?? "").toLowerCase();
-        const id = (f.friend_id ?? "").toLowerCase();
-        return name.includes(q) || nickname.includes(q) || id.includes(q);
+        const display = getFriendDisplay(f.friend_id, f.friend);
+        const searchable = [
+          display.primary,
+          display.secondary,
+          display.baseName,
+          display.idTag,
+          f.friend?.username,
+          f.friend?.display_name,
+          f.friend_id,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        return searchable.includes(q);
       });
-  }, [friendsList, friendsQuery, settings.friendNicknames]);
+  }, [friendsList, friendsQuery, getFriendDisplay]);
 
   const filteredIncomingRequests = useMemo(() => {
     const q = friendsQuery.trim().toLowerCase();
     if (!q) return incomingRequests;
 
     return incomingRequests.filter((r) => {
-      const name = (r.requester?.username ?? "").toLowerCase();
-      const id = (r.requester_id ?? "").toLowerCase();
-      return name.includes(q) || id.includes(q);
+      const display = getFriendDisplay(r.requester_id, r.requester);
+      const searchable = [
+        display.primary,
+        display.secondary,
+        display.baseName,
+        display.idTag,
+        r.requester?.username,
+        r.requester?.display_name,
+        r.requester_id,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return searchable.includes(q);
     });
-  }, [incomingRequests, friendsQuery]);
+  }, [incomingRequests, friendsQuery, getFriendDisplay]);
 
   const filtered = useMemo(() => {
     let out = items.slice();
@@ -2991,42 +3307,92 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
   const isWideBoard = view === "all" && boardView;
 
+  const currentTheme = STACK_COLOR_THEMES[settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme];
+  const themeStyle = {
+    "--stack-theme-bg": currentTheme.bg,
+    "--stack-theme-fg": currentTheme.fg,
+    "--stack-theme-surface": currentTheme.surface,
+    "--stack-theme-accent": currentTheme.accent,
+    "--stack-theme-good": currentTheme.good,
+    "--stack-theme-good-border": currentTheme.goodBorder,
+    "--stack-theme-bad": currentTheme.bad,
+    "--stack-theme-bad-border": currentTheme.badBorder,
+    "--stack-theme-focus": currentTheme.focus,
+    "--stack-theme-ring": currentTheme.ring,
+  } as React.CSSProperties;
+
   return (
-    <div className="min-h-screen stack-bg">
+    <div className="min-h-screen stack-bg" style={themeStyle}>
+      <style>{`
+        .stack-bg {
+          background: var(--stack-theme-bg) !important;
+          color: var(--stack-theme-fg) !important;
+        }
+
+        .stack-surface {
+          background: var(--stack-theme-surface) !important;
+          box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28), 0 0 0 1px var(--stack-theme-ring) inset;
+        }
+
+        .stack-accent {
+          background: var(--stack-theme-accent) !important;
+        }
+
+        .stack-good {
+          background: var(--stack-theme-good) !important;
+          border-color: var(--stack-theme-good-border) !important;
+        }
+
+        .stack-bad {
+          background: var(--stack-theme-bad) !important;
+          border-color: var(--stack-theme-bad-border) !important;
+        }
+
+        .stack-bg input:focus,
+        .stack-bg textarea:focus,
+        .stack-bg select:focus {
+          border-color: var(--stack-theme-focus) !important;
+          box-shadow: 0 0 0 1px color-mix(in srgb, var(--stack-theme-focus) 42%, transparent);
+        }
+      `}</style>
       <div
         className={[
           isWideBoard ? "max-w-[104rem]" : "max-w-6xl",
-          "mx-auto px-4 sm:px-6 py-6 space-y-6 min-w-0 overflow-x-hidden",
+          "mx-auto px-3 sm:px-6 py-5 sm:py-6 space-y-6 min-w-0 overflow-x-hidden",
         ].join(" ")}
       >
         {/* Header */}
-        <header className="space-y-3">
-          <div className="flex items-end justify-between gap-4">
+        <header className="space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-2 text-center sm:text-left">
             <div>
-              <h1 className="text-3xl font-semibold tracking-tight">Stack</h1>
+              <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight">Stack</h1>
               <p className="text-sm text-neutral-400">Your personal media website</p>
             </div>
-            <div className="text-xs text-neutral-500">{saveStatus}</div>
+            <div className="text-xs text-neutral-500 sm:text-right">{saveStatus}</div>
           </div>
 
-          <nav className="flex justify-center">
-            <div className="flex items-center gap-2">
-              <div className="inline-flex flex-wrap justify-center gap-[clamp(0.35rem,1.2vw,0.6rem)] rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/80 px-[clamp(0.4rem,1.6vw,0.7rem)] py-[clamp(0.35rem,1.2vw,0.6rem)] max-w-[92vw]">
+          <nav className="space-y-2" aria-label="Stack navigation">
+            <div className="flex justify-center">
+              <div className="inline-flex flex-wrap justify-center gap-[clamp(0.35rem,1.5vw,0.65rem)] rounded-3xl bg-neutral-950/55 ring-1 ring-white/10 shadow-lg shadow-black/20 px-[clamp(0.45rem,1.6vw,0.8rem)] py-[clamp(0.4rem,1.2vw,0.65rem)] max-w-[96vw] backdrop-blur-xl">
                 {navMain.map((n) => (
                   <Link
                     key={n.href}
                     href={n.href}
                     className={[
-                      "px-[clamp(0.55rem,1.6vw,0.9rem)] py-[clamp(0.45rem,1.2vw,0.65rem)] rounded-xl border text-[clamp(0.72rem,1.2vw,0.9rem)] transition",
-                      view === n.key ? "bg-white/15 border-white/20" : "bg-white/5 border-white/10 hover:bg-white/10",
+                      "px-[clamp(0.6rem,1.8vw,1rem)] py-[clamp(0.48rem,1.2vw,0.7rem)] rounded-2xl border text-[clamp(0.72rem,1.25vw,0.9rem)] transition whitespace-nowrap",
+                      view === n.key
+                        ? "bg-white/15 border-white/25 shadow-inner text-neutral-50"
+                        : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-300",
                     ].join(" ")}
                   >
                     {n.label}
                   </Link>
                 ))}
               </div>
+            </div>
 
-              <div className="flex items-center gap-2">
+            <div className="flex justify-center">
+              <div className="flex flex-wrap justify-center gap-2 max-w-[96vw]">
                 {navActions.map((n) => (
                   <Link
                     key={n.href}
@@ -3034,9 +3400,11 @@ async function pickForMe(mode: "best" | "random" = "best") {
                     title={n.label}
                     aria-label={n.label}
                     className={[
-                      "h-[clamp(2.25rem,5vw,2.75rem)] w-[clamp(2.25rem,5vw,2.75rem)] grid place-items-center rounded-2xl border transition",
-                      "bg-neutral-900/40 ring-1 ring-neutral-800/80",
-                      view === n.key ? "bg-white/15 border-white/20" : "bg-white/5 border-white/10 hover:bg-white/10",
+                      "h-[clamp(2.35rem,10vw,2.85rem)] min-w-[clamp(2.35rem,10vw,2.85rem)] px-2 grid place-items-center rounded-2xl border transition shadow-sm touch-manipulation",
+                      "bg-neutral-950/50 ring-1 ring-white/5 backdrop-blur-xl",
+                      view === n.key
+                        ? "bg-white/15 border-white/25 text-neutral-50 shadow-inner"
+                        : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-300",
                     ].join(" ")}
                   >
                     {n.icon === "plus" ? (
@@ -3063,9 +3431,9 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
         {/* STATS PAGE */}
         {view === "stats" ? (
-          <div className="space-y-6">
+          <div className="space-y-6 max-w-6xl mx-auto">
             {/* ✅ Stats filter bar */}
-            <div className="flex flex-wrap items-end justify-between gap-3">
+            <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 text-center sm:text-left">
               <div>
                 <div className="text-sm text-neutral-200 font-medium">Stats</div>
                 <div className="text-xs text-neutral-500">
@@ -3192,7 +3560,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
               <Panel title="Genres (completed)" className="lg:col-span-2">
                 {genreCounts.length ? (
-                  <div className="flex flex-col sm:flex-row sm:items-center gap-6">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-center gap-6">
                     <PieChartSimple data={genreCounts} />
                     <div className="space-y-2 text-sm w-full">
                       {genreCounts.map((g, idx) => (
@@ -3275,7 +3643,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 <div className="mt-3 grid sm:grid-cols-2 gap-2 text-sm text-neutral-300">
                   {avgByType.length ? (
                     avgByType.map((x) => (
-                      <div key={x.type} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+                      <div key={x.type} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-center">
                         <div className="text-xs text-neutral-400">{TYPE_LABEL[x.type]}</div>
                         <div>
                           {formatRatingValue(x.avg, settings.ratingFormat)} <span className="text-xs text-neutral-500">({x.count} rated)</span>
@@ -3717,13 +4085,13 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
         {/* FRIENDS PAGE */}
         {view === "friends" ? (
-          <div className="space-y-4">
+          <div className="space-y-4 max-w-5xl mx-auto">
             {/* Top bar (matches main pages vibe) */}
-            <div className="flex flex-wrap items-end justify-between gap-3">
+            <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 text-center sm:text-left">
               <div>
                 <div className="text-lg font-semibold text-neutral-200">Friends</div>
                 <div className="text-sm text-neutral-500">
-                  Add friends by their <span className="text-neutral-200">Stack username</span>.
+                  Add friends, customize their names, and browse what they are watching.
                 </div>
               </div>
 
@@ -3741,15 +4109,15 @@ async function pickForMe(mode: "best" | "random" = "best") {
             </div>
 
             {/* Search + Tabs (same control style as main) */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
               <input
                 value={friendsQuery}
                 onChange={(e) => setFriendsQuery(e.target.value)}
-                placeholder="Search friends / requests..."
+                placeholder="Search friends, display names, tags, or requests..."
                 className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
               />
 
-              <div className="flex items-center gap-2 justify-start sm:justify-end">
+              <div className="flex items-center gap-2 justify-center sm:justify-end">
                 <button
                   type="button"
                   onClick={() => setFriendsTab("friends")}
@@ -3779,7 +4147,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
             </div>
 
             {/* Send request panel (same surface look) */}
-            <div className="rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/80 p-4 sm:p-6">
+            <div className="rounded-3xl bg-neutral-900/45 ring-1 ring-white/10 shadow-xl shadow-black/10 backdrop-blur-xl p-4 sm:p-6">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-sm font-medium text-neutral-200">Add a friend</div>
@@ -3807,7 +4175,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
             </div>
 
             {/* List panel (table header row like main pages) */}
-            <div className="rounded-2xl bg-neutral-900/40 ring-1 ring-neutral-800/80 p-4 sm:p-6">
+            <div className="rounded-3xl bg-neutral-900/45 ring-1 ring-white/10 shadow-xl shadow-black/10 backdrop-blur-xl p-4 sm:p-6">
               <div className="flex items-center justify-between gap-3">
                 <div className="text-sm font-medium text-neutral-200">
                   {friendsTab === "friends" ? "Your friends" : "Incoming requests"}
@@ -3826,12 +4194,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 {friendsTab === "friends" ? (
                   filteredFriendsList.length ? (
                     filteredFriendsList.map((f) => {
-                      const display = getFriendDisplay(f.friend_id, f.friend?.username);
+                      const display = getFriendDisplay(f.friend_id, f.friend);
 
                       return (
                         <div
                           key={f.friend_id}
-                          className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3"
+                          className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm"
                         >
                           <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(220px,280px)] gap-3 items-center">
                             <div className="min-w-0">
@@ -3840,7 +4208,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                               </div>
                               <div className="text-[11px] text-neutral-600 truncate">{display.secondary}</div>
                               {display.hasCustomTag ? (
-                                <div className="text-[11px] text-emerald-300/80 mt-1">Showing custom tag</div>
+                                <div className="text-[11px] text-emerald-300/80 mt-1">Showing your nickname first</div>
                               ) : null}
                             </div>
 
@@ -3873,7 +4241,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   filteredIncomingRequests.map((r) => (
                     <div
                       key={r.id}
-                      className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3"
+                      className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm"
                     >
                       <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(180px,240px)] gap-3 items-center">
                         <div className="min-w-0">
@@ -3909,7 +4277,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
             </div>
 
             <Panel
-              title="Friend media"
+              title="Friend media library"
               right={<span className="text-xs text-neutral-500">{friendActivityStatus}</span>}
             >
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -3920,7 +4288,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   options={[
                     { value: "all", label: "All friends" },
                     ...friendsList.map((f) => {
-                      const display = getFriendDisplay(f.friend_id, f.friend?.username);
+                      const display = getFriendDisplay(f.friend_id, f.friend);
                       return { value: f.friend_id, label: display.primary };
                     }),
                   ]}
@@ -3960,7 +4328,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   friendLibraryItems.map((item) => (
                     <div
                       key={`${item.__ownerId}:${item.id}`}
-                      className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3"
+                      className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm"
                     >
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <div className="min-w-0 flex-1">
@@ -3995,8 +4363,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
         {/* FEED PAGE */}
         {view === "feed" ? (
-          <div className="space-y-4">
-            <div className="flex flex-wrap items-end justify-between gap-3">
+          <div className="space-y-4 max-w-5xl mx-auto">
+            <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 text-center sm:text-left">
               <div>
                 <div className="text-lg font-semibold text-neutral-200">Activity Feed</div>
                 <div className="text-sm text-neutral-500">Latest activity from you and any friends your current RLS rules allow you to view.</div>
@@ -4015,7 +4383,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
               <div className="space-y-2">
                 {activityFeed.length ? (
                   activityFeed.map((a) => (
-                    <div key={a.id} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3">
+                    <div key={a.id} className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm">
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <div className="min-w-0">
                           <div className="text-sm text-neutral-200 truncate">
@@ -4040,8 +4408,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
         {/* DISCOVER PAGE */}
         {view === "discover" ? (
-          <div className="space-y-4">
-            <div>
+          <div className="space-y-4 max-w-5xl mx-auto">
+            <div className="text-center sm:text-left">
               <div className="text-lg font-semibold text-neutral-200">Discover</div>
               <div className="text-sm text-neutral-500">Browse movies and TV by genre, then add anything directly to Planned.</div>
             </div>
@@ -4077,7 +4445,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   <button
                     type="button"
                     onClick={browseDiscover}
-                    className="w-full px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
+                    className="w-full h-[42px] px-4 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
                   >
                     Browse
                   </button>
@@ -4120,8 +4488,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
         {/* FEEDBACK PAGE */}
         {view === "feedback" ? (
-          <div className="space-y-4">
-            <div>
+          <div className="space-y-4 max-w-5xl mx-auto">
+            <div className="text-center sm:text-left">
               <div className="text-lg font-semibold text-neutral-200">Suggestions / Problems</div>
               <div className="text-sm text-neutral-500">Save feedback the moment you notice it. This uses your existing media_items.data JSON.</div>
             </div>
@@ -4156,7 +4524,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
               <div className="space-y-2">
                 {feedbackEntries.length ? (
                   feedbackEntries.map((f) => (
-                    <div key={f.id} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3">
+                    <div key={f.id} className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm">
                       <div className="flex flex-wrap items-start justify-between gap-3">
                         <div className="min-w-0 flex-1">
                           <div className="text-xs text-neutral-500 mb-1">
@@ -4184,8 +4552,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
         {/* SETTINGS PAGE */}
         {view === "settings" ? (
-          <div className="space-y-4">
-            <div>
+          <div className="space-y-4 max-w-5xl mx-auto">
+            <div className="text-center sm:text-left">
               <div className="text-lg font-semibold text-neutral-200">Settings</div>
               <div className="text-sm text-neutral-500">Personalize your Stack without changing the production database schema.</div>
             </div>
@@ -4217,92 +4585,115 @@ async function pickForMe(mode: "best" | "random" = "best") {
             </Panel>
 
             <Panel title="Site preferences">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
-                <Select
-                  label="Rating display"
-                  value={settings.ratingFormat ?? "ten"}
-                  onChange={(v) => updateSettings({ ratingFormat: v as RatingFormat })}
-                  options={[
-                    { value: "ten", label: "10-point scale" },
-                    { value: "five", label: "5-point scale" },
-                    { value: "stars", label: "Stars" },
-                    { value: "percent", label: "Percent" },
-                  ]}
-                />
-                <div>
-                  <div className="text-xs text-neutral-400 mb-1">Sound effects</div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Toggle
-                      label="Hover/click sounds"
-                      checked={!!settings.soundEffects}
-                      onChange={(v) => updateSettings({ soundEffects: v })}
-                    />
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-stretch">
+                <div className="rounded-2xl bg-neutral-950/60 border border-white/10 p-4 flex flex-col justify-between min-h-[152px]">
+                  <Select
+                    label="Rating display"
+                    value={settings.ratingFormat ?? "ten"}
+                    onChange={(v) => updateSettings({ ratingFormat: v as RatingFormat })}
+                    options={[
+                      { value: "ten", label: "10-point scale" },
+                      { value: "five", label: "5-point scale" },
+                      { value: "stars", label: "Stars" },
+                      { value: "percent", label: "Percent" },
+                    ]}
+                  />
+                  <div className="text-[11px] text-neutral-500 mt-3">
+                    Ratings are still saved as 0–10 internally. Current display: {ratingFormatLabel(settings.ratingFormat)}.
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-neutral-950/60 border border-white/10 p-4 flex flex-col justify-between min-h-[152px]">
+                  <Select
+                    label="Color theme"
+                    value={settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme}
+                    onChange={(v) => updateSettings({ colorTheme: v as StackColorTheme })}
+                    options={STACK_COLOR_THEME_OPTIONS.map((t) => ({ value: t.value, label: t.label }))}
+                  />
+
+                  <div className="mt-3 grid grid-cols-6 gap-1.5">
+                    {STACK_COLOR_THEME_OPTIONS.map((t) => {
+                      const theme = STACK_COLOR_THEMES[t.value];
+                      return (
+                        <button
+                          key={t.value}
+                          type="button"
+                          onClick={() => updateSettings({ colorTheme: t.value })}
+                          className={[
+                            "h-7 rounded-lg border transition",
+                            (settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme) === t.value
+                              ? "border-white/50 ring-2 ring-white/20"
+                              : "border-white/10 hover:border-white/25",
+                          ].join(" ")}
+                          style={{ background: theme.accent }}
+                          title={t.label}
+                        />
+                      );
+                    })}
+                  </div>
+
+                  <div className="text-[11px] text-neutral-500 mt-3">
+                    Current theme: {STACK_COLOR_THEME_OPTIONS.find((t) => t.value === (settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme))?.description}.
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-neutral-950/60 border border-white/10 p-4 min-h-[152px] space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <div>
+                      <div className="text-xs text-neutral-400 mb-1">Sound effects</div>
+                      <Toggle
+                        label="Hover/click sounds"
+                        checked={!!settings.soundEffects}
+                        onChange={(v) => updateSettings({ soundEffects: v })}
+                      />
+                    </div>
                     <button
                       type="button"
-                      onClick={() => playStackSoundEffect("click")}
+                      onClick={() => playStackSoundEffect("click", settings.soundVolume ?? 1)}
                       className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm"
                     >
                       Test sound
                     </button>
                   </div>
-                  <div className="text-[11px] text-neutral-500 mt-1">
-                    Turn this on, then click once or press Test sound to unlock audio in the browser.
+
+                  <label className="block">
+                    <div className="flex items-center justify-between gap-3 text-xs text-neutral-400 mb-1">
+                      <span>Sound volume</span>
+                      <span className="text-neutral-500">{Math.round((settings.soundVolume ?? 1) * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.25"
+                      max="2"
+                      step="0.05"
+                      value={settings.soundVolume ?? 1}
+                      onChange={(e) => updateSettings({ soundVolume: Number(e.target.value) })}
+                      className="w-full accent-emerald-500"
+                    />
+                  </label>
+
+                  <div className="text-[11px] text-neutral-500">
+                    Turn sounds on, then click once or press Test sound to unlock audio. Raise volume if the browser is quiet.
                   </div>
                 </div>
               </div>
-              <div className="text-xs text-neutral-500 mt-3">
-                Ratings are still saved as 0–10 internally so your existing data stays safe. Current display: {ratingFormatLabel(settings.ratingFormat)}.
-              </div>
-            </Panel>
-
-            <Panel title="Friend custom tags" right={<span className="text-xs text-neutral-500">{friendsList.length} friends</span>}>
-              {friendsList.length ? (
-                <div className="space-y-2">
-                  {friendsList.map((f) => {
-                    const display = getFriendDisplay(f.friend_id, f.friend?.username);
-
-                    return (
-                      <div key={f.friend_id} className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_260px] gap-3 items-center rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3">
-                        <div className="min-w-0">
-                          <div className="text-sm text-neutral-200 truncate">{display.primary}</div>
-                          <div className="text-[11px] text-neutral-600 truncate">{display.secondary}</div>
-                        </div>
-                        <div className="space-y-2">
-                          <input
-                            value={settings.friendNicknames?.[f.friend_id] ?? ""}
-                            onChange={(e) => updateFriendNickname(f.friend_id, e.target.value)}
-                            placeholder="Nickname / ID tag"
-                            className="w-full rounded-xl bg-neutral-900 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => removeFriend(f.friend_id)}
-                            className="w-full text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 text-neutral-200"
-                          >
-                            Remove friend
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div className="text-sm text-neutral-500">No friends yet.</div>
-              )}
             </Panel>
           </div>
         ) : null}
 
         {/* LIST PAGES */}
         {view !== "stats" && view !== "add" && view !== "friends" && view !== "feed" && view !== "discover" && view !== "feedback" && view !== "settings" ? (
-          <div className="space-y-4">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search title, notes, tags..."
-                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
-              />
+          <div className={view === "all" && boardView ? "space-y-4" : "space-y-4 max-w-5xl mx-auto"}>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
+              <label className="block">
+                <div className="text-xs text-neutral-400 mb-1">Search</div>
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search title, notes, tags..."
+                  className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
+                />
+              </label>
 
               <Select
                 label="Sort"
@@ -4658,7 +5049,7 @@ function MALRow({
 
           {/* Title + meta */}
           <div className="min-w-0">
-            <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1">
                 {/* TITLE */}
                 {isEditing ? (
@@ -4757,73 +5148,73 @@ function MALRow({
                     <span className="px-2 py-1 rounded-lg bg-sky-400/10 border border-sky-400/20 text-neutral-200">Private</span>
                   ) : null}
                 </div>
-              </div>
 
-              {/* ACTIONS */}
-              <div className="flex items-center gap-2 shrink-0">
-                {isEditing ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={saveEdit}
-                      className="text-xs px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
-                      title="Save"
-                    >
-                      Save
-                    </button>
-                    <button
-                      type="button"
-                      onClick={cancelEdit}
-                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                      title="Cancel"
-                    >
-                      Cancel
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => onUpdate({ favorite: !item.favorite })}
-                      className={[
-                        "text-xs px-3 py-2 rounded-xl border hover:bg-white/10",
-                        item.favorite ? "bg-amber-400/15 border-amber-400/25" : "bg-white/5 border-white/10",
-                      ].join(" ")}
-                      title={item.favorite ? "Remove favorite" : "Mark favorite"}
-                      aria-pressed={!!item.favorite}
-                    >
-                      {item.favorite ? "★" : "☆"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onUpdate({ isPrivate: !item.isPrivate })}
-                      className={[
-                        "text-xs px-3 py-2 rounded-xl border hover:bg-white/10",
-                        item.isPrivate ? "bg-sky-400/15 border-sky-400/25" : "bg-white/5 border-white/10",
-                      ].join(" ")}
-                      title={item.isPrivate ? "Make visible to friends later" : "Mark private"}
-                      aria-pressed={!!item.isPrivate}
-                    >
-                      {item.isPrivate ? "Private" : "Public"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setIsEditing(true)}
-                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                      title="Edit"
-                    >
-                      Edit
-                    </button>
-                    <button
-                      onClick={onDelete}
-                      className="text-xs px-3 py-2 rounded-xl stack-bad hover:opacity-95"
-                      title="Delete"
-                      type="button"
-                    >
-                      Delete
-                    </button>
-                  </>
-                )}
+                {/* ACTIONS */}
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  {isEditing ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={saveEdit}
+                        className="text-xs px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
+                        title="Save"
+                      >
+                        Save
+                      </button>
+                      <button
+                        type="button"
+                        onClick={cancelEdit}
+                        className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                        title="Cancel"
+                      >
+                        Cancel
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => onUpdate({ favorite: !item.favorite })}
+                        className={[
+                          "text-xs px-3 py-2 rounded-xl border hover:bg-white/10",
+                          item.favorite ? "bg-amber-400/15 border-amber-400/25" : "bg-white/5 border-white/10",
+                        ].join(" ")}
+                        title={item.favorite ? "Remove favorite" : "Mark favorite"}
+                        aria-pressed={!!item.favorite}
+                      >
+                        {item.favorite ? "★" : "☆"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onUpdate({ isPrivate: !item.isPrivate })}
+                        className={[
+                          "text-xs px-3 py-2 rounded-xl border hover:bg-white/10",
+                          item.isPrivate ? "bg-sky-400/15 border-sky-400/25" : "bg-white/5 border-white/10",
+                        ].join(" ")}
+                        title={item.isPrivate ? "Make visible to friends later" : "Mark private"}
+                        aria-pressed={!!item.isPrivate}
+                      >
+                        {item.isPrivate ? "Private" : "Public"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setIsEditing(true)}
+                        className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                        title="Edit"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        onClick={onDelete}
+                        className="text-xs px-3 py-2 rounded-xl stack-bad hover:opacity-95"
+                        title="Delete"
+                        type="button"
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -5139,24 +5530,27 @@ function CardDraggable({
               ) : null}
             </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-2 mt-3">
-              <select
-                value={item.status}
-                onChange={(e) => onUpdate({ status: e.target.value as Status })}
-                className="rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
-              >
-                <option value="completed">Completed</option>
-                <option value="in_progress">In Progress</option>
-                <option value="planned">Planned</option>
-                <option value="dropped">Dropped</option>
-              </select>
+            <div className="mt-3 pt-3 border-t border-white/10 space-y-2">
+              <label className="block">
+                <div className="text-[11px] text-neutral-500 mb-1">Status</div>
+                <select
+                  value={item.status}
+                  onChange={(e) => onUpdate({ status: e.target.value as Status })}
+                  className="w-full rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1.5 text-xs outline-none focus:border-neutral-500"
+                >
+                  <option value="completed">Completed</option>
+                  <option value="in_progress">In Progress</option>
+                  <option value="planned">Planned</option>
+                  <option value="dropped">Dropped</option>
+                </select>
+              </label>
 
-              <div className="flex flex-wrap items-center justify-end gap-1">
+              <div className="flex flex-wrap items-center justify-start gap-2">
                 <button
                   type="button"
                   onClick={() => onUpdate({ favorite: !item.favorite })}
                   className={[
-                    "text-xs px-2 py-1 rounded-lg border hover:bg-white/10",
+                    "text-xs px-2.5 py-1.5 rounded-lg border hover:bg-white/10",
                     item.favorite ? "bg-amber-400/15 border-amber-400/25" : "bg-white/5 border-white/10",
                   ].join(" ")}
                   title={item.favorite ? "Remove favorite" : "Mark favorite"}
@@ -5168,7 +5562,7 @@ function CardDraggable({
                   type="button"
                   onClick={() => onUpdate({ isPrivate: !item.isPrivate })}
                   className={[
-                    "text-xs px-2 py-1 rounded-lg border hover:bg-white/10",
+                    "text-xs px-2.5 py-1.5 rounded-lg border hover:bg-white/10",
                     item.isPrivate ? "bg-sky-400/15 border-sky-400/25" : "bg-white/5 border-white/10",
                   ].join(" ")}
                   title={item.isPrivate ? "Make visible to friends later" : "Mark private"}
@@ -5179,7 +5573,7 @@ function CardDraggable({
                 <button
                   type="button"
                   onClick={onDelete}
-                  className="text-xs px-3 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+                  className="text-xs px-3 py-1.5 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
                 >
                   Delete
                 </button>
@@ -5209,11 +5603,11 @@ function Panel({
   return (
     <div
       className={[
-        "stack-surface p-4 sm:p-6 rounded-2xl shadow-sm",
+        "stack-surface p-4 sm:p-6 rounded-3xl border border-white/10 shadow-xl shadow-black/10 backdrop-blur-xl mx-auto w-full",
         className || "",
       ].join(" ")}
     >
-      <div className="flex items-center justify-between gap-3 mb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4 text-center sm:text-left">
         <div className="text-sm font-medium text-neutral-200">{title}</div>
         {right ? <div className="shrink-0">{right}</div> : null}
       </div>
@@ -5224,7 +5618,7 @@ function Panel({
 
 function MiniStat({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
-    <div className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
+    <div className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-center">
       <div className="text-[11px] text-neutral-500">{label}</div>
       <div className="text-sm text-neutral-200 mt-1 truncate">{value}</div>
       {sub ? <div className="text-[11px] text-neutral-600 mt-1">{sub}</div> : null}
@@ -5235,7 +5629,7 @@ function MiniStat({ label, value, sub }: { label: string; value: string; sub?: s
 
 function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
   return (
-    <div className="bg-neutral-900/50 p-4 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm">
+    <div className="bg-neutral-900/50 p-4 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm text-center">
       <div className="text-xs text-neutral-400">{title}</div>
       <div className="text-2xl font-semibold tracking-tight mt-1">{value}</div>
       {sub ? <div className="text-[11px] text-neutral-500 mt-1">{sub}</div> : null}
@@ -5271,17 +5665,7 @@ function PieChartSimple({ data }: { data: Array<{ label: string; value: number }
   const cx = 45;
   const cy = 45;
 
-  // ✅ Nice, readable palette (loops if > length)
-  const COLORS = [
-    "#60a5fa", // blue
-    "#34d399", // green
-    "#fbbf24", // amber
-    "#f87171", // red
-    "#a78bfa", // purple
-    "#22d3ee", // cyan
-    "#fb7185", // pink
-    "#c084fc", // violet
-  ];
+  const COLORS = PIE_COLORS;
 
   const slices = data.map((d, idx) => {
     const v = Math.max(0, d.value || 0);
@@ -5303,7 +5687,7 @@ function PieChartSimple({ data }: { data: Array<{ label: string; value: number }
   });
 
   return (
-    <div className="shrink-0">
+    <div className="shrink-0 mx-auto sm:mx-0">
       <svg width={90} height={90} viewBox="0 0 90 90" className="block">
         <circle cx={cx} cy={cy} r={r} fill="transparent" stroke="white" strokeOpacity={0.08} />
         {slices}
@@ -5330,7 +5714,7 @@ function Select({
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
+        className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
       >
         {options.map((o) => (
           <option key={o.value} value={o.value}>
