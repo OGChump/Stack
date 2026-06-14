@@ -5,13 +5,23 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
-import { DndContext, DragEndEvent, useDraggable, useDroppable } from "@dnd-kit/core";
+import {
+  DndContext,
+  DragEndEvent,
+  MouseSensor,
+  TouchSensor,
+  useDraggable,
+  useDroppable,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
 
 /* ================= TYPES ================= */
 
 type MediaType = "movie" | "tv" | "anime" | "manga" | "book" | "game";
 type GroupMode = "none" | "day" | "month" | "year";
-type SortMode = "newest" | "oldest" | "title" | "rating_high" | "rating_low";
+type SortMode = "newest" | "oldest" | "title" | "rating_high" | "rating_low" | "updated" | "favorites";
+type RatingFormat = "ten" | "five" | "stars" | "percent";
 
 export type StackView =
   | "all"
@@ -21,7 +31,11 @@ export type StackView =
   | "dropped"
   | "stats"
   | "add"
-  | "friends";
+  | "friends"
+  | "feed"
+  | "discover"
+  | "feedback"
+  | "settings";
 
 const STATUSES = [
   { id: "completed", label: "Completed" },
@@ -31,6 +45,7 @@ const STATUSES = [
 ] as const;
 
 type Status = (typeof STATUSES)[number]["id"];
+type FriendLibraryStatusFilter = "all" | Status;
 
 type MediaItem = {
   id: string;
@@ -60,6 +75,10 @@ type MediaItem = {
   status: Status;
   tags: string[];
   createdAt: string; // ISO
+  updatedAt?: string; // ISO
+  favorite?: boolean;
+  isPrivate?: boolean;
+  withFriendIds?: string[];
 
   // Optional progress
   progressCur?: number;
@@ -102,7 +121,7 @@ type AnilistSearchResponse = {
   error?: string;
 };
 
-type Pick =
+type MediaPick =
   | {
       provider: "tmdb";
       title: string;
@@ -142,9 +161,50 @@ type Suggestion = {
   anilistType?: "ANIME" | "MANGA";
 };
 
+type StackSettings = {
+  displayName?: string;
+  usernameTag?: string;
+  profileBio?: string;
+  soundEffects?: boolean;
+  ratingFormat?: RatingFormat;
+  friendNicknames?: Record<string, string>;
+};
+
+type FeedbackEntry = {
+  id: string;
+  type: "suggestion" | "problem";
+  message: string;
+  createdAt: string;
+  status?: "new" | "reviewed" | "done";
+};
+
+type DiscoverCard = {
+  id: number;
+  title: string;
+  type: "movie" | "tv";
+  posterUrl?: string;
+  year?: string;
+  overview?: string;
+  tags?: string[];
+};
+
+type ActivityEntry = {
+  id: string;
+  actorId: string;
+  actorName: string;
+  itemTitle: string;
+  itemType: MediaType;
+  status: Status;
+  date: string;
+  favorite?: boolean;
+};
+
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
 const LOCAL_BOARD_VIEW_KEY = "stack-board-view-v1";
 
+function backupKeyForUser(uid?: string | null) {
+  return uid ? `${LOCAL_BACKUP_KEY}:${uid}` : LOCAL_BACKUP_KEY;
+}
 
 const TYPE_LABEL: Record<MediaType, string> = {
   movie: "Movie",
@@ -155,10 +215,142 @@ const TYPE_LABEL: Record<MediaType, string> = {
   game: "Game",
 };
 
+const PIE_COLORS = [
+  "#60a5fa",
+  "#34d399",
+  "#fbbf24",
+  "#f87171",
+  "#a78bfa",
+  "#22d3ee",
+  "#fb7185",
+  "#c084fc",
+];
 
+const DEFAULT_SETTINGS: Required<Pick<StackSettings, "soundEffects" | "ratingFormat">> &
+  Omit<StackSettings, "soundEffects" | "ratingFormat"> = {
+  displayName: "",
+  usernameTag: "",
+  profileBio: "",
+  soundEffects: false,
+  ratingFormat: "ten",
+  friendNicknames: {},
+};
 
 function uid() {
-  return crypto.randomUUID();
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+
+  // Browser fallback for older Safari/WebView versions.
+  return `stack_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeSettings(raw: unknown): StackSettings {
+  const obj = raw && typeof raw === "object" ? (raw as Record<string, any>) : {};
+  const ratingFormat = ["ten", "five", "stars", "percent"].includes(obj.ratingFormat)
+    ? (obj.ratingFormat as RatingFormat)
+    : DEFAULT_SETTINGS.ratingFormat;
+
+  return {
+    ...DEFAULT_SETTINGS,
+    displayName: typeof obj.displayName === "string" ? obj.displayName : "",
+    usernameTag: typeof obj.usernameTag === "string" ? obj.usernameTag : "",
+    profileBio: typeof obj.profileBio === "string" ? obj.profileBio : "",
+    soundEffects: typeof obj.soundEffects === "boolean" ? obj.soundEffects : DEFAULT_SETTINGS.soundEffects,
+    ratingFormat,
+    friendNicknames:
+      obj.friendNicknames && typeof obj.friendNicknames === "object" && !Array.isArray(obj.friendNicknames)
+        ? (Object.fromEntries(
+            Object.entries(obj.friendNicknames).filter(
+              ([k, v]) => typeof k === "string" && typeof v === "string"
+            )
+          ) as Record<string, string>)
+        : {},
+  };
+}
+
+function formatRatingValue(rating: number | undefined, format: RatingFormat = "ten") {
+  if (typeof rating !== "number" || !Number.isFinite(rating)) return "—";
+  const r = clamp(rating, 0, 10);
+
+  if (format === "five") return `${(r / 2).toFixed(1)} / 5`;
+  if (format === "percent") return `${Math.round(r * 10)}%`;
+  if (format === "stars") {
+    const filled = Math.round(r / 2);
+    return `${"★".repeat(filled)}${"☆".repeat(Math.max(0, 5 - filled))}`;
+  }
+
+  return `${r.toFixed(1)} / 10`;
+}
+
+function ratingFormatLabel(format: RatingFormat = "ten") {
+  if (format === "five") return "5-point scale";
+  if (format === "stars") return "Stars";
+  if (format === "percent") return "Percent";
+  return "10-point scale";
+}
+
+function sortMediaItems<T extends MediaItem>(list: T[], sortMode: SortMode): T[] {
+  const out = list.slice();
+
+  out.sort((a, b) => {
+    if (sortMode === "title") return a.title.localeCompare(b.title);
+    if (sortMode === "rating_high") return (b.rating ?? -1) - (a.rating ?? -1);
+    if (sortMode === "rating_low") return (a.rating ?? 999) - (b.rating ?? 999);
+
+    const createdA = new Date((a.dateFinished ?? a.createdAt) as string).getTime();
+    const createdB = new Date((b.dateFinished ?? b.createdAt) as string).getTime();
+    const updatedA = new Date((a.updatedAt ?? a.createdAt) as string).getTime();
+    const updatedB = new Date((b.updatedAt ?? b.createdAt) as string).getTime();
+
+    if (sortMode === "updated") return updatedB - updatedA;
+    if (sortMode === "favorites") {
+      const favDiff = Number(!!b.favorite) - Number(!!a.favorite);
+      return favDiff || updatedB - updatedA;
+    }
+
+    return sortMode === "oldest" ? createdA - createdB : createdB - createdA;
+  });
+
+  return out;
+}
+
+function playStackSoundEffect(kind: "hover" | "click" = "click") {
+  if (typeof window === "undefined") return;
+
+  try {
+    const AudioCtor = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtor) return;
+
+    const ctx = new AudioCtor();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    osc.type = "sine";
+    osc.frequency.value = kind === "click" ? 520 : 420;
+    gain.gain.value = kind === "click" ? 0.035 : 0.018;
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start();
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + (kind === "click" ? 0.055 : 0.035));
+    osc.stop(ctx.currentTime + (kind === "click" ? 0.06 : 0.04));
+
+    window.setTimeout(() => {
+      try {
+        ctx.close();
+      } catch {}
+    }, 120);
+  } catch {}
+}
+
+function omitKnownDataKeys(raw: unknown) {
+  const obj = raw && typeof raw === "object" && raw !== null && !Array.isArray(raw) ? { ...(raw as Record<string, any>) } : {};
+  delete obj.items;
+  delete obj.settings;
+  delete obj.feedback;
+  return obj;
 }
 
 async function anilistRandomManga(): Promise<{ title: string; anilistId: number; posterUrl?: string }> {
@@ -396,7 +588,16 @@ async function anilistDetails(
 // ================= RECOMMENDER HELPERS (TMDB) =================
 
 type TmdbDiscoverResult = {
-  results?: Array<{ id: number; title?: string; name?: string; poster_path?: string | null }>;
+  results?: Array<{
+    id: number;
+    title?: string;
+    name?: string;
+    poster_path?: string | null;
+    overview?: string;
+    release_date?: string;
+    first_air_date?: string;
+    genre_ids?: number[];
+  }>;
   total_pages?: number;
 };
 
@@ -623,6 +824,9 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [statsMonth, setStatsMonth] = useState<string>("all");
   const [items, setItems] = useState<MediaItem[]>([]);
   const [userId, setUserId] = useState<string | null>(null);
+  const [settings, setSettings] = useState<StackSettings>(DEFAULT_SETTINGS);
+  const [feedbackEntries, setFeedbackEntries] = useState<FeedbackEntry[]>([]);
+  const [cloudExtraData, setCloudExtraData] = useState<Record<string, any>>({});
 
   const [query, setQuery] = useState("");
   const groupMode: GroupMode = "none";
@@ -632,7 +836,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   useEffect(() => {
     try {
       const raw = localStorage.getItem(LOCAL_BOARD_VIEW_KEY);
-      if (raw !== null) setBoardView(raw === "1" || raw === "true");
+      if (raw !== null) {
+        setBoardView(raw === "1" || raw === "true");
+        return;
+      }
+
+      // Keep desktop the same, but make first-time mobile use default to the safer list view.
+      if (typeof window !== "undefined" && window.matchMedia("(max-width: 640px)").matches) {
+        setBoardView(false);
+      }
     } catch {}
   }, []);
 
@@ -659,6 +871,17 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     }>
   >([]);
 
+  const [outgoingRequests, setOutgoingRequests] = useState<
+    Array<{
+      id: string;
+      requester_id: string;
+      requested_id: string;
+      status: string;
+      created_at?: string;
+      requested?: { username?: string | null } | null;
+    }>
+  >([]);
+
   const [friendsList, setFriendsList] = useState<
     Array<{
       friend_id: string;
@@ -668,7 +891,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
 
 
-  const [picks, setPicks] = useState<Pick[]>([]);
+  const [picks, setPicks] = useState<MediaPick[]>([]);
   const [pickStatus, setPickStatus] = useState("");
   const seenPickKeysRef = useRef<Set<string>>(new Set());
 
@@ -739,7 +962,7 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
   const [form, setForm] = useState<Partial<MediaItem>>({
     title: "",
     type: "movie",
-    status: "completed",
+    status: "planned",
     tags: [],
     inTheaters: false,
     notes: "",
@@ -769,7 +992,85 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
   // ✅ Friends UI
   const [friendsTab, setFriendsTab] = useState<"friends" | "requests">("friends");
   const [friendsQuery, setFriendsQuery] = useState("");
-  
+  const [friendLibraryFriendId, setFriendLibraryFriendId] = useState<string>("all");
+  const [friendLibraryStatus, setFriendLibraryStatus] = useState<FriendLibraryStatusFilter>("all");
+  const [friendLibrarySortMode, setFriendLibrarySortMode] = useState<SortMode>("updated");
+  const [selectedFriendIds, setSelectedFriendIds] = useState<string[]>([]);
+  const [collapsedStatuses, setCollapsedStatuses] = useState<Set<Status>>(new Set());
+
+  const [feedbackType, setFeedbackType] = useState<"suggestion" | "problem">("suggestion");
+  const [feedbackText, setFeedbackText] = useState("");
+
+  const [discoverType, setDiscoverType] = useState<"movie" | "tv">("movie");
+  const [discoverGenres, setDiscoverGenres] = useState<Array<{ id: number; name: string }>>([]);
+  const [discoverGenreId, setDiscoverGenreId] = useState<string>("all");
+  const [discoverResults, setDiscoverResults] = useState<DiscoverCard[]>([]);
+  const [discoverStatus, setDiscoverStatus] = useState("");
+
+  const [friendActivityRows, setFriendActivityRows] = useState<Array<{ user_id: string; data: any }>>([]);
+  const [friendActivityStatus, setFriendActivityStatus] = useState("");
+
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 180, tolerance: 8 } })
+  );
+
+  const friendsNameById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const f of friendsList) {
+      const nickname = settings.friendNicknames?.[f.friend_id]?.trim();
+      map.set(f.friend_id, nickname || f.friend?.username || f.friend_id);
+    }
+    return map;
+  }, [friendsList, settings.friendNicknames]);
+
+  const getFriendDisplay = useCallback(
+    (friendId: string, username?: string | null) => {
+      const nickname = settings.friendNicknames?.[friendId]?.trim();
+      const fallbackName = username?.trim() || friendId;
+
+      return {
+        primary: nickname || fallbackName,
+        secondary: nickname ? `${fallbackName} • ${friendId}` : friendId,
+        hasCustomTag: !!nickname,
+      };
+    },
+    [settings.friendNicknames]
+  );
+
+  const updateSettings = useCallback((patch: Partial<StackSettings>) => {
+    setSettings((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  const updateFriendNickname = useCallback((friendId: string, nickname: string) => {
+    setSettings((prev) => {
+      const nextNicknames = { ...(prev.friendNicknames ?? {}) };
+      const cleanNickname = nickname.trim();
+
+      if (cleanNickname) nextNicknames[friendId] = cleanNickname;
+      else delete nextNicknames[friendId];
+
+      return {
+        ...prev,
+        friendNicknames: nextNicknames,
+      };
+    });
+  }, []);
+
+  const toggleSelectedFriend = useCallback((friendId: string) => {
+    setSelectedFriendIds((prev) =>
+      prev.includes(friendId) ? prev.filter((id) => id !== friendId) : [...prev, friendId]
+    );
+  }, []);
+
+  const toggleCollapsedStatus = useCallback((status: Status) => {
+    setCollapsedStatuses((prev) => {
+      const next = new Set(prev);
+      if (next.has(status)) next.delete(status);
+      else next.add(status);
+      return next;
+    });
+  }, []);
 
   /* ================= NAV ================= */
 
@@ -789,6 +1090,10 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
       { href: "/stats", label: "Stats", key: "stats" as StackView, icon: "pie" as const },
       { href: "/add", label: "Add", key: "add" as StackView, icon: "plus" as const },
       { href: "/friends", label: "Friends", key: "friends" as StackView, icon: "users" as const },
+      { href: "/feed", label: "Feed", key: "feed" as StackView, icon: "feed" as const },
+      { href: "/discover", label: "Discover", key: "discover" as StackView, icon: "discover" as const },
+      { href: "/feedback", label: "Feedback", key: "feedback" as StackView, icon: "feedback" as const },
+      { href: "/settings", label: "Settings", key: "settings" as StackView, icon: "settings" as const },
     ],
     []
   );
@@ -796,9 +1101,11 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
 
   /* ================= LOCAL BACKUP ================= */
 
-  const loadLocalBackup = useCallback((): MediaItem[] | null => {
+  const loadLocalBackup = useCallback((uid?: string | null): MediaItem[] | null => {
     try {
-      const raw = localStorage.getItem(LOCAL_BACKUP_KEY);
+      const primary = localStorage.getItem(backupKeyForUser(uid));
+      const fallback = uid ? localStorage.getItem(LOCAL_BACKUP_KEY) : null;
+      const raw = primary || fallback;
       if (!raw) return null;
       const parsed = JSON.parse(raw) as unknown;
       return Array.isArray(parsed) ? (parsed as MediaItem[]) : null;
@@ -807,9 +1114,9 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
     }
   }, []);
 
-  const saveLocalBackup = useCallback((next: MediaItem[]) => {
+  const saveLocalBackup = useCallback((next: MediaItem[], uid?: string | null) => {
     try {
-      localStorage.setItem(LOCAL_BACKUP_KEY, JSON.stringify(next));
+      localStorage.setItem(backupKeyForUser(uid), JSON.stringify(next));
     } catch {}
   }, []);
 
@@ -909,6 +1216,28 @@ const loadIncomingFriendRequests = useCallback(
   [userId, loadFriends]
 );
 
+const loadOutgoingFriendRequests = useCallback(
+  async (uid?: string) => {
+    const me = uid ?? userId;
+    if (!me) return;
+
+    const { data, error } = await supabase
+      .from("friend_requests")
+      .select("id, requester_id, requested_id, status, created_at, requested:requested_id(username)")
+      .eq("requester_id", me)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error(error);
+      return;
+    }
+
+    setOutgoingRequests((data ?? []) as any[]);
+  },
+  [userId]
+);
+
 async function acceptFriendRequest(
   requestId: string,
   requesterId: string,
@@ -979,6 +1308,53 @@ async function declineFriendRequest(requestId: string) {
 
   setFriendStatus("Request declined.");
   await loadIncomingFriendRequests(userId, { autoAccept: false });
+}
+
+async function removeFriend(friendId: string) {
+  if (!userId) return;
+
+  const friendName = friendsNameById.get(friendId) ?? friendId;
+  const confirmed =
+    typeof window === "undefined"
+      ? true
+      : window.confirm(`Remove ${friendName} from your friends list?`);
+
+  if (!confirmed) return;
+
+  const { error } = await supabase
+    .from("friends")
+    .delete()
+    .eq("user_id", userId)
+    .eq("friend_id", friendId);
+
+  if (error) {
+    console.error(error);
+    setFriendStatus(error.message || "Failed to remove friend.");
+    return;
+  }
+
+  // Best-effort cleanup of the mirrored row. Some RLS setups may block this,
+  // but the friend is removed from your own list either way.
+  const reciprocal = await supabase
+    .from("friends")
+    .delete()
+    .eq("user_id", friendId)
+    .eq("friend_id", userId);
+
+  if (reciprocal.error) console.warn(reciprocal.error);
+
+  setSettings((prev) => {
+    const nextNicknames = { ...(prev.friendNicknames ?? {}) };
+    delete nextNicknames[friendId];
+    return { ...prev, friendNicknames: nextNicknames };
+  });
+
+  setSelectedFriendIds((prev) => prev.filter((id) => id !== friendId));
+  setFriendActivityRows((prev) => prev.filter((row) => row.user_id !== friendId));
+  setFriendLibraryFriendId((prev) => (prev === friendId ? "all" : prev));
+  setFriendStatus(`Removed ${friendName} from your friends list.`);
+
+  await loadFriends(userId);
 }
 
 async function sendFriendRequest() {
@@ -1055,6 +1431,7 @@ async function sendFriendRequest() {
 
   setFriendStatus(`Friend request sent to ${profile.username ?? "that user"}.`);
   setInputUsername("");
+  await loadOutgoingFriendRequests(userId);
 }
 
 const loadCloud = useCallback(
@@ -1070,7 +1447,7 @@ const loadCloud = useCallback(
 
     if (error) {
       console.error(error);
-      const backup = loadLocalBackup();
+      const backup = loadLocalBackup(uidStr);
       if (backup) setItems(backup);
       setCloudLoaded(true);
       setSaveStatus("Loaded (local backup)");
@@ -1078,35 +1455,48 @@ const loadCloud = useCallback(
     }
 
     const raw = data?.data as unknown;
+    const rawObj = raw && typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as any) : null;
 
     const parsedItems =
-      raw &&
-      typeof raw === "object" &&
-      raw !== null &&
-      "items" in raw &&
-      Array.isArray((raw as any).items)
-        ? ((raw as any).items as any[])
+      rawObj &&
+      "items" in rawObj &&
+      Array.isArray(rawObj.items)
+        ? (rawObj.items as any[])
             .filter((x) => x && typeof x.id === "string" && typeof x.title === "string")
             .map((x) => x as MediaItem)
         : null;
 
-
     if (parsedItems) {
       setItems(parsedItems);
-      saveLocalBackup(parsedItems);
+      setSettings(normalizeSettings(rawObj?.settings));
+      setFeedbackEntries(
+        Array.isArray(rawObj?.feedback)
+          ? (rawObj.feedback as any[])
+              .filter((x) => x && typeof x.id === "string" && typeof x.message === "string")
+              .map((x) => ({
+                id: x.id,
+                type: x.type === "problem" ? "problem" : "suggestion",
+                message: String(x.message),
+                createdAt: typeof x.createdAt === "string" ? x.createdAt : new Date().toISOString(),
+                status: x.status === "reviewed" || x.status === "done" ? x.status : "new",
+              }))
+          : []
+      );
+      setCloudExtraData(omitKnownDataKeys(raw));
+      saveLocalBackup(parsedItems, uidStr);
       setCloudLoaded(true);
       setSaveStatus("Loaded");
       return;
     }
 
+    const initialData = { items: [], settings: DEFAULT_SETTINGS, feedback: [] };
     const up = await supabase
       .from("media_items")
-      .upsert([{ user_id: uidStr, data: { items: [] } }], { onConflict: "user_id" });
-
+      .upsert([{ user_id: uidStr, data: initialData }], { onConflict: "user_id" });
 
     if (up.error) {
       console.error(up.error);
-      const backup = loadLocalBackup();
+      const backup = loadLocalBackup(uidStr);
       if (backup) setItems(backup);
       setCloudLoaded(true);
       setSaveStatus("Loaded (local backup)");
@@ -1114,7 +1504,10 @@ const loadCloud = useCallback(
     }
 
     setItems([]);
-    saveLocalBackup([]);
+    setSettings(DEFAULT_SETTINGS);
+    setFeedbackEntries([]);
+    setCloudExtraData({});
+    saveLocalBackup([], uidStr);
     setCloudLoaded(true);
     setSaveStatus("Loaded");
   },
@@ -1122,15 +1515,22 @@ const loadCloud = useCallback(
 );
 
 const saveCloud = useCallback(
-  async (uidStr: string, next: MediaItem[]) => {
-    saveLocalBackup(next);
+  async (uidStr: string, next: MediaItem[], nextSettings: StackSettings, nextFeedback: FeedbackEntry[]) => {
+    saveLocalBackup(next, uidStr);
     if (!cloudLoaded) return;
 
     setSaveStatus("Saving…");
 
+    const dataPayload = {
+      ...cloudExtraData,
+      items: next,
+      settings: normalizeSettings(nextSettings),
+      feedback: nextFeedback,
+    };
+
     const { error } = await supabase
       .from("media_items")
-      .upsert([{ user_id: uidStr, data: { items: next } }], { onConflict: "user_id" });
+      .upsert([{ user_id: uidStr, data: dataPayload }], { onConflict: "user_id" });
 
     if (error) {
       console.error(error);
@@ -1140,19 +1540,20 @@ const saveCloud = useCallback(
 
     setSaveStatus("Saved");
   },
-  [cloudLoaded, saveLocalBackup]
+  [cloudLoaded, saveLocalBackup, cloudExtraData]
 );
 
 useEffect(() => {
-  const backup = loadLocalBackup();
+  const backup = loadLocalBackup(null);
   if (backup) setItems(backup);
 }, [loadLocalBackup]);
 
 useEffect(() => {
   if (!userId) return;
   loadIncomingFriendRequests(userId);
+  loadOutgoingFriendRequests(userId);
   loadFriends(userId);
-}, [userId, loadIncomingFriendRequests, loadFriends]);
+}, [userId, loadIncomingFriendRequests, loadOutgoingFriendRequests, loadFriends]);
 
 useEffect(() => {
   let mounted = true;
@@ -1178,9 +1579,29 @@ useEffect(() => {
 }, [loadCloud]);
 
 useEffect(() => {
-  if (userId) saveCloud(userId, items);
-  else saveLocalBackup(items);
-}, [items, userId, saveCloud, saveLocalBackup]);
+  if (!userId || !cloudLoaded) return;
+
+  const reloadFromCloud = () => {
+    loadCloud(userId);
+  };
+
+  const onVisibilityChange = () => {
+    if (document.visibilityState === "visible") reloadFromCloud();
+  };
+
+  window.addEventListener("focus", reloadFromCloud);
+  document.addEventListener("visibilitychange", onVisibilityChange);
+
+  return () => {
+    window.removeEventListener("focus", reloadFromCloud);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+  };
+}, [userId, cloudLoaded, loadCloud]);
+
+useEffect(() => {
+  if (userId) saveCloud(userId, items, settings, feedbackEntries);
+  else saveLocalBackup(items, null);
+}, [items, settings, feedbackEntries, userId, saveCloud, saveLocalBackup]);
 
 
 
@@ -1190,7 +1611,7 @@ function addItem(e: React.SyntheticEvent) {
   e.preventDefault();
   if (!form.title) return;
 
-  const status = (form.status as Status) ?? "completed";
+  const status = (form.status as Status) ?? "planned";
 
   const manualDate = (form.dateFinished || "").trim();
   const autoDate = status === "completed" ? todayYMD() : "";
@@ -1235,7 +1656,11 @@ function addItem(e: React.SyntheticEvent) {
     tags,
     rewatchCount,
     createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
     rating,
+    favorite: false,
+    isPrivate: false,
+    withFriendIds: selectedFriendIds.length ? selectedFriendIds : undefined,
 
     tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
     tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
@@ -1261,7 +1686,7 @@ function addItem(e: React.SyntheticEvent) {
   setForm((prev) => ({
     title: "",
     type: prev.type ?? "movie",
-    status: "completed",
+    status: "planned",
     tags: [],
     inTheaters: false,
     notes: "",
@@ -1289,6 +1714,7 @@ function addItem(e: React.SyntheticEvent) {
   setRewatchText("0");
   setProgressCurText("");
   setProgressTotalText("");
+  setSelectedFriendIds([]);
 
 }
 
@@ -1315,11 +1741,13 @@ function removeItem(id: string) {
 
 // ✅ Smart status + smart date + progress auto-complete
 function updateItem(id: string, patch: Partial<MediaItem>) {
+  const nowIso = new Date().toISOString();
+
   setItems((prev) =>
     prev.map((x) => {
       if (x.id !== id) return x;
 
-      const merged: MediaItem = { ...x, ...patch };
+      const merged: MediaItem = { ...x, ...patch, updatedAt: nowIso };
 
       const hadCompleted = x.status === "completed";
       const nowCompleted = merged.status === "completed";
@@ -1629,7 +2057,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
   const keepManual = opts?.keepManualTags ?? true;
 
   const getCurrent = () => {
-    const { type = "movie", status = "completed" } = formRef.current ?? {};
+    const { type = "movie", status = "planned" } = formRef.current ?? {};
     return { type: type as MediaType, status: status as Status };
   };
 
@@ -1960,17 +2388,247 @@ async function pickForMe(mode: "best" | "random" = "best") {
     [applySuggestion]
   );
 
+  useEffect(() => {
+    if (!settings.soundEffects) return;
+    if (typeof window === "undefined") return;
+
+    let lastHover = 0;
+
+    const isInteractive = (target: EventTarget | null) =>
+      target instanceof Element && !!target.closest('button,a,[role="button"],select,input,textarea');
+
+    const onMouseOver = (e: MouseEvent) => {
+      if (!isInteractive(e.target)) return;
+      const now = Date.now();
+      if (now - lastHover < 120) return;
+      lastHover = now;
+      playStackSoundEffect("hover");
+    };
+
+    const onClick = (e: MouseEvent) => {
+      if (!isInteractive(e.target)) return;
+      playStackSoundEffect("click");
+    };
+
+    document.addEventListener("mouseover", onMouseOver, true);
+    document.addEventListener("click", onClick, true);
+
+    return () => {
+      document.removeEventListener("mouseover", onMouseOver, true);
+      document.removeEventListener("click", onClick, true);
+    };
+  }, [settings.soundEffects]);
+
+  useEffect(() => {
+    if (view !== "discover") return;
+
+    let active = true;
+    setDiscoverStatus("Loading genres…");
+
+    tmdbGenreList(discoverType)
+      .then((genres) => {
+        if (!active) return;
+        setDiscoverGenres(genres);
+        setDiscoverStatus("");
+      })
+      .catch((e: unknown) => {
+        if (!active) return;
+        const msg = e instanceof Error ? e.message : "Could not load genres.";
+        setDiscoverStatus(msg);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [view, discoverType]);
+
+  const browseDiscover = useCallback(async () => {
+    try {
+      setDiscoverStatus("Finding titles…");
+      setDiscoverResults([]);
+
+      const genreIds = discoverGenreId === "all" ? [] : [Number(discoverGenreId)].filter((n) => Number.isFinite(n));
+      const results = await tmdbDiscoverByGenres(discoverType, genreIds);
+      const genreNameById = new Map(discoverGenres.map((g) => [g.id, g.name]));
+
+      const cards = results.slice(0, 20).map((r) => {
+        const title = (r.title || r.name || "Untitled").trim();
+        return {
+          id: r.id,
+          title,
+          type: discoverType,
+          posterUrl: r.poster_path ? `https://image.tmdb.org/t/p/w500${r.poster_path}` : undefined,
+          year: (discoverType === "movie" ? r.release_date : r.first_air_date)?.slice(0, 4) || undefined,
+          overview: r.overview,
+          tags: (r.genre_ids ?? []).map((id) => genreNameById.get(id)).filter((x): x is string => !!x),
+        } satisfies DiscoverCard;
+      });
+
+      setDiscoverResults(cards);
+      setDiscoverStatus(cards.length ? `Found ${cards.length} titles.` : "No results found.");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Discover failed.";
+      setDiscoverStatus(msg);
+    }
+  }, [discoverType, discoverGenreId, discoverGenres]);
+
+  const addDiscoverItem = useCallback((card: DiscoverCard) => {
+    const now = new Date().toISOString();
+    const item: MediaItem = {
+      id: uid(),
+      title: card.title,
+      type: card.type,
+      status: "planned",
+      tags: card.tags ?? [],
+      createdAt: now,
+      updatedAt: now,
+      posterUrl: card.posterUrl,
+      tmdbId: card.id,
+      tmdbType: card.type,
+      favorite: false,
+      isPrivate: false,
+      rewatchCount: 0,
+    };
+
+    setItems((prev) => [item, ...prev]);
+    setDiscoverStatus(`Added ${card.title} to Planned.`);
+  }, []);
+
+  const submitFeedback = useCallback((e: React.SyntheticEvent) => {
+    e.preventDefault();
+    const message = feedbackText.trim();
+    if (!message) return;
+
+    const entry: FeedbackEntry = {
+      id: uid(),
+      type: feedbackType,
+      message,
+      createdAt: new Date().toISOString(),
+      status: "new",
+    };
+
+    setFeedbackEntries((prev) => [entry, ...prev]);
+    setFeedbackText("");
+  }, [feedbackText, feedbackType]);
+
+  const loadFriendActivity = useCallback(async () => {
+    if (!friendsList.length) {
+      setFriendActivityRows([]);
+      setFriendActivityStatus("No friends yet.");
+      return;
+    }
+
+    try {
+      setFriendActivityStatus("Loading friend activity…");
+      const friendIds = friendsList.map((f) => f.friend_id);
+      const { data, error } = await supabase
+        .from("media_items")
+        .select("user_id,data")
+        .in("user_id", friendIds);
+
+      if (error) {
+        console.error(error);
+        setFriendActivityStatus("Friend activity is unavailable with the current sharing rules.");
+        return;
+      }
+
+      setFriendActivityRows((data ?? []) as Array<{ user_id: string; data: any }>);
+      setFriendActivityStatus(data?.length ? "Loaded." : "No friend activity found yet.");
+    } catch {
+      setFriendActivityStatus("Friend activity is unavailable right now.");
+    }
+  }, [friendsList]);
+
+  useEffect(() => {
+    if (view === "feed" || view === "friends") loadFriendActivity();
+  }, [view, loadFriendActivity]);
+
+  const activityFeed = useMemo(() => {
+    const selfName = settings.displayName?.trim() || settings.usernameTag?.trim() || "You";
+    const entries: ActivityEntry[] = [];
+
+    for (const i of items) {
+      const date = i.updatedAt ?? i.createdAt;
+      entries.push({
+        id: `self:${i.id}`,
+        actorId: userId ?? "self",
+        actorName: selfName,
+        itemTitle: i.title,
+        itemType: i.type,
+        status: i.status,
+        date,
+        favorite: i.favorite,
+      });
+    }
+
+    for (const row of friendActivityRows) {
+      const actorName = friendsNameById.get(row.user_id) ?? row.user_id;
+      const friendItems = Array.isArray(row?.data?.items) ? (row.data.items as MediaItem[]) : [];
+
+      for (const i of friendItems) {
+        if (i.isPrivate) continue;
+        entries.push({
+          id: `friend:${row.user_id}:${i.id}`,
+          actorId: row.user_id,
+          actorName,
+          itemTitle: i.title,
+          itemType: i.type,
+          status: i.status,
+          date: i.updatedAt ?? i.createdAt,
+          favorite: i.favorite,
+        });
+      }
+    }
+
+    return entries
+      .filter((e) => e.date)
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+      .slice(0, 50);
+  }, [items, userId, settings.displayName, settings.usernameTag, friendActivityRows, friendsNameById]);
+
+  const friendLibraryItems = useMemo(() => {
+    const rows: Array<MediaItem & { __ownerId: string; __ownerName: string }> = [];
+
+    for (const row of friendActivityRows) {
+      if (friendLibraryFriendId !== "all" && row.user_id !== friendLibraryFriendId) continue;
+
+      const ownerName = friendsNameById.get(row.user_id) ?? row.user_id;
+      const friendItems = Array.isArray(row?.data?.items) ? (row.data.items as MediaItem[]) : [];
+
+      for (const item of friendItems) {
+        if (!item || item.isPrivate) continue;
+        if (friendLibraryStatus !== "all" && item.status !== friendLibraryStatus) continue;
+
+        rows.push({
+          ...item,
+          __ownerId: row.user_id,
+          __ownerName: ownerName,
+        });
+      }
+    }
+
+    return sortMediaItems(rows, friendLibrarySortMode);
+  }, [friendActivityRows, friendLibraryFriendId, friendLibraryStatus, friendLibrarySortMode, friendsNameById]);
+
   /* ================= FILTER ================= */
   const filteredFriendsList = useMemo(() => {
     const q = friendsQuery.trim().toLowerCase();
-    if (!q) return friendsList;
 
-    return friendsList.filter((f) => {
-      const name = (f.friend?.username ?? "").toLowerCase();
-      const id = (f.friend_id ?? "").toLowerCase();
-      return name.includes(q) || id.includes(q);
-    });
-  }, [friendsList, friendsQuery]);
+    return friendsList
+      .slice()
+      .sort((a, b) => {
+        const aName = settings.friendNicknames?.[a.friend_id]?.trim() || a.friend?.username || a.friend_id;
+        const bName = settings.friendNicknames?.[b.friend_id]?.trim() || b.friend?.username || b.friend_id;
+        return aName.localeCompare(bName);
+      })
+      .filter((f) => {
+        if (!q) return true;
+        const name = (f.friend?.username ?? "").toLowerCase();
+        const nickname = (settings.friendNicknames?.[f.friend_id] ?? "").toLowerCase();
+        const id = (f.friend_id ?? "").toLowerCase();
+        return name.includes(q) || nickname.includes(q) || id.includes(q);
+      });
+  }, [friendsList, friendsQuery, settings.friendNicknames]);
 
   const filteredIncomingRequests = useMemo(() => {
     const q = friendsQuery.trim().toLowerCase();
@@ -1996,17 +2654,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
       out = out.filter((i) => [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q)));
     }
 
-    out.sort((a, b) => {
-      if (sortMode === "title") return a.title.localeCompare(b.title);
-      if (sortMode === "rating_high") return (b.rating ?? -1) - (a.rating ?? -1);
-      if (sortMode === "rating_low") return (a.rating ?? 999) - (b.rating ?? 999);
-
-      const ad = new Date((a.dateFinished ?? a.createdAt) as string).getTime();
-      const bd = new Date((b.dateFinished ?? b.createdAt) as string).getTime();
-      return sortMode === "oldest" ? ad - bd : bd - ad;
-    });
-
-    return out;
+    return sortMediaItems(out, sortMode);
   }, [items, view, query, sortMode]);
 
   const grouped = useMemo(() => {
@@ -2341,9 +2989,16 @@ async function pickForMe(mode: "best" | "random" = "best") {
     return uniqTags([...(autoTags ?? []), ...(manualTags ?? [])]);
   }, [autoTags, manualTags]);
 
+  const isWideBoard = view === "all" && boardView;
+
   return (
     <div className="min-h-screen stack-bg">
-      <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+      <div
+        className={[
+          isWideBoard ? "max-w-[104rem]" : "max-w-6xl",
+          "mx-auto px-4 sm:px-6 py-6 space-y-6 min-w-0 overflow-x-hidden",
+        ].join(" ")}
+      >
         {/* Header */}
         <header className="space-y-3">
           <div className="flex items-end justify-between gap-4">
@@ -2388,8 +3043,16 @@ async function pickForMe(mode: "best" | "random" = "best") {
                       <span className="text-[clamp(1.0rem,2.4vw,1.35rem)] leading-none">+</span>
                     ) : n.icon === "pie" ? (
                       <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">◔</span>
-                    ) : (
+                    ) : n.icon === "users" ? (
                       <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">👥</span>
+                    ) : n.icon === "feed" ? (
+                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">≡</span>
+                    ) : n.icon === "discover" ? (
+                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">⌕</span>
+                    ) : n.icon === "feedback" ? (
+                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">!</span>
+                    ) : (
+                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">⚙</span>
                     )}
                   </Link>
                 ))}
@@ -2423,7 +3086,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
               </div>
             </div>
             {/* Top KPIs */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
               <StatCard title="Total items" value={items.length.toString()} sub={`${statusCounts.completed} completed`} />
               <StatCard title="Completed" value={totalCompleted.toString()} sub="(after excludes)" />
               <StatCard
@@ -2432,6 +3095,11 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 sub={`${totalRuntimeMinutesCompleted} min`}
               />
               <StatCard title="Rewatches" value={`${rewatchTotals.rewatches}`} sub={`${rewatchTotals.itemsRewatched} items`} />
+              <StatCard
+                title="Friends"
+                value={friendsList.length.toString()}
+                sub={`Following ${friendsList.length} • Pending ${outgoingRequests.length}`}
+              />
             </div>
 
             {/* Highlights */}
@@ -2527,9 +3195,16 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   <div className="flex flex-col sm:flex-row sm:items-center gap-6">
                     <PieChartSimple data={genreCounts} />
                     <div className="space-y-2 text-sm w-full">
-                      {genreCounts.map((g) => (
+                      {genreCounts.map((g, idx) => (
                         <div key={g.label} className="flex items-center justify-between gap-6">
-                          <div className="text-neutral-300 truncate">{g.label}</div>
+                          <div className="min-w-0 flex items-center gap-2">
+                            <span
+                              className="h-3 w-3 rounded-full shrink-0 ring-1 ring-white/10"
+                              style={{ backgroundColor: PIE_COLORS[idx % PIE_COLORS.length] }}
+                              aria-hidden="true"
+                            />
+                            <div className="text-neutral-300 truncate">{g.label}</div>
+                          </div>
                           <div className="text-neutral-400 tabular-nums">{g.value}</div>
                         </div>
                       ))}
@@ -2603,7 +3278,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                       <div key={x.type} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2">
                         <div className="text-xs text-neutral-400">{TYPE_LABEL[x.type]}</div>
                         <div>
-                          {x.avg.toFixed(1)} <span className="text-xs text-neutral-500">({x.count} rated)</span>
+                          {formatRatingValue(x.avg, settings.ratingFormat)} <span className="text-xs text-neutral-500">({x.count} rated)</span>
                         </div>
                       </div>
                     ))
@@ -2690,7 +3365,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                       }}
 
                       placeholder="Title"
-                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
                     />
 
                     {showSuggest && suggestions.length ? (
@@ -2805,7 +3480,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
                   <Select
                     label="Status"
-                    value={form.status || "completed"}
+                    value={form.status || "planned"}
                     onChange={(v) => setForm({ ...form, status: v as Status })}
                     options={[
                       { value: "completed", label: "Completed" },
@@ -2816,7 +3491,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   />
 
                   <TextNumberInput
-                    label="Rating (0–10)"
+                    label={`Rating (${ratingFormatLabel(settings.ratingFormat)})`}
                     value={ratingText}
                     onChange={setRatingText}
                     placeholder="—"
@@ -2934,7 +3609,34 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   helper="Auto-filled genres show below; add your own tags too."
                 />
 
-
+                {friendsList.length ? (
+                  <div className="space-y-2">
+                    <div className="text-xs text-neutral-400">With friends (optional)</div>
+                    <div className="flex flex-wrap gap-2">
+                      {friendsList.map((f) => {
+                        const selected = selectedFriendIds.includes(f.friend_id);
+                        return (
+                          <button
+                            key={f.friend_id}
+                            type="button"
+                            onClick={() => toggleSelectedFriend(f.friend_id)}
+                            className={[
+                              "px-3 py-2 rounded-xl border text-xs transition touch-manipulation",
+                              selected
+                                ? "bg-emerald-500/15 border-emerald-500/25 text-neutral-100"
+                                : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-300",
+                            ].join(" ")}
+                            aria-pressed={selected}
+                          >
+                            {selected ? "Added: " : "Add: "}
+                            {friendsNameById.get(f.friend_id) ?? f.friend?.username ?? f.friend_id}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="text-[11px] text-neutral-500">This saves with the item in your existing media JSON.</div>
+                  </div>
+                ) : null}
 
                 <TextArea
                   label="Notes"
@@ -3030,6 +3732,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 onClick={() => {
                   loadIncomingFriendRequests(undefined, { autoAccept: true });
                   loadFriends();
+                  loadFriendActivity();
                 }}
                 className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
               >
@@ -3043,7 +3746,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 value={friendsQuery}
                 onChange={(e) => setFriendsQuery(e.target.value)}
                 placeholder="Search friends / requests..."
-                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
               />
 
               <div className="flex items-center gap-2 justify-start sm:justify-end">
@@ -3089,7 +3792,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   value={inputUsername}
                   onChange={(e) => setInputUsername(e.target.value)}
                   placeholder="Enter username (e.g., OGChump)"
-                  className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+                  className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
                 />
                 <button
                   type="button"
@@ -3122,27 +3825,47 @@ async function pickForMe(mode: "best" | "random" = "best") {
               <div className="mt-2 space-y-2">
                 {friendsTab === "friends" ? (
                   filteredFriendsList.length ? (
-                    filteredFriendsList.map((f) => (
-                      <div
-                        key={f.friend_id}
-                        className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3"
-                      >
-                        <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(180px,240px)] gap-3 items-center">
-                          <div className="min-w-0">
-                            <div className="text-sm text-neutral-200 truncate">
-                              {f.friend?.username ?? "Unknown user"}
-                            </div>
-                            <div className="text-[11px] text-neutral-600 truncate">{f.friend_id}</div>
-                          </div>
+                    filteredFriendsList.map((f) => {
+                      const display = getFriendDisplay(f.friend_id, f.friend?.username);
 
-                          <div className="flex sm:justify-end">
-                            <div className="text-xs text-neutral-500">
-                              (No actions yet)
+                      return (
+                        <div
+                          key={f.friend_id}
+                          className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3"
+                        >
+                          <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(220px,280px)] gap-3 items-center">
+                            <div className="min-w-0">
+                              <div className="text-sm text-neutral-200 truncate">
+                                {display.primary}
+                              </div>
+                              <div className="text-[11px] text-neutral-600 truncate">{display.secondary}</div>
+                              {display.hasCustomTag ? (
+                                <div className="text-[11px] text-emerald-300/80 mt-1">Showing custom tag</div>
+                              ) : null}
+                            </div>
+
+                            <div className="sm:justify-self-end w-full sm:w-[260px] space-y-2">
+                              <label className="block">
+                                <div className="text-[11px] text-neutral-500 mb-1">Custom friend tag</div>
+                                <input
+                                  value={settings.friendNicknames?.[f.friend_id] ?? ""}
+                                  onChange={(e) => updateFriendNickname(f.friend_id, e.target.value)}
+                                  placeholder="Nickname / ID tag"
+                                  className="w-full rounded-lg bg-neutral-900 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                onClick={() => removeFriend(f.friend_id)}
+                                className="w-full text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 text-neutral-200"
+                              >
+                                Remove friend
+                              </button>
                             </div>
                           </div>
                         </div>
-                      </div>
-                    ))
+                      );
+                    })
                   ) : (
                     <div className="text-xs text-neutral-500 mt-2">No friends yet.</div>
                   )
@@ -3184,18 +3907,401 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 )}
               </div>
             </div>
+
+            <Panel
+              title="Friend media"
+              right={<span className="text-xs text-neutral-500">{friendActivityStatus}</span>}
+            >
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <Select
+                  label="Friend"
+                  value={friendLibraryFriendId}
+                  onChange={setFriendLibraryFriendId}
+                  options={[
+                    { value: "all", label: "All friends" },
+                    ...friendsList.map((f) => {
+                      const display = getFriendDisplay(f.friend_id, f.friend?.username);
+                      return { value: f.friend_id, label: display.primary };
+                    }),
+                  ]}
+                />
+
+                <Select
+                  label="Status"
+                  value={friendLibraryStatus}
+                  onChange={(v) => setFriendLibraryStatus(v as FriendLibraryStatusFilter)}
+                  options={[
+                    { value: "all", label: "All statuses" },
+                    { value: "completed", label: "Completed" },
+                    { value: "in_progress", label: "In Progress" },
+                    { value: "planned", label: "Planned" },
+                    { value: "dropped", label: "Dropped" },
+                  ]}
+                />
+
+                <Select
+                  label="Sort"
+                  value={friendLibrarySortMode}
+                  onChange={(v) => setFriendLibrarySortMode(v as SortMode)}
+                  options={[
+                    { value: "newest", label: "Newest first" },
+                    { value: "oldest", label: "Oldest first" },
+                    { value: "title", label: "Title (A–Z)" },
+                    { value: "rating_high", label: "Rating (high → low)" },
+                    { value: "rating_low", label: "Rating (low → high)" },
+                    { value: "updated", label: "Last updated" },
+                    { value: "favorites", label: "Favorites first" },
+                  ]}
+                />
+              </div>
+
+              <div className="mt-4 space-y-2">
+                {friendLibraryItems.length ? (
+                  friendLibraryItems.map((item) => (
+                    <div
+                      key={`${item.__ownerId}:${item.id}`}
+                      className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm text-neutral-200 truncate">
+                            <span className="font-medium">{item.title}</span>
+                          </div>
+                          <div className="text-[11px] text-neutral-500 mt-1">
+                            {item.__ownerName} • {TYPE_LABEL[item.type]} • {item.status.replace("_", " ")}
+                            {item.rating !== undefined ? ` • ${formatRatingValue(item.rating, settings.ratingFormat)}` : ""}
+                            {item.favorite ? " • Favorite" : ""}
+                          </div>
+                          {item.tags?.length ? (
+                            <div className="text-[11px] text-neutral-600 mt-1 truncate">{item.tags.join(" • ")}</div>
+                          ) : null}
+                        </div>
+
+                        <div className="text-[11px] text-neutral-600 whitespace-nowrap">
+                          Updated {new Date(item.updatedAt ?? item.createdAt).toLocaleDateString()}
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-sm text-neutral-500">
+                    No visible friend items match this filter yet. Private items stay hidden.
+                  </div>
+                )}
+              </div>
+            </Panel>
+          </div>
+        ) : null}
+
+        {/* FEED PAGE */}
+        {view === "feed" ? (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div>
+                <div className="text-lg font-semibold text-neutral-200">Activity Feed</div>
+                <div className="text-sm text-neutral-500">Latest activity from you and any friends your current RLS rules allow you to view.</div>
+              </div>
+
+              <button
+                type="button"
+                onClick={loadFriendActivity}
+                className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+              >
+                Refresh feed
+              </button>
+            </div>
+
+            <Panel title="Latest activity" right={<span className="text-xs text-neutral-500">{friendActivityStatus}</span>}>
+              <div className="space-y-2">
+                {activityFeed.length ? (
+                  activityFeed.map((a) => (
+                    <div key={a.id} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="text-sm text-neutral-200 truncate">
+                            <span className="font-medium">{a.actorName}</span> {a.status === "completed" ? "completed" : a.status === "in_progress" ? "started / updated" : a.status === "planned" ? "planned" : "dropped"} <span className="font-medium">{a.itemTitle}</span>
+                          </div>
+                          <div className="text-[11px] text-neutral-500 mt-1">
+                            {TYPE_LABEL[a.itemType]} • {new Date(a.date).toLocaleString()}
+                            {a.favorite ? " • Favorite" : ""}
+                          </div>
+                        </div>
+                        <div className="text-xs text-neutral-500 capitalize">{a.status.replace("_", " ")}</div>
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-sm text-neutral-500">No activity yet.</div>
+                )}
+              </div>
+            </Panel>
+          </div>
+        ) : null}
+
+        {/* DISCOVER PAGE */}
+        {view === "discover" ? (
+          <div className="space-y-4">
+            <div>
+              <div className="text-lg font-semibold text-neutral-200">Discover</div>
+              <div className="text-sm text-neutral-500">Browse movies and TV by genre, then add anything directly to Planned.</div>
+            </div>
+
+            <Panel title="Browse TMDB">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <Select
+                  label="Type"
+                  value={discoverType}
+                  onChange={(v) => {
+                    setDiscoverType(v as "movie" | "tv");
+                    setDiscoverGenreId("all");
+                    setDiscoverResults([]);
+                  }}
+                  options={[
+                    { value: "movie", label: "Movies" },
+                    { value: "tv", label: "TV" },
+                  ]}
+                />
+
+                <Select
+                  label="Genre"
+                  value={discoverGenreId}
+                  onChange={setDiscoverGenreId}
+                  options={[
+                    { value: "all", label: "All genres" },
+                    ...discoverGenres.map((g) => ({ value: String(g.id), label: g.name })),
+                  ]}
+                />
+
+                <label className="block">
+                  <div className="text-xs text-neutral-400 mb-1">Search</div>
+                  <button
+                    type="button"
+                    onClick={browseDiscover}
+                    className="w-full px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
+                  >
+                    Browse
+                  </button>
+                </label>
+              </div>
+
+              {discoverStatus ? <div className="text-xs text-neutral-400 mt-3">{discoverStatus}</div> : null}
+
+              {discoverResults.length ? (
+                <div className="mt-5 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+                  {discoverResults.map((card) => (
+                    <div key={`${card.type}:${card.id}`} className="rounded-2xl bg-neutral-950 border border-neutral-800 overflow-hidden">
+                      <div className="aspect-[2/3] bg-neutral-900">
+                        {card.posterUrl ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={card.posterUrl} alt={card.title} className="w-full h-full object-cover" />
+                        ) : (
+                          <div className="w-full h-full grid place-items-center text-xs text-neutral-600">No cover</div>
+                        )}
+                      </div>
+                      <div className="p-3 space-y-2">
+                        <div className="text-sm font-medium text-neutral-200 line-clamp-2">{card.title}</div>
+                        <div className="text-[11px] text-neutral-500">{TYPE_LABEL[card.type]}{card.year ? ` • ${card.year}` : ""}</div>
+                        {card.tags?.length ? <div className="text-[11px] text-neutral-500 line-clamp-1">{card.tags.join(" • ")}</div> : null}
+                        <button
+                          type="button"
+                          onClick={() => addDiscoverItem(card)}
+                          className="w-full text-xs px-3 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/25 hover:bg-emerald-500/20"
+                        >
+                          Add planned
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </Panel>
+          </div>
+        ) : null}
+
+        {/* FEEDBACK PAGE */}
+        {view === "feedback" ? (
+          <div className="space-y-4">
+            <div>
+              <div className="text-lg font-semibold text-neutral-200">Suggestions / Problems</div>
+              <div className="text-sm text-neutral-500">Save feedback the moment you notice it. This uses your existing media_items.data JSON.</div>
+            </div>
+
+            <Panel title="Submit feedback">
+              <form onSubmit={submitFeedback} className="space-y-3">
+                <div className="grid grid-cols-1 sm:grid-cols-[180px_minmax(0,1fr)] gap-3">
+                  <Select
+                    label="Type"
+                    value={feedbackType}
+                    onChange={(v) => setFeedbackType(v as "suggestion" | "problem")}
+                    options={[
+                      { value: "suggestion", label: "Suggestion" },
+                      { value: "problem", label: "Problem" },
+                    ]}
+                  />
+                  <TextArea
+                    label="What did you notice?"
+                    value={feedbackText}
+                    onChange={setFeedbackText}
+                    placeholder="Write the idea, bug, or problem here..."
+                  />
+                </div>
+
+                <button type="submit" className="px-4 py-2 rounded-xl stack-good hover:opacity-95">
+                  Save feedback
+                </button>
+              </form>
+            </Panel>
+
+            <Panel title="Saved feedback" right={<span className="text-xs text-neutral-500">{feedbackEntries.length}</span>}>
+              <div className="space-y-2">
+                {feedbackEntries.length ? (
+                  feedbackEntries.map((f) => (
+                    <div key={f.id} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs text-neutral-500 mb-1">
+                            {f.type === "problem" ? "Problem" : "Suggestion"} • {new Date(f.createdAt).toLocaleString()}
+                          </div>
+                          <div className="text-sm text-neutral-200 whitespace-pre-wrap">{f.message}</div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setFeedbackEntries((prev) => prev.filter((x) => x.id !== f.id))}
+                          className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-sm text-neutral-500">No feedback saved yet.</div>
+                )}
+              </div>
+            </Panel>
+          </div>
+        ) : null}
+
+        {/* SETTINGS PAGE */}
+        {view === "settings" ? (
+          <div className="space-y-4">
+            <div>
+              <div className="text-lg font-semibold text-neutral-200">Settings</div>
+              <div className="text-sm text-neutral-500">Personalize your Stack without changing the production database schema.</div>
+            </div>
+
+            <Panel title="Profile / personal info">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <Text
+                  label="Display name"
+                  value={settings.displayName ?? ""}
+                  onChange={(v) => updateSettings({ displayName: v })}
+                  helper="Used in your local activity feed display."
+                />
+                <Text
+                  label="Custom ID tag"
+                  value={settings.usernameTag ?? ""}
+                  onChange={(v) => updateSettings({ usernameTag: v })}
+                  helper="This is a Stack display tag. It does not rename profiles.username in Supabase."
+                />
+              </div>
+
+              <div className="mt-3">
+                <TextArea
+                  label="Profile bio"
+                  value={settings.profileBio ?? ""}
+                  onChange={(v) => updateSettings({ profileBio: v })}
+                  placeholder="Anything you want shown on your Stack profile later..."
+                />
+              </div>
+            </Panel>
+
+            <Panel title="Site preferences">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
+                <Select
+                  label="Rating display"
+                  value={settings.ratingFormat ?? "ten"}
+                  onChange={(v) => updateSettings({ ratingFormat: v as RatingFormat })}
+                  options={[
+                    { value: "ten", label: "10-point scale" },
+                    { value: "five", label: "5-point scale" },
+                    { value: "stars", label: "Stars" },
+                    { value: "percent", label: "Percent" },
+                  ]}
+                />
+                <div>
+                  <div className="text-xs text-neutral-400 mb-1">Sound effects</div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Toggle
+                      label="Hover/click sounds"
+                      checked={!!settings.soundEffects}
+                      onChange={(v) => updateSettings({ soundEffects: v })}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => playStackSoundEffect("click")}
+                      className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm"
+                    >
+                      Test sound
+                    </button>
+                  </div>
+                  <div className="text-[11px] text-neutral-500 mt-1">
+                    Turn this on, then click once or press Test sound to unlock audio in the browser.
+                  </div>
+                </div>
+              </div>
+              <div className="text-xs text-neutral-500 mt-3">
+                Ratings are still saved as 0–10 internally so your existing data stays safe. Current display: {ratingFormatLabel(settings.ratingFormat)}.
+              </div>
+            </Panel>
+
+            <Panel title="Friend custom tags" right={<span className="text-xs text-neutral-500">{friendsList.length} friends</span>}>
+              {friendsList.length ? (
+                <div className="space-y-2">
+                  {friendsList.map((f) => {
+                    const display = getFriendDisplay(f.friend_id, f.friend?.username);
+
+                    return (
+                      <div key={f.friend_id} className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_260px] gap-3 items-center rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-3">
+                        <div className="min-w-0">
+                          <div className="text-sm text-neutral-200 truncate">{display.primary}</div>
+                          <div className="text-[11px] text-neutral-600 truncate">{display.secondary}</div>
+                        </div>
+                        <div className="space-y-2">
+                          <input
+                            value={settings.friendNicknames?.[f.friend_id] ?? ""}
+                            onChange={(e) => updateFriendNickname(f.friend_id, e.target.value)}
+                            placeholder="Nickname / ID tag"
+                            className="w-full rounded-xl bg-neutral-900 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removeFriend(f.friend_id)}
+                            className="w-full text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 text-neutral-200"
+                          >
+                            Remove friend
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="text-sm text-neutral-500">No friends yet.</div>
+              )}
+            </Panel>
           </div>
         ) : null}
 
         {/* LIST PAGES */}
-        {view !== "stats" && view !== "add" && view !== "friends" ? (
+        {view !== "stats" && view !== "add" && view !== "friends" && view !== "feed" && view !== "discover" && view !== "feedback" && view !== "settings" ? (
           <div className="space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search title, notes, tags..."
-                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 outline-none focus:border-neutral-500"
+                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
               />
 
               <Select
@@ -3208,6 +4314,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   { value: "title", label: "Title (A–Z)" },
                   { value: "rating_high", label: "Rating (high → low)" },
                   { value: "rating_low", label: "Rating (low → high)" },
+                  { value: "updated", label: "Last updated" },
+                  { value: "favorites", label: "Favorites first" },
                 ]}
               />
             </div>
@@ -3219,9 +4327,9 @@ async function pickForMe(mode: "best" | "random" = "best") {
               </div>
             ) : null}
 
-            <DndContext onDragEnd={handleDragEnd}>
+            <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
               {view === "all" && boardView ? (
-                <BoardView items={filtered} onDelete={removeItem} onUpdate={updateItem} />
+                <BoardView items={filtered} onDelete={removeItem} onUpdate={updateItem} friendsById={friendsNameById} ratingFormat={settings.ratingFormat ?? "ten"} />
               ) : groupMode !== "none" && grouped ? (
                 <div className="space-y-6">
                   {grouped.map(([k, list]) => (
@@ -3229,7 +4337,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                       <h3 className="text-sm text-neutral-400">{k}</h3>
                       <div className="space-y-3">
                         {list.map((i) => (
-                          <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} />
+                          <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} friendsById={friendsNameById} ratingFormat={settings.ratingFormat ?? "ten"} />
                         ))}
                       </div>
                     </section>
@@ -3241,13 +4349,23 @@ async function pickForMe(mode: "best" | "random" = "best") {
                     const list = byStatusFiltered[s.id];
                     if (!list.length) return null;
 
+                    const collapsed = collapsedStatuses.has(s.id);
+
                     return (
                       <section key={s.id} className="space-y-3">
-                        <div className="flex items-center justify-between">
+                        <button
+                          type="button"
+                          onClick={() => toggleCollapsedStatus(s.id)}
+                          className="w-full flex items-center justify-between rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 px-3 py-2 text-left touch-manipulation"
+                          aria-expanded={!collapsed}
+                        >
                           <h3 className="text-sm text-neutral-300">{s.label}</h3>
-                          <div className="text-xs text-neutral-500">{list.length}</div>
-                        </div>
+                          <div className="text-xs text-neutral-500">
+                            {collapsed ? "Show" : "Hide"} • {list.length}
+                          </div>
+                        </button>
 
+                        {!collapsed ? (
                         <div className="space-y-3">
                           <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
                             <div />
@@ -3263,9 +4381,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
                               item={i}
                               onDelete={() => removeItem(i.id)}
                               onUpdate={(patch) => updateItem(i.id, patch)}
+                              friendsById={friendsNameById}
+                              ratingFormat={settings.ratingFormat ?? "ten"}
                             />
                           ))}
                         </div>
+                        ) : null}
                       </section>
                     );
                   })}
@@ -3325,10 +4446,14 @@ function BoardView({
   items,
   onDelete,
   onUpdate,
+  friendsById,
+  ratingFormat,
 }: {
   items: MediaItem[];
   onDelete: (id: string) => void;
   onUpdate: (id: string, patch: Partial<MediaItem>) => void;
+  friendsById: Map<string, string>;
+  ratingFormat: RatingFormat;
 }) {
   const byStatus = useMemo(() => {
     const map: Record<Status, MediaItem[]> = { completed: [], in_progress: [], planned: [], dropped: [] };
@@ -3337,12 +4462,12 @@ function BoardView({
   }, [items]);
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+    <div className="grid grid-cols-1 sm:grid-cols-2 2xl:grid-cols-4 gap-6">
       {STATUSES.map((s) => (
         <StatusColumn key={s.id} status={s.id} title={s.label}>
           <div className="space-y-3">
             {byStatus[s.id].map((i) => (
-              <CardDraggable key={i.id} item={i} onDelete={() => onDelete(i.id)} onUpdate={(p) => onUpdate(i.id, p)} />
+              <CardDraggable key={i.id} item={i} onDelete={() => onDelete(i.id)} onUpdate={(p) => onUpdate(i.id, p)} friendsById={friendsById} ratingFormat={ratingFormat} />
             ))}
             {!byStatus[s.id].length ? <div className="text-xs text-neutral-600 text-center py-8">Drop here</div> : null}
           </div>
@@ -3359,7 +4484,7 @@ function StatusColumn({ status, title, children }: { status: Status; title: stri
     <section
       ref={setNodeRef}
       className={[
-        "rounded-2xl ring-1 shadow-sm p-3 min-h-[240px]",
+        "rounded-2xl ring-1 shadow-sm p-5 min-h-[340px]",
         isOver ? "ring-emerald-500/40 bg-emerald-500/5" : "ring-neutral-800/80 bg-neutral-900/40",
       ].join(" ")}
     >
@@ -3375,12 +4500,19 @@ function MALRow({
   item,
   onDelete,
   onUpdate,
+  friendsById,
+  ratingFormat = "ten",
 }: {
   item: MediaItem;
   onDelete: () => void;
   onUpdate: (patch: Partial<MediaItem>) => void;
+  friendsById?: Map<string, string>;
+  ratingFormat?: RatingFormat;
 }) {
   const displayPoster = item.posterOverrideUrl || item.posterUrl;
+  const withFriends = (item.withFriendIds ?? [])
+    .map((id) => friendsById?.get(id) ?? id)
+    .filter(Boolean);
 
   // ---------------- EDITING ----------------
   const [isEditing, setIsEditing] = React.useState(false);
@@ -3587,7 +4719,7 @@ function MALRow({
                       value={draftNotes}
                       onChange={(e) => setDraftNotes(e.target.value)}
                       rows={3}
-                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500 resize-none"
+                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500 resize-none"
                       placeholder="Write a note…"
                     />
                   </div>
@@ -3612,6 +4744,19 @@ function MALRow({
                 {item.tags?.length ? (
                   <div className="text-[11px] text-neutral-500 mt-1 truncate">{item.tags.join(" • ")}</div>
                 ) : null}
+
+                {withFriends.length ? (
+                  <div className="text-[11px] text-neutral-500 mt-1 truncate">With: {withFriends.join(" • ")}</div>
+                ) : null}
+
+                <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+                  {item.favorite ? (
+                    <span className="px-2 py-1 rounded-lg bg-amber-400/10 border border-amber-400/20 text-neutral-200">Favorite</span>
+                  ) : null}
+                  {item.isPrivate ? (
+                    <span className="px-2 py-1 rounded-lg bg-sky-400/10 border border-sky-400/20 text-neutral-200">Private</span>
+                  ) : null}
+                </div>
               </div>
 
               {/* ACTIONS */}
@@ -3637,6 +4782,30 @@ function MALRow({
                   </>
                 ) : (
                   <>
+                    <button
+                      type="button"
+                      onClick={() => onUpdate({ favorite: !item.favorite })}
+                      className={[
+                        "text-xs px-3 py-2 rounded-xl border hover:bg-white/10",
+                        item.favorite ? "bg-amber-400/15 border-amber-400/25" : "bg-white/5 border-white/10",
+                      ].join(" ")}
+                      title={item.favorite ? "Remove favorite" : "Mark favorite"}
+                      aria-pressed={!!item.favorite}
+                    >
+                      {item.favorite ? "★" : "☆"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onUpdate({ isPrivate: !item.isPrivate })}
+                      className={[
+                        "text-xs px-3 py-2 rounded-xl border hover:bg-white/10",
+                        item.isPrivate ? "bg-sky-400/15 border-sky-400/25" : "bg-white/5 border-white/10",
+                      ].join(" ")}
+                      title={item.isPrivate ? "Make visible to friends later" : "Mark private"}
+                      aria-pressed={!!item.isPrivate}
+                    >
+                      {item.isPrivate ? "Private" : "Public"}
+                    </button>
                     <button
                       type="button"
                       onClick={() => setIsEditing(true)}
@@ -3672,10 +4841,8 @@ function MALRow({
                 className="w-[5.5rem] text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
                 title="Rating (0–10)"
               />
-            ) : typeof item.rating === "number" ? (
-              item.rating.toFixed(1)
             ) : (
-              "—"
+              formatRatingValue(item.rating, ratingFormat)
             )}
           </div>
 
@@ -3775,10 +4942,14 @@ function CardDraggable({
   item,
   onDelete,
   onUpdate,
+  friendsById,
+  ratingFormat = "ten",
 }: {
   item: MediaItem;
   onDelete: () => void;
   onUpdate: (patch: Partial<MediaItem>) => void;
+  friendsById?: Map<string, string>;
+  ratingFormat?: RatingFormat;
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: item.id });
 
@@ -3789,6 +4960,9 @@ function CardDraggable({
     : {};
 
   const displayPoster = item.posterOverrideUrl || item.posterUrl;
+  const withFriends = (item.withFriendIds ?? [])
+    .map((id) => friendsById?.get(id) ?? id)
+    .filter(Boolean);
 
   const movieProg = getMovieProgressDefaults(item);
   const cur =
@@ -3864,7 +5038,7 @@ function CardDraggable({
                 value={draftNote}
                 onChange={(e) => setDraftNote(e.target.value)}
                 rows={8}
-                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500 resize-none"
+                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500 resize-none"
                 placeholder="Write anything you want to remember…"
               />
 
@@ -3902,16 +5076,16 @@ function CardDraggable({
           className="flex items-center justify-between gap-2 px-3 py-2 bg-neutral-950 border-b border-neutral-800"
           {...listeners}
           {...attributes}
-          style={{ cursor: "grab" }}
+          style={{ cursor: "grab", touchAction: "none" }}
         >
           <div className="text-xs text-neutral-500">Drag</div>
           <div className="text-xs text-neutral-400">{TYPE_LABEL[item.type]}</div>
         </div>
 
-        <div className="p-3 flex gap-3">
+        <div className="p-4 flex gap-4">
           {/* LEFT: poster + note button */}
           <div className="shrink-0 space-y-2">
-            <div className="w-12 h-16 rounded-xl overflow-hidden bg-neutral-900 border border-neutral-800">
+            <div className="w-16 h-20 rounded-xl overflow-hidden bg-neutral-900 border border-neutral-800">
               {displayPoster ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
@@ -3924,7 +5098,7 @@ function CardDraggable({
               type="button"
               onClick={() => setShowNote(true)}
               className={[
-                "w-12 rounded-lg px-2 py-1 text-[11px] border transition",
+                "w-16 rounded-lg px-2 py-1 text-[11px] border transition",
                 item.notes
                   ? "bg-white/10 border-white/10 hover:bg-white/15 text-neutral-200"
                   : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-400",
@@ -3936,7 +5110,7 @@ function CardDraggable({
           </div>
 
           <div className="min-w-0 flex-1">
-            <div className="font-semibold text-sm text-neutral-200 truncate">{item.title}</div>
+            <div className="font-semibold text-base text-neutral-200 truncate">{item.title}</div>
 
             <div className="text-[11px] text-neutral-500 mt-1">
               {item.type === "game"
@@ -3945,12 +5119,27 @@ function CardDraggable({
               {(Number(item.rewatchCount ?? 0) || 0) > 0 ? ` • Rewatch x${Number(item.rewatchCount ?? 0) || 0}` : ""}
             </div>
 
+            <div className="text-[11px] text-neutral-500 mt-1">Score: {formatRatingValue(item.rating, ratingFormat)}</div>
+
             {/* tiny note preview */}
             {item.notes ? (
               <div className="text-[11px] text-neutral-400 mt-1 line-clamp-1">{item.notes}</div>
             ) : null}
 
-            <div className="flex items-center justify-between mt-3">
+            {withFriends.length ? (
+              <div className="text-[11px] text-neutral-500 mt-1 line-clamp-1">With: {withFriends.join(" • ")}</div>
+            ) : null}
+
+            <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+              {item.favorite ? (
+                <span className="px-2 py-1 rounded-lg bg-amber-400/10 border border-amber-400/20 text-neutral-200">Favorite</span>
+              ) : null}
+              {item.isPrivate ? (
+                <span className="px-2 py-1 rounded-lg bg-sky-400/10 border border-sky-400/20 text-neutral-200">Private</span>
+              ) : null}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 mt-3">
               <select
                 value={item.status}
                 onChange={(e) => onUpdate({ status: e.target.value as Status })}
@@ -3962,13 +5151,39 @@ function CardDraggable({
                 <option value="dropped">Dropped</option>
               </select>
 
-              <button
-                type="button"
-                onClick={onDelete}
-                className="text-xs px-2 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
-              >
-                Delete
-              </button>
+              <div className="flex flex-wrap items-center justify-end gap-1">
+                <button
+                  type="button"
+                  onClick={() => onUpdate({ favorite: !item.favorite })}
+                  className={[
+                    "text-xs px-2 py-1 rounded-lg border hover:bg-white/10",
+                    item.favorite ? "bg-amber-400/15 border-amber-400/25" : "bg-white/5 border-white/10",
+                  ].join(" ")}
+                  title={item.favorite ? "Remove favorite" : "Mark favorite"}
+                  aria-pressed={!!item.favorite}
+                >
+                  {item.favorite ? "★" : "☆"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdate({ isPrivate: !item.isPrivate })}
+                  className={[
+                    "text-xs px-2 py-1 rounded-lg border hover:bg-white/10",
+                    item.isPrivate ? "bg-sky-400/15 border-sky-400/25" : "bg-white/5 border-white/10",
+                  ].join(" ")}
+                  title={item.isPrivate ? "Make visible to friends later" : "Mark private"}
+                  aria-pressed={!!item.isPrivate}
+                >
+                  {item.isPrivate ? "Private" : "Public"}
+                </button>
+                <button
+                  type="button"
+                  onClick={onDelete}
+                  className="text-xs px-3 py-1 rounded-lg bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+                >
+                  Delete
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -4115,7 +5330,7 @@ function Select({
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500"
+        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
       >
         {options.map((o) => (
           <option key={o.value} value={o.value}>
@@ -4164,7 +5379,7 @@ function Text({
         type={type}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500"
+        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
       />
       {helper ? <div className="text-[11px] text-neutral-500 mt-1">{helper}</div> : null}
     </label>
@@ -4190,7 +5405,7 @@ function TextArea({
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         rows={4}
-        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500 resize-none"
+        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500 resize-none"
       />
     </label>
   );
@@ -4225,7 +5440,7 @@ function TextNumberInput({
         placeholder={placeholder}
         disabled={disabled}
         className={[
-          "w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500",
+          "w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500",
           disabled ? "opacity-50 cursor-not-allowed" : "",
         ].join(" ")}
       />
