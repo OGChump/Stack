@@ -1609,15 +1609,44 @@ const findProfileByUsernameOrDisplayName = useCallback(
     const q = input.trim();
     if (!q) return { profile: null };
 
-    const { data: usernameMatch, error: usernameError } = await supabase
+    const normalizeLookup = (value: unknown) =>
+      String(value ?? "")
+        .trim()
+        .replace(/^@+/, "")
+        .replace(/\s+/g, " ")
+        .toLowerCase();
+
+    const cleanQ = q.replace(/^@+/, "").trim();
+    const qNorm = normalizeLookup(q);
+
+    const dedupeMatches = (rows: ProfileRow[]) => {
+      const map = new Map<string, ProfileRow>();
+      for (const row of rows) {
+        if (!row?.id) continue;
+        if (!map.has(row.id)) map.set(row.id, row);
+      }
+      return Array.from(map.values());
+    };
+
+    const resolveMatches = (rows: ProfileRow[]) => {
+      const matches = dedupeMatches(rows);
+      if (matches.length === 1) return { profile: matches[0] };
+      if (matches.length > 1) return { profile: null, ambiguous: true };
+      return { profile: null };
+    };
+
+    // 1) Exact username, case-insensitive, with or without @.
+    const { data: usernameMatches, error: usernameError } = await supabase
       .from("profiles")
       .select("id, username, display_name")
-      .eq("username", q)
-      .maybeSingle();
+      .ilike("username", cleanQ)
+      .limit(3);
 
     if (usernameError) console.error(usernameError);
-    if (usernameMatch?.id) return { profile: usernameMatch as ProfileRow };
+    const exactUsername = resolveMatches((usernameMatches ?? []) as ProfileRow[]);
+    if (exactUsername.profile || exactUsername.ambiguous) return exactUsername;
 
+    // 2) Exact profile display_name, case-insensitive.
     const { data: exactDisplayMatches, error: exactDisplayError } = await supabase
       .from("profiles")
       .select("id, username, display_name")
@@ -1629,10 +1658,45 @@ const findProfileByUsernameOrDisplayName = useCallback(
       return { profile: null };
     }
 
-    const exactMatches = (exactDisplayMatches ?? []) as ProfileRow[];
-    if (exactMatches.length === 1) return { profile: exactMatches[0] };
-    if (exactMatches.length > 1) return { profile: null, ambiguous: true };
+    const exactProfileDisplay = resolveMatches((exactDisplayMatches ?? []) as ProfileRow[]);
+    if (exactProfileDisplay.profile || exactProfileDisplay.ambiguous) return exactProfileDisplay;
 
+    // 3) Exact Stack display name / custom ID tag from the existing media_items.data.settings JSON.
+    // This is needed because the Settings page saves displayName in media_items.data.settings,
+    // while friend search was only checking profiles.display_name before.
+    const { data: stackRows, error: stackRowsError } = await supabase
+      .from("media_items")
+      .select("user_id,data")
+      .limit(500);
+
+    if (stackRowsError) console.warn(stackRowsError);
+
+    const stackProfiles = ((stackRows ?? []) as Array<{ user_id: string; data: any }>)
+      .map((row) => {
+        const rowSettings = normalizeSettings(row?.data?.settings);
+        const displayName = rowSettings.displayName?.trim() || "";
+        const usernameTag = rowSettings.usernameTag?.trim() || "";
+
+        return {
+          profile: {
+            id: row.user_id,
+            username: usernameTag ? usernameTag.replace(/^@+/, "") : null,
+            display_name: displayName || usernameTag || null,
+          } satisfies ProfileRow,
+          displayName,
+          usernameTag,
+        };
+      })
+      .filter((row) => row.profile.id);
+
+    const exactStackMatches = stackProfiles
+      .filter((row) => normalizeLookup(row.displayName) === qNorm || normalizeLookup(row.usernameTag) === qNorm)
+      .map((row) => row.profile);
+
+    const exactStackDisplay = resolveMatches(exactStackMatches);
+    if (exactStackDisplay.profile || exactStackDisplay.ambiguous) return exactStackDisplay;
+
+    // 4) Partial profile display_name match.
     const { data: partialDisplayMatches, error: partialDisplayError } = await supabase
       .from("profiles")
       .select("id, username, display_name")
@@ -1644,9 +1708,20 @@ const findProfileByUsernameOrDisplayName = useCallback(
       return { profile: null };
     }
 
-    const partialMatches = (partialDisplayMatches ?? []) as ProfileRow[];
-    if (partialMatches.length === 1) return { profile: partialMatches[0] };
-    if (partialMatches.length > 1) return { profile: null, ambiguous: true };
+    const partialProfileDisplay = resolveMatches((partialDisplayMatches ?? []) as ProfileRow[]);
+    if (partialProfileDisplay.profile || partialProfileDisplay.ambiguous) return partialProfileDisplay;
+
+    // 5) Partial Stack display name / custom ID tag match.
+    const partialStackMatches = stackProfiles
+      .filter((row) => {
+        const display = normalizeLookup(row.displayName);
+        const tag = normalizeLookup(row.usernameTag);
+        return (display && display.includes(qNorm)) || (tag && tag.includes(qNorm));
+      })
+      .map((row) => row.profile);
+
+    const partialStackDisplay = resolveMatches(partialStackMatches);
+    if (partialStackDisplay.profile || partialStackDisplay.ambiguous) return partialStackDisplay;
 
     return { profile: null };
   },
@@ -1867,9 +1942,11 @@ async function sendFriendRequest() {
   }
 
   if (!profile?.id) {
-    setFriendStatus("User not found. Try their Stack username or display name.");
+    setFriendStatus("User not found. Try their Stack username, display name, or custom ID tag.");
     return;
   }
+
+  const profileLabel = profile.display_name?.trim() || profile.username?.trim() || "that user";
 
   if (profile.id === userId) {
     setFriendStatus("You can't friend yourself 💀");
@@ -1887,7 +1964,7 @@ async function sendFriendRequest() {
   if (friendCheckErr) console.error(friendCheckErr);
 
   if (existingFriend?.friend_id) {
-    setFriendStatus(`You're already friends with ${profile.username ?? "that user"}.`);
+    setFriendStatus(`You're already friends with ${profileLabel}.`);
     return;
   }
 
@@ -1906,13 +1983,13 @@ async function sendFriendRequest() {
 
   if (existingReq?.id && existingReq.status === "pending") {
     if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
-      setFriendStatus(`${profile.username ?? "That user"} already requested you — auto-accepting…`);
+      setFriendStatus(`${profileLabel} already requested you — auto-accepting…`);
       await acceptFriendRequest(existingReq.id, profile.id);
       setInputUsername("");
       return;
     }
 
-    setFriendStatus(`You already sent a pending request to ${profile.username ?? "that user"}.`);
+    setFriendStatus(`You already sent a pending request to ${profileLabel}.`);
     return;
   }
 
@@ -1928,7 +2005,7 @@ async function sendFriendRequest() {
     return;
   }
 
-  setFriendStatus(`Friend request sent to ${profile.username ?? "that user"}.`);
+  setFriendStatus(`Friend request sent to ${profileLabel}.`);
   setInputUsername("");
   await loadOutgoingFriendRequests(userId);
 }
@@ -2094,6 +2171,26 @@ useEffect(() => {
   loadOutgoingFriendRequests(userId);
   loadFriends(userId);
 }, [userId, loadIncomingFriendRequests, loadOutgoingFriendRequests, loadFriends]);
+
+useEffect(() => {
+  if (!userId || !cloudLoaded) return;
+
+  const displayName = (settings.displayName ?? "").trim();
+  const timer = window.setTimeout(async () => {
+    try {
+      const { error } = await supabase
+        .from("profiles")
+        .update({ display_name: displayName || null })
+        .eq("id", userId);
+
+      if (error) console.warn("Could not sync Stack display name to profiles.display_name", error);
+    } catch (e) {
+      console.warn("Could not sync Stack display name to profiles.display_name", e);
+    }
+  }, 600);
+
+  return () => window.clearTimeout(timer);
+}, [userId, cloudLoaded, settings.displayName]);
 
 useEffect(() => {
   let mounted = true;
