@@ -2,7 +2,7 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import {
@@ -171,6 +171,17 @@ type StackSettings = {
   ratingFormat?: RatingFormat;
   colorTheme?: StackColorTheme;
   friendNicknames?: Record<string, string>;
+
+  // Friend/public profile privacy controls. These stay inside the existing settings JSON.
+  showRatingsToFriends?: boolean;
+  showNotesToFriends?: boolean;
+  showTagsToFriends?: boolean;
+  showProfileBioToFriends?: boolean;
+
+  // Display preferences saved with the existing settings JSON.
+  compactMode?: boolean;
+  defaultBoardView?: "board" | "list";
+  defaultAddStatus?: Status;
 };
 
 type FeedbackEntry = {
@@ -281,7 +292,15 @@ function loadLocalColorTheme(): StackColorTheme {
 
   try {
     const stored = localStorage.getItem(LOCAL_COLOR_THEME_KEY);
-    return isStackColorTheme(stored) ? stored : "midnight";
+    if (isStackColorTheme(stored)) return stored;
+
+    const cookieTheme = document.cookie
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("stack_color_theme="))
+      ?.split("=")[1];
+
+    return isStackColorTheme(cookieTheme) ? cookieTheme : "midnight";
   } catch {
     return "midnight";
   }
@@ -292,6 +311,10 @@ function saveLocalColorTheme(theme: StackColorTheme) {
 
   try {
     localStorage.setItem(LOCAL_COLOR_THEME_KEY, theme);
+  } catch {}
+
+  try {
+    document.cookie = `stack_color_theme=${theme}; Max-Age=31536000; Path=/; SameSite=Lax`;
   } catch {}
 }
 
@@ -384,8 +407,76 @@ const STACK_COLOR_THEMES: Record<
   },
 };
 
-const DEFAULT_SETTINGS: Required<Pick<StackSettings, "soundEffects" | "soundVolume" | "ratingFormat" | "colorTheme">> &
-  Omit<StackSettings, "soundEffects" | "soundVolume" | "ratingFormat" | "colorTheme"> = {
+function stackThemeToCssVars(theme: (typeof STACK_COLOR_THEMES)[StackColorTheme]) {
+  return {
+    "--stack-theme-bg": theme.bg,
+    "--stack-theme-fg": theme.fg,
+    "--stack-theme-surface": theme.surface,
+    "--stack-theme-accent": theme.accent,
+    "--stack-theme-good": theme.good,
+    "--stack-theme-good-border": theme.goodBorder,
+    "--stack-theme-bad": theme.bad,
+    "--stack-theme-bad-border": theme.badBorder,
+    "--stack-theme-focus": theme.focus,
+    "--stack-theme-ring": theme.ring,
+  };
+}
+
+const STACK_COLOR_THEME_CSS_VARS: Record<StackColorTheme, Record<string, string>> = {
+  midnight: stackThemeToCssVars(STACK_COLOR_THEMES.midnight),
+  ocean: stackThemeToCssVars(STACK_COLOR_THEMES.ocean),
+  emerald: stackThemeToCssVars(STACK_COLOR_THEMES.emerald),
+  violet: stackThemeToCssVars(STACK_COLOR_THEMES.violet),
+  rose: stackThemeToCssVars(STACK_COLOR_THEMES.rose),
+  amber: stackThemeToCssVars(STACK_COLOR_THEMES.amber),
+};
+
+const STACK_THEME_BOOT_SCRIPT = `(function(){try{var key=${JSON.stringify(LOCAL_COLOR_THEME_KEY)};var themes=${JSON.stringify(STACK_COLOR_THEME_CSS_VARS).replace(/</g, "\u003c")};var theme=localStorage.getItem(key);if(!themes[theme]){var match=document.cookie.match(/(?:^|; )stack_color_theme=([^;]+)/);theme=match?decodeURIComponent(match[1]):"midnight";}if(!themes[theme])theme="midnight";var root=document.documentElement;var vars=themes[theme];Object.keys(vars).forEach(function(k){root.style.setProperty(k,vars[k]);});root.dataset.stackTheme=theme;root.style.colorScheme="dark";}catch(e){}})();`;
+
+function applyStackThemeToDocument(themeValue: unknown) {
+  if (typeof document === "undefined") return;
+
+  const theme = isStackColorTheme(themeValue) ? themeValue : "midnight";
+  const vars = STACK_COLOR_THEME_CSS_VARS[theme];
+
+  for (const [key, value] of Object.entries(vars)) {
+    document.documentElement.style.setProperty(key, value);
+  }
+
+  document.documentElement.dataset.stackTheme = theme;
+  document.documentElement.style.colorScheme = "dark";
+}
+
+const DEFAULT_SETTINGS: Required<
+  Pick<
+    StackSettings,
+    | "soundEffects"
+    | "soundVolume"
+    | "ratingFormat"
+    | "colorTheme"
+    | "showRatingsToFriends"
+    | "showNotesToFriends"
+    | "showTagsToFriends"
+    | "showProfileBioToFriends"
+    | "compactMode"
+    | "defaultBoardView"
+    | "defaultAddStatus"
+  >
+> &
+  Omit<
+    StackSettings,
+    | "soundEffects"
+    | "soundVolume"
+    | "ratingFormat"
+    | "colorTheme"
+    | "showRatingsToFriends"
+    | "showNotesToFriends"
+    | "showTagsToFriends"
+    | "showProfileBioToFriends"
+    | "compactMode"
+    | "defaultBoardView"
+    | "defaultAddStatus"
+  > = {
   displayName: "",
   usernameTag: "",
   profileBio: "",
@@ -394,6 +485,13 @@ const DEFAULT_SETTINGS: Required<Pick<StackSettings, "soundEffects" | "soundVolu
   ratingFormat: "ten",
   colorTheme: "midnight",
   friendNicknames: {},
+  showRatingsToFriends: true,
+  showNotesToFriends: true,
+  showTagsToFriends: true,
+  showProfileBioToFriends: true,
+  compactMode: false,
+  defaultBoardView: "board",
+  defaultAddStatus: "planned",
 };
 
 function uid() {
@@ -426,6 +524,21 @@ function normalizeSettings(raw: unknown): StackSettings {
         : DEFAULT_SETTINGS.soundVolume,
     ratingFormat,
     colorTheme,
+    showRatingsToFriends:
+      typeof obj.showRatingsToFriends === "boolean" ? obj.showRatingsToFriends : DEFAULT_SETTINGS.showRatingsToFriends,
+    showNotesToFriends:
+      typeof obj.showNotesToFriends === "boolean" ? obj.showNotesToFriends : DEFAULT_SETTINGS.showNotesToFriends,
+    showTagsToFriends:
+      typeof obj.showTagsToFriends === "boolean" ? obj.showTagsToFriends : DEFAULT_SETTINGS.showTagsToFriends,
+    showProfileBioToFriends:
+      typeof obj.showProfileBioToFriends === "boolean"
+        ? obj.showProfileBioToFriends
+        : DEFAULT_SETTINGS.showProfileBioToFriends,
+    compactMode: typeof obj.compactMode === "boolean" ? obj.compactMode : DEFAULT_SETTINGS.compactMode,
+    defaultBoardView: obj.defaultBoardView === "list" || obj.defaultBoardView === "board" ? obj.defaultBoardView : DEFAULT_SETTINGS.defaultBoardView,
+    defaultAddStatus: STATUSES.some((s) => s.id === obj.defaultAddStatus)
+      ? (obj.defaultAddStatus as Status)
+      : DEFAULT_SETTINGS.defaultAddStatus,
     friendNicknames:
       obj.friendNicknames && typeof obj.friendNicknames === "object" && !Array.isArray(obj.friendNicknames)
         ? (Object.fromEntries(
@@ -481,6 +594,63 @@ function sortMediaItems<T extends MediaItem>(list: T[], sortMode: SortMode): T[]
   });
 
   return out;
+}
+
+type ProfilePrivacyOptions = {
+  showRatings: boolean;
+  showNotes: boolean;
+  showTags: boolean;
+};
+
+function profilePrivacyFromSettings(settings?: StackSettings): ProfilePrivacyOptions {
+  return {
+    showRatings: settings?.showRatingsToFriends !== false,
+    showNotes: settings?.showNotesToFriends !== false,
+    showTags: settings?.showTagsToFriends !== false,
+  };
+}
+
+function computeVisibleProfileStats(items: MediaItem[]) {
+  const total = items.length;
+  const completed = items.filter((i) => i.status === "completed").length;
+  const planned = items.filter((i) => i.status === "planned").length;
+  const inProgress = items.filter((i) => i.status === "in_progress").length;
+  const dropped = items.filter((i) => i.status === "dropped").length;
+  const ratings = items
+    .map((i) => i.rating)
+    .filter((r): r is number => typeof r === "number" && Number.isFinite(r));
+  const avgRating = ratings.length ? ratings.reduce((a, b) => a + b, 0) / ratings.length : undefined;
+
+  const tagCounts = new Map<string, number>();
+  for (const item of items) {
+    for (const tag of item.tags ?? []) {
+      const key = String(tag || "").trim();
+      if (!key) continue;
+      tagCounts.set(key, (tagCounts.get(key) ?? 0) + 1);
+    }
+  }
+
+  const topGenre = Array.from(tagCounts.entries()).sort((a, b) => b[1] - a[1])[0];
+
+  return {
+    total,
+    completed,
+    planned,
+    inProgress,
+    dropped,
+    avgRating,
+    topGenre: topGenre?.[0] ?? "—",
+    topGenreCount: topGenre?.[1] ?? 0,
+  };
+}
+
+function safeDateLabel(value?: string) {
+  if (!value) return "—";
+  try {
+    return new Date(value).toLocaleDateString();
+  } catch {
+    return value;
+  }
 }
 
 function playStackSoundEffect(kind: "hover" | "click" = "click", volume = 1) {
@@ -1003,7 +1173,14 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [query, setQuery] = useState("");
   const groupMode: GroupMode = "none";
   const [sortMode, setSortMode] = useState<SortMode>("newest");
+  const [favoriteOnly, setFavoriteOnly] = useState(false);
+  const [tagFilter, setTagFilter] = useState<string>("all");
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
+  const [friendProfileMobileTab, setFriendProfileMobileTab] = useState<"profile" | "library" | "stats">("profile");
   const [boardView, setBoardView] = useState<boolean>(true);
+  const [ownFriendPreviewOpen, setOwnFriendPreviewOpen] = useState(false);
+  const [adminFeedbackFilter, setAdminFeedbackFilter] = useState<"all" | "suggestion" | "problem" | "new" | "reviewed" | "done">("all");
+  const [adminHideDone, setAdminHideDone] = useState(true);
 
   useEffect(() => {
     try {
@@ -1019,6 +1196,14 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       }
     } catch {}
   }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(LOCAL_BOARD_VIEW_KEY);
+      if (raw !== null) return;
+      setBoardView((settings.defaultBoardView ?? DEFAULT_SETTINGS.defaultBoardView) === "board");
+    } catch {}
+  }, [settings.defaultBoardView]);
 
 
   const [autofillStatus, setAutofillStatus] = useState("");
@@ -1144,7 +1329,7 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
   const [form, setForm] = useState<Partial<MediaItem>>({
     title: "",
     type: "movie",
-    status: "planned",
+    status: DEFAULT_SETTINGS.defaultAddStatus,
     tags: [],
     inTheaters: false,
     notes: "",
@@ -1170,6 +1355,13 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
   useEffect(() => {
     formRef.current = form;
   }, [form]);
+
+  useEffect(() => {
+    const defaultStatus = settings.defaultAddStatus ?? DEFAULT_SETTINGS.defaultAddStatus;
+    const hasStartedTyping = String(form.title || "").trim().length > 0;
+    if (hasStartedTyping) return;
+    setForm((prev) => ({ ...prev, status: defaultStatus }));
+  }, [settings.defaultAddStatus, form.title]);
 
   // ✅ Friends UI
   const [friendsTab, setFriendsTab] = useState<"friends" | "requests">("friends");
@@ -2034,7 +2226,7 @@ function addItem(e: React.SyntheticEvent) {
   setForm((prev) => ({
     title: "",
     type: prev.type ?? "movie",
-    status: "planned",
+    status: settings.defaultAddStatus ?? DEFAULT_SETTINGS.defaultAddStatus,
     tags: [],
     inTheaters: false,
     notes: "",
@@ -2899,6 +3091,58 @@ async function pickForMe(mode: "best" | "random" = "best") {
     }
   }, [userId]);
 
+
+  const filteredAdminFeedbackRows = useMemo(() => {
+    return adminFeedbackRows.filter((entry) => {
+      if (adminHideDone && entry.status === "done") return false;
+      if (adminFeedbackFilter === "all") return true;
+      if (adminFeedbackFilter === "suggestion" || adminFeedbackFilter === "problem") return entry.type === adminFeedbackFilter;
+      return (entry.status ?? "new") === adminFeedbackFilter;
+    });
+  }, [adminFeedbackRows, adminFeedbackFilter, adminHideDone]);
+
+  const updateAdminFeedbackStatus = useCallback(
+    async (targetUserId: string, feedbackId: string, nextStatus: "new" | "reviewed" | "done") => {
+      if (!userId || !STACK_ADMIN_USER_IDS.includes(userId)) return;
+
+      try {
+        setAdminFeedbackStatus("Updating feedback…");
+        const { data, error } = await supabase
+          .from("media_items")
+          .select("data")
+          .eq("user_id", targetUserId)
+          .maybeSingle();
+
+        if (error) throw error;
+
+        const raw = data?.data && typeof data.data === "object" ? (data.data as Record<string, any>) : {};
+        const feedback = parseFeedbackEntries(raw.feedback).map((entry) =>
+          entry.id === feedbackId ? { ...entry, status: nextStatus } : entry
+        );
+
+        const { error: updateError } = await supabase
+          .from("media_items")
+          .upsert(
+            [{ user_id: targetUserId, data: { ...raw, feedback } }],
+            { onConflict: "user_id" }
+          );
+
+        if (updateError) throw updateError;
+
+        setAdminFeedbackRows((prev) =>
+          prev.map((entry) =>
+            entry.userId === targetUserId && entry.id === feedbackId ? { ...entry, status: nextStatus } : entry
+          )
+        );
+        setAdminFeedbackStatus("Feedback updated.");
+      } catch (e) {
+        console.error(e);
+        setAdminFeedbackStatus("Could not update feedback with the current sharing rules.");
+      }
+    },
+    [userId]
+  );
+
   useEffect(() => {
     if (view === "feedback" && isAdminUser) loadAdminFeedback();
   }, [view, isAdminUser, loadAdminFeedback]);
@@ -3033,9 +3277,13 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
     const q = friendProfileQuery.trim().toLowerCase();
     if (q) {
+      const privacy = profilePrivacyFromSettings(selectedFriendProfile.settings);
       out = out.filter((item) =>
-        [item.title, item.notes, item.tags?.join(" ")]
-          .some((value) => String(value || "").toLowerCase().includes(q))
+        [
+          item.title,
+          privacy.showNotes ? item.notes : "",
+          privacy.showTags ? item.tags?.join(" ") : "",
+        ].some((value) => String(value || "").toLowerCase().includes(q))
       );
     }
 
@@ -3047,6 +3295,60 @@ async function pickForMe(mode: "best" | "random" = "best") {
     for (const item of friendProfileFilteredItems) map[item.status].push(item);
     return map;
   }, [friendProfileFilteredItems]);
+
+  const selectedFriendProfileStats = useMemo(() => {
+    return computeVisibleProfileStats(selectedFriendProfile?.items ?? []);
+  }, [selectedFriendProfile]);
+
+  const ownFriendPreviewItems = useMemo(() => items.filter((item) => item && !item.isPrivate), [items]);
+  const ownFriendPreviewStats = useMemo(
+    () => computeVisibleProfileStats(ownFriendPreviewItems),
+    [ownFriendPreviewItems]
+  );
+
+  const selectedFriendComparison = useMemo(() => {
+    const friendItems = selectedFriendProfile?.items ?? [];
+    const friendCompletedTitles = new Set(
+      friendItems.filter((item) => item.status === "completed").map((item) => normTitle(item.title)).filter(Boolean)
+    );
+    const friendPlannedTitles = new Set(
+      friendItems.filter((item) => item.status === "planned").map((item) => normTitle(item.title)).filter(Boolean)
+    );
+    const friendInProgressTitles = new Set(
+      friendItems.filter((item) => item.status === "in_progress").map((item) => normTitle(item.title)).filter(Boolean)
+    );
+
+    const bothCompleted = items.filter((item) => item.status === "completed" && friendCompletedTitles.has(normTitle(item.title))).length;
+    const bothPlanned = items.filter((item) => item.status === "planned" && friendPlannedTitles.has(normTitle(item.title))).length;
+    const bothInProgress = items.filter((item) => item.status === "in_progress" && friendInProgressTitles.has(normTitle(item.title))).length;
+
+    const myTags = new Set(items.flatMap((item) => item.tags ?? []).map(normTag).filter(Boolean));
+    const sharedTagCounts = new Map<string, number>();
+    for (const item of friendItems) {
+      for (const tag of item.tags ?? []) {
+        const normalized = normTag(tag);
+        if (!normalized || !myTags.has(normalized)) continue;
+        sharedTagCounts.set(tag, (sharedTagCounts.get(tag) ?? 0) + 1);
+      }
+    }
+
+    const sharedTopTags = Array.from(sharedTagCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([tag]) => tag);
+
+    const typeCounts = new Map<MediaType, number>();
+    for (const item of friendItems) typeCounts.set(item.type, (typeCounts.get(item.type) ?? 0) + 1);
+    const friendTopType = Array.from(typeCounts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0];
+
+    return {
+      bothCompleted,
+      bothPlanned,
+      bothInProgress,
+      sharedTopTags: sharedTopTags.length ? sharedTopTags.join(" • ") : "—",
+      friendTopType: friendTopType ? TYPE_LABEL[friendTopType] : "—",
+    };
+  }, [items, selectedFriendProfile]);
 
   /* ================= FILTER ================= */
   const filteredFriendsList = useMemo(() => {
@@ -3100,6 +3402,23 @@ async function pickForMe(mode: "best" | "random" = "best") {
     });
   }, [incomingRequests, friendsQuery, getFriendDisplay]);
 
+  const tagFilterOptions = useMemo(() => {
+    const tagSet = new Set<string>();
+    for (const item of items) {
+      for (const tag of item.tags ?? []) {
+        const clean = String(tag || "").trim();
+        if (clean) tagSet.add(clean);
+      }
+    }
+
+    return [
+      { value: "all", label: "All tags" },
+      ...Array.from(tagSet)
+        .sort((a, b) => a.localeCompare(b))
+        .map((tag) => ({ value: tag, label: tag })),
+    ];
+  }, [items]);
+
   const filtered = useMemo(() => {
     let out = items.slice();
 
@@ -3108,13 +3427,20 @@ async function pickForMe(mode: "best" | "random" = "best") {
     if (view === "planned") out = out.filter((i) => i.status === "planned");
     if (view === "dropped") out = out.filter((i) => i.status === "dropped");
 
+    if (favoriteOnly) out = out.filter((i) => !!i.favorite);
+
+    if (tagFilter !== "all") {
+      const selectedTag = tagFilter.toLowerCase();
+      out = out.filter((i) => (i.tags ?? []).some((tag) => String(tag || "").toLowerCase() === selectedTag));
+    }
+
     if (query) {
       const q = query.toLowerCase();
       out = out.filter((i) => [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q)));
     }
 
     return sortMediaItems(out, sortMode);
-  }, [items, view, query, sortMode]);
+  }, [items, view, query, sortMode, favoriteOnly, tagFilter]);
 
   const grouped = useMemo(() => {
     if (groupMode === "none") return null;
@@ -3443,6 +3769,13 @@ async function pickForMe(mode: "best" | "random" = "best") {
   }, [items, excludeTypes]);
 
 
+  const clearStackFilters = useCallback(() => {
+    setQuery("");
+    setTagFilter("all");
+    setFavoriteOnly(false);
+    setMobileFiltersOpen(false);
+  }, []);
+
   const handleLogout = useCallback(async () => {
     if (!userId) return;
 
@@ -3486,22 +3819,30 @@ async function pickForMe(mode: "best" | "random" = "best") {
   const isWideBoard = view === "all" && boardView;
 
   const currentTheme = STACK_COLOR_THEMES[settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme];
-  const themeStyle = {
-    "--stack-theme-bg": currentTheme.bg,
-    "--stack-theme-fg": currentTheme.fg,
-    "--stack-theme-surface": currentTheme.surface,
-    "--stack-theme-accent": currentTheme.accent,
-    "--stack-theme-good": currentTheme.good,
-    "--stack-theme-good-border": currentTheme.goodBorder,
-    "--stack-theme-bad": currentTheme.bad,
-    "--stack-theme-bad-border": currentTheme.badBorder,
-    "--stack-theme-focus": currentTheme.focus,
-    "--stack-theme-ring": currentTheme.ring,
-  } as React.CSSProperties;
+  const themeStyle = STACK_COLOR_THEME_CSS_VARS[settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme] as React.CSSProperties;
+
+  useLayoutEffect(() => {
+    applyStackThemeToDocument(settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme);
+  }, [settings.colorTheme]);
 
   return (
-    <div className="min-h-screen stack-bg" style={themeStyle}>
+    <>
+    <script suppressHydrationWarning dangerouslySetInnerHTML={{ __html: STACK_THEME_BOOT_SCRIPT }} />
+    <div className={["min-h-screen stack-bg", settings.compactMode ? "stack-compact" : ""].filter(Boolean).join(" ")}>
       <style>{`
+        :root {
+          --stack-theme-bg: ${STACK_COLOR_THEMES.midnight.bg};
+          --stack-theme-fg: ${STACK_COLOR_THEMES.midnight.fg};
+          --stack-theme-surface: ${STACK_COLOR_THEMES.midnight.surface};
+          --stack-theme-accent: ${STACK_COLOR_THEMES.midnight.accent};
+          --stack-theme-good: ${STACK_COLOR_THEMES.midnight.good};
+          --stack-theme-good-border: ${STACK_COLOR_THEMES.midnight.goodBorder};
+          --stack-theme-bad: ${STACK_COLOR_THEMES.midnight.bad};
+          --stack-theme-bad-border: ${STACK_COLOR_THEMES.midnight.badBorder};
+          --stack-theme-focus: ${STACK_COLOR_THEMES.midnight.focus};
+          --stack-theme-ring: ${STACK_COLOR_THEMES.midnight.ring};
+        }
+
         .stack-bg {
           background: var(--stack-theme-bg) !important;
           color: var(--stack-theme-fg) !important;
@@ -3532,11 +3873,53 @@ async function pickForMe(mode: "best" | "random" = "best") {
           border-color: var(--stack-theme-focus) !important;
           box-shadow: 0 0 0 1px color-mix(in srgb, var(--stack-theme-focus) 42%, transparent);
         }
+
+
+        .stack-compact .p-5 { padding: 0.85rem !important; }
+        .stack-compact .p-4 { padding: 0.75rem !important; }
+        .stack-compact .p-3 { padding: 0.6rem !important; }
+        .stack-compact .space-y-6 > :not([hidden]) ~ :not([hidden]) { margin-top: 1rem !important; }
+        .stack-compact .space-y-4 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.75rem !important; }
+        .stack-compact .space-y-3 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.5rem !important; }
+        .stack-compact .rounded-3xl { border-radius: 1.15rem !important; }
+        .stack-compact .rounded-2xl { border-radius: 0.9rem !important; }
+
+        @media (max-width: 639px) {
+          .stack-bg { min-height: 100dvh; }
+
+          .stack-mobile-item-card {
+            background: rgba(8, 12, 22, 0.86) !important;
+            border-color: rgba(255,255,255,0.14) !important;
+            box-shadow: 0 18px 54px rgba(0,0,0,0.28);
+          }
+
+          .stack-mobile-item-card select,
+          .stack-mobile-item-card button,
+          .stack-mobile-item-card input {
+            min-height: 40px;
+          }
+
+          .stack-mobile-item-card [title="Open details"] {
+            width: 5rem !important;
+            height: 6.5rem !important;
+          }
+
+          .stack-mobile-readable-surface {
+            background: rgba(8, 12, 22, 0.88) !important;
+            border-color: rgba(255,255,255,0.14) !important;
+          }
+
+          .stack-mobile-scroll-panel {
+            max-height: min(82dvh, 780px);
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+          }
+        }
       `}</style>
       <div
         className={[
           isWideBoard ? "max-w-[104rem]" : "max-w-6xl",
-          "mx-auto px-3 sm:px-6 py-5 sm:py-6 space-y-6 min-w-0 overflow-x-hidden",
+          "mx-auto px-3 sm:px-6 py-5 pb-28 sm:py-6 sm:pb-6 space-y-6 min-w-0 overflow-x-hidden",
         ].join(" ")}
       >
         {/* Header */}
@@ -4398,6 +4781,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                                   setSelectedFriendProfileId(f.friend_id);
                                   setFriendProfileView("all");
                                   setFriendProfileQuery("");
+                                  setFriendProfileMobileTab("profile");
                                 }}
                                 className="text-sm text-neutral-200 hover:text-neutral-50 truncate text-left max-w-full"
                               >
@@ -4425,6 +4809,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                                   setSelectedFriendProfileId(f.friend_id);
                                   setFriendProfileView("all");
                                   setFriendProfileQuery("");
+                                  setFriendProfileMobileTab("profile");
                                 }}
                                 className="w-full text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-200"
                               >
@@ -4497,7 +4882,25 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   </button>
                 }
               >
-                <div className="rounded-2xl bg-neutral-950/60 border border-white/10 p-4 mb-4">
+                <div className="sm:hidden grid grid-cols-3 gap-2 mb-4 rounded-2xl stack-mobile-readable-surface border border-white/10 p-2">
+                  {(["profile", "library", "stats"] as const).map((tab) => (
+                    <button
+                      key={tab}
+                      type="button"
+                      onClick={() => setFriendProfileMobileTab(tab)}
+                      className={[
+                        "px-3 py-2 rounded-xl border text-xs capitalize transition",
+                        friendProfileMobileTab === tab
+                          ? "bg-white/15 border-white/25 text-neutral-50"
+                          : "bg-white/5 border-white/10 text-neutral-300",
+                      ].join(" ")}
+                    >
+                      {tab}
+                    </button>
+                  ))}
+                </div>
+
+                <div className={["rounded-2xl bg-neutral-950/60 border border-white/10 p-4 mb-4", friendProfileMobileTab === "library" ? "hidden sm:block" : ""].join(" ")}>
                   <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
                     <div className="min-w-0">
                       <div className="text-xl font-semibold text-neutral-100 truncate">
@@ -4513,10 +4916,45 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   </div>
 
                   <div className="mt-3 text-sm text-neutral-300 whitespace-pre-wrap">
-                    {selectedFriendProfile.settings.profileBio?.trim() || "No profile description yet."}
+                    {selectedFriendProfile.settings.showProfileBioToFriends === false
+                      ? "Profile description hidden by this user."
+                      : selectedFriendProfile.settings.profileBio?.trim() || "No profile description yet."}
+                  </div>
+
+                  <div className="grid grid-cols-2 lg:grid-cols-5 gap-2 mt-4">
+                    <MiniStat label="Visible" value={String(selectedFriendProfileStats.total)} sub="items" />
+                    <MiniStat label="Completed" value={String(selectedFriendProfileStats.completed)} sub="finished" />
+                    <MiniStat label="In progress" value={String(selectedFriendProfileStats.inProgress)} sub="active" />
+                    <MiniStat
+                      label="Average"
+                      value={selectedFriendProfile.settings.showRatingsToFriends === false ? "Hidden" : formatRatingValue(selectedFriendProfileStats.avgRating, settings.ratingFormat)}
+                      sub="rating"
+                    />
+                    <MiniStat
+                      label="Top genre"
+                      value={selectedFriendProfile.settings.showTagsToFriends === false ? "Hidden" : selectedFriendProfileStats.topGenre}
+                      sub={selectedFriendProfile.settings.showTagsToFriends === false ? "tags" : `${selectedFriendProfileStats.topGenreCount}`}
+                    />
                   </div>
                 </div>
 
+                <div className={["rounded-2xl bg-neutral-950/60 border border-white/10 p-4 mb-4", friendProfileMobileTab === "stats" ? "" : "hidden sm:block"].join(" ")}>
+                  <div className="flex items-center justify-between gap-3 mb-3">
+                    <div>
+                      <div className="text-sm font-medium text-neutral-200">Comparison with your Stack</div>
+                      <div className="text-xs text-neutral-500">Based only on visible public titles and tags.</div>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
+                    <MiniStat label="Both completed" value={String(selectedFriendComparison.bothCompleted)} sub="same titles" />
+                    <MiniStat label="Both planned" value={String(selectedFriendComparison.bothPlanned)} sub="same titles" />
+                    <MiniStat label="Both active" value={String(selectedFriendComparison.bothInProgress)} sub="in progress" />
+                    <MiniStat label="Shared genres" value={selectedFriendComparison.sharedTopTags} sub="top overlap" />
+                    <MiniStat label="Friend top type" value={selectedFriendComparison.friendTopType} sub="visible library" />
+                  </div>
+                </div>
+
+                <div className={["space-y-4", friendProfileMobileTab === "library" ? "" : "hidden sm:block"].join(" ")}>
                 <div className="flex flex-wrap gap-2 mb-4">
                   <button
                     type="button"
@@ -4579,6 +5017,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                     <FriendReadOnlyBoardView
                       items={friendProfileFilteredItems}
                       ratingFormat={settings.ratingFormat ?? "ten"}
+                      privacy={profilePrivacyFromSettings(selectedFriendProfile.settings)}
                     />
                   ) : (
                     <div className="space-y-5">
@@ -4601,6 +5040,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                                   key={item.id}
                                   item={item}
                                   ratingFormat={settings.ratingFormat ?? "ten"}
+                                  privacy={profilePrivacyFromSettings(selectedFriendProfile.settings)}
                                 />
                               ))}
                             </div>
@@ -4612,6 +5052,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 ) : (
                   <div className="text-sm text-neutral-500">No visible items match this profile filter. Private items stay hidden.</div>
                 )}
+                </div>
               </Panel>
             ) : null}
 
@@ -4676,10 +5117,14 @@ async function pickForMe(mode: "best" | "random" = "best") {
                           </div>
                           <div className="text-[11px] text-neutral-500 mt-1">
                             {item.__ownerName} • {TYPE_LABEL[item.type]} • {item.status.replace("_", " ")}
-                            {item.rating !== undefined ? ` • ${formatRatingValue(item.rating, settings.ratingFormat)}` : ""}
+                            {friendSettingsById.get(item.__ownerId)?.showRatingsToFriends === false
+                              ? ""
+                              : item.rating !== undefined
+                              ? ` • ${formatRatingValue(item.rating, settings.ratingFormat)}`
+                              : ""}
                             {item.favorite ? " • Favorite" : ""}
                           </div>
-                          {item.tags?.length ? (
+                          {friendSettingsById.get(item.__ownerId)?.showTagsToFriends !== false && item.tags?.length ? (
                             <div className="text-[11px] text-neutral-600 mt-1 truncate">{item.tags.join(" • ")}</div>
                           ) : null}
                         </div>
@@ -4906,25 +5351,65 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   Only the admin account shows this section. It gathers saved Suggestions / Problems from visible Stack data.
                 </div>
 
+                <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,220px)_auto] gap-3 items-end mb-4">
+                  <Select
+                    label="Admin filter"
+                    value={adminFeedbackFilter}
+                    onChange={(v) => setAdminFeedbackFilter(v as typeof adminFeedbackFilter)}
+                    options={[
+                      { value: "all", label: "All feedback" },
+                      { value: "suggestion", label: "Suggestions only" },
+                      { value: "problem", label: "Problems only" },
+                      { value: "new", label: "New" },
+                      { value: "reviewed", label: "Reviewed" },
+                      { value: "done", label: "Done" },
+                    ]}
+                  />
+                  <Toggle label="Hide done" checked={adminHideDone} onChange={setAdminHideDone} />
+                </div>
+
                 <div className="space-y-2">
-                  {adminFeedbackRows.length ? (
-                    adminFeedbackRows.map((f) => (
+                  {filteredAdminFeedbackRows.length ? (
+                    filteredAdminFeedbackRows.map((f) => (
                       <div key={`${f.userId}:${f.id}`} className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm">
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div className="min-w-0 flex-1">
                             <div className="text-xs text-neutral-500 mb-1">
-                              {f.type === "problem" ? "Problem" : "Suggestion"} • {new Date(f.createdAt).toLocaleString()}
+                              {f.type === "problem" ? "Problem" : "Suggestion"} • {(f.status ?? "new").toUpperCase()} • {new Date(f.createdAt).toLocaleString()}
                             </div>
                             <div className="text-[11px] text-neutral-600 mb-2 truncate">
                               From: {f.userLabel} • {f.userId}
                             </div>
                             <div className="text-sm text-neutral-200 whitespace-pre-wrap">{f.message}</div>
                           </div>
+                          <div className="flex flex-wrap gap-2 sm:justify-end">
+                            <button
+                              type="button"
+                              onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "new")}
+                              className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                            >
+                              New
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "reviewed")}
+                              className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                            >
+                              Reviewed
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "done")}
+                              className="text-xs px-3 py-2 rounded-xl stack-good hover:opacity-95"
+                            >
+                              Done
+                            </button>
+                          </div>
                         </div>
                       </div>
                     ))
                   ) : (
-                    <div className="text-sm text-neutral-500">No submitted feedback visible yet.</div>
+                    <div className="text-sm text-neutral-500">No submitted feedback matches this filter yet.</div>
                   )}
                 </div>
               </Panel>
@@ -4964,6 +5449,92 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   placeholder="Anything you want shown on your Stack profile later..."
                 />
               </div>
+            </Panel>
+
+            <Panel title="Friend profile privacy">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                <Toggle
+                  label="Show bio to friends"
+                  checked={settings.showProfileBioToFriends !== false}
+                  onChange={(v) => updateSettings({ showProfileBioToFriends: v })}
+                />
+                <Toggle
+                  label="Show ratings to friends"
+                  checked={settings.showRatingsToFriends !== false}
+                  onChange={(v) => updateSettings({ showRatingsToFriends: v })}
+                />
+                <Toggle
+                  label="Show notes to friends"
+                  checked={settings.showNotesToFriends !== false}
+                  onChange={(v) => updateSettings({ showNotesToFriends: v })}
+                />
+                <Toggle
+                  label="Show tags to friends"
+                  checked={settings.showTagsToFriends !== false}
+                  onChange={(v) => updateSettings({ showTagsToFriends: v })}
+                />
+              </div>
+              <div className="text-[11px] text-neutral-500 mt-3">
+                Private items are always hidden. These controls decide what details friends see on public items.
+              </div>
+            </Panel>
+
+            <Panel
+              title="Preview what friends can see"
+              right={
+                <button
+                  type="button"
+                  onClick={() => setOwnFriendPreviewOpen((prev) => !prev)}
+                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                >
+                  {ownFriendPreviewOpen ? "Hide preview" : "Show preview"}
+                </button>
+              }
+            >
+              <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
+                <MiniStat label="Visible" value={String(ownFriendPreviewStats.total)} sub="items" />
+                <MiniStat label="Completed" value={String(ownFriendPreviewStats.completed)} sub="finished" />
+                <MiniStat label="In progress" value={String(ownFriendPreviewStats.inProgress)} sub="active" />
+                <MiniStat
+                  label="Average"
+                  value={settings.showRatingsToFriends === false ? "Hidden" : formatRatingValue(ownFriendPreviewStats.avgRating, settings.ratingFormat)}
+                  sub="rating"
+                />
+                <MiniStat
+                  label="Top genre"
+                  value={settings.showTagsToFriends === false ? "Hidden" : ownFriendPreviewStats.topGenre}
+                  sub={settings.showTagsToFriends === false ? "tags" : `${ownFriendPreviewStats.topGenreCount}`}
+                />
+              </div>
+
+              {ownFriendPreviewOpen ? (
+                <div className="mt-4 space-y-3">
+                  {(settings.showProfileBioToFriends === false ? "Profile description hidden." : settings.profileBio?.trim() || "No profile description yet.") ? (
+                    <div className="rounded-2xl bg-neutral-950/70 border border-white/10 px-3 py-3 text-sm text-neutral-300 whitespace-pre-wrap">
+                      {settings.showProfileBioToFriends === false
+                        ? "Profile description hidden."
+                        : settings.profileBio?.trim() || "No profile description yet."}
+                    </div>
+                  ) : null}
+                  {ownFriendPreviewItems.length ? (
+                    ownFriendPreviewItems.slice(0, 5).map((item) => (
+                      <FriendReadOnlyRow
+                        key={`preview:${item.id}`}
+                        item={item}
+                        ratingFormat={settings.ratingFormat ?? "ten"}
+                        privacy={profilePrivacyFromSettings(settings)}
+                      />
+                    ))
+                  ) : (
+                    <div className="text-sm text-neutral-500">Friends would not see any items yet because your items are private or your Stack is empty.</div>
+                  )}
+                  {ownFriendPreviewItems.length > 5 ? (
+                    <div className="text-xs text-neutral-500">Showing the first 5 visible items.</div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="text-xs text-neutral-500 mt-3">Open this to see your Stack the way a friend would see it.</div>
+              )}
             </Panel>
 
             <Panel title="Site preferences">
@@ -5017,6 +5588,51 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   <div className="text-[11px] text-neutral-500 mt-3">
                     Current theme: {STACK_COLOR_THEME_OPTIONS.find((t) => t.value === (settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme))?.description}.
                   </div>
+                </div>
+
+                <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
+                  <Select
+                    label="Default add status"
+                    value={settings.defaultAddStatus ?? DEFAULT_SETTINGS.defaultAddStatus}
+                    onChange={(v) => {
+                      const nextStatus = v as Status;
+                      updateSettings({ defaultAddStatus: nextStatus });
+                      if (!String(form.title || "").trim()) setForm((prev) => ({ ...prev, status: nextStatus }));
+                    }}
+                    options={[
+                      { value: "completed", label: "Completed" },
+                      { value: "in_progress", label: "In Progress" },
+                      { value: "planned", label: "Planned" },
+                      { value: "dropped", label: "Dropped" },
+                    ]}
+                  />
+                  <div className="text-[11px] text-neutral-500">
+                    New items on the Add page start with this status unless you change it.
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
+                  <Select
+                    label="Default All page view"
+                    value={settings.defaultBoardView ?? DEFAULT_SETTINGS.defaultBoardView}
+                    onChange={(v) => {
+                      const nextView = v as "board" | "list";
+                      updateSettings({ defaultBoardView: nextView });
+                      setBoardView(nextView === "board");
+                    }}
+                    options={[
+                      { value: "board", label: "Board view" },
+                      { value: "list", label: "List view" },
+                    ]}
+                  />
+                  <div className="text-[11px] text-neutral-500">
+                    This also switches the current All page layout.
+                  </div>
+                  <Toggle
+                    label="Compact mode"
+                    checked={!!settings.compactMode}
+                    onChange={(v) => updateSettings({ compactMode: v })}
+                  />
                 </div>
 
                 <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
@@ -5093,11 +5709,54 @@ async function pickForMe(mode: "best" | "random" = "best") {
               />
             </div>
 
+            <div className="sm:hidden flex items-center justify-between gap-3 rounded-2xl stack-mobile-readable-surface border border-white/10 px-3 py-3">
+              <button
+                type="button"
+                onClick={() => setMobileFiltersOpen(true)}
+                className="flex-1 text-sm px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-neutral-100"
+              >
+                Filters
+              </button>
+              <button
+                type="button"
+                onClick={clearStackFilters}
+                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-300"
+              >
+                Clear
+              </button>
+            </div>
+
+            <div className="hidden sm:flex sm:flex-row sm:items-end sm:justify-between gap-3 rounded-2xl bg-neutral-950/55 border border-white/10 px-3 py-3">
+              <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,220px)_auto] gap-3 items-end w-full sm:w-auto">
+                <Select
+                  label="Tag filter"
+                  value={tagFilter}
+                  onChange={setTagFilter}
+                  options={tagFilterOptions}
+                />
+                <Toggle label="Favorites only" checked={favoriteOnly} onChange={setFavoriteOnly} />
+              </div>
+              <button
+                type="button"
+                onClick={clearStackFilters}
+                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-300"
+              >
+                Clear filters
+              </button>
+            </div>
+
             {view === "all" ? (
               <div className="flex items-center justify-between">
                 <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
                 <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
               </div>
+            ) : null}
+
+            {filtered.length === 0 ? (
+              <EmptyState
+                title="No items match this view"
+                message="Try clearing search, tag, or favorite filters, or add something new to your Stack."
+              />
             ) : null}
 
             <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
@@ -5172,6 +5831,94 @@ async function pickForMe(mode: "best" | "random" = "best") {
         <footer className="pt-6 text-xs text-neutral-500">Stack • Saves to Supabase + local backup</footer>
       </div>
 
+      {view !== "stats" && view !== "add" && view !== "friends" && view !== "feed" && view !== "discover" && view !== "feedback" && view !== "settings" && mobileFiltersOpen ? (
+        <div className="sm:hidden fixed inset-0 z-50 bg-black/70" onMouseDown={() => setMobileFiltersOpen(false)}>
+          <div
+            className="absolute inset-x-0 bottom-0 rounded-t-3xl stack-mobile-readable-surface border-t border-white/10 p-4 pb-[calc(1rem+env(safe-area-inset-bottom))] shadow-2xl"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3 mb-4">
+              <div>
+                <div className="text-base font-semibold text-neutral-100">Filters</div>
+                <div className="text-xs text-neutral-500">Search, sort, tags, favorites, and view.</div>
+              </div>
+              <button type="button" onClick={() => setMobileFiltersOpen(false)} className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10">
+                Close
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <label className="block">
+                <div className="text-xs text-neutral-400 mb-1">Search</div>
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search title, notes, tags..."
+                  className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base outline-none focus:border-neutral-500"
+                />
+              </label>
+
+              <Select
+                label="Sort"
+                value={sortMode}
+                onChange={(v) => setSortMode(v as SortMode)}
+                options={[
+                  { value: "newest", label: "Newest first" },
+                  { value: "oldest", label: "Oldest first" },
+                  { value: "title", label: "Title (A–Z)" },
+                  { value: "rating_high", label: "Rating (high → low)" },
+                  { value: "rating_low", label: "Rating (low → high)" },
+                  { value: "updated", label: "Last updated" },
+                  { value: "favorites", label: "Favorites first" },
+                ]}
+              />
+
+              <Select label="Tag filter" value={tagFilter} onChange={setTagFilter} options={tagFilterOptions} />
+              <Toggle label="Favorites only" checked={favoriteOnly} onChange={setFavoriteOnly} />
+              {view === "all" ? <Toggle label="Board view" checked={boardView} onChange={setBoardView} /> : null}
+
+              <div className="grid grid-cols-2 gap-2 pt-2">
+                <button type="button" onClick={clearStackFilters} className="text-sm px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10">
+                  Clear filters
+                </button>
+                <button type="button" onClick={() => setMobileFiltersOpen(false)} className="text-sm px-3 py-2 rounded-xl stack-good hover:opacity-95">
+                  Apply
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {view !== "add" ? (
+        <Link href="/add" className="sm:hidden fixed right-4 bottom-[5.35rem] z-40 px-4 py-3 rounded-2xl stack-good border border-white/10 shadow-2xl text-sm font-medium text-neutral-50" aria-label="Add to Stack">
+          + Add
+        </Link>
+      ) : null}
+
+      <nav className="sm:hidden fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-neutral-950/90 backdrop-blur-xl px-2 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))]" aria-label="Mobile Stack navigation">
+        <div className="grid grid-cols-5 gap-1 max-w-md mx-auto">
+          {[
+            { href: "/", label: "All", key: "all" as StackView },
+            { href: "/add", label: "Add", key: "add" as StackView },
+            { href: "/friends", label: "Friends", key: "friends" as StackView },
+            { href: "/stats", label: "Stats", key: "stats" as StackView },
+            { href: "/settings", label: "Settings", key: "settings" as StackView },
+          ].map((n) => (
+            <Link
+              key={n.href}
+              href={n.href}
+              className={[
+                "min-h-[46px] rounded-2xl grid place-items-center px-1 text-[11px] border transition",
+                view === n.key ? "bg-white/15 border-white/25 text-neutral-50" : "bg-white/5 border-white/10 text-neutral-300",
+              ].join(" ")}
+            >
+              {n.label}
+            </Link>
+          ))}
+        </div>
+      </nav>
+
       {/* ✅ UNDO TOAST */}
       {undoState ? (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50">
@@ -5210,6 +5957,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
         </div>
       ) : null}
     </div>
+    </>
   );
 }
 
@@ -5294,8 +6042,9 @@ function MALRow({
   const [draftRating, setDraftRating] = React.useState(typeof item.rating === "number" ? String(item.rating) : "");
   const [draftNotes, setDraftNotes] = React.useState(item.notes ?? "");
 
-  // full note modal
+  // full detail / note modals
   const [showFullNote, setShowFullNote] = React.useState(false);
+  const [showDetail, setShowDetail] = React.useState(false);
 
   // keep drafts in sync if item changes while not editing
   useEffect(() => {
@@ -5387,6 +6136,17 @@ function MALRow({
 
   return (
     <>
+      {showDetail ? (
+        <MediaItemDetailModal
+          item={item}
+          ratingFormat={ratingFormat}
+          friendsById={friendsById}
+          onUpdate={onUpdate}
+          onDelete={onDelete}
+          onClose={() => setShowDetail(false)}
+        />
+      ) : null}
+
       {/* FULL NOTE MODAL */}
       {showFullNote ? (
         <div
@@ -5417,17 +6177,22 @@ function MALRow({
         </div>
       ) : null}
 
-      <div className="rounded-2xl bg-neutral-950/72 ring-1 ring-neutral-800/80 overflow-hidden">
+      <div className="stack-mobile-item-card rounded-2xl bg-neutral-950/72 ring-1 ring-neutral-800/80 overflow-hidden">
         <div className="grid grid-cols-1 sm:grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 p-3 items-center">
           {/* Poster */}
-          <div className="w-[72px] h-[96px] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
+          <button
+            type="button"
+            onClick={() => setShowDetail(true)}
+            className="w-[72px] h-[96px] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800 block"
+            title="Open details"
+          >
             {displayPoster ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
             ) : (
               <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">No cover</div>
             )}
-          </div>
+          </button>
 
           {/* Title + meta */}
           <div className="min-w-0">
@@ -5442,7 +6207,13 @@ function MALRow({
                     placeholder="Title"
                   />
                 ) : (
-                  <div className="font-semibold truncate">{item.title}</div>
+                  <button
+                    type="button"
+                    onClick={() => setShowDetail(true)}
+                    className="font-semibold truncate text-left hover:text-neutral-50 max-w-full"
+                  >
+                    {item.title}
+                  </button>
                 )}
 
                 {/* STATUS + DATE */}
@@ -5758,8 +6529,9 @@ function CardDraggable({
         : `${cur ?? 0}`
       : "—";
 
-        // ---------------- NOTES (BOARD VIEW) ----------------
+        // ---------------- NOTES / DETAIL (BOARD VIEW) ----------------
   const [showNote, setShowNote] = React.useState(false);
+  const [showDetail, setShowDetail] = React.useState(false);
   const [draftNote, setDraftNote] = React.useState(item.notes ?? "");
 
   useEffect(() => {
@@ -5769,6 +6541,17 @@ function CardDraggable({
 
   return (
     <>
+      {showDetail ? (
+        <MediaItemDetailModal
+          item={item}
+          ratingFormat={ratingFormat}
+          friendsById={friendsById}
+          onUpdate={onUpdate}
+          onDelete={onDelete}
+          onClose={() => setShowDetail(false)}
+        />
+      ) : null}
+
       {/* NOTE MODAL */}
       {showNote ? (
         <div
@@ -5840,7 +6623,7 @@ function CardDraggable({
         ref={setNodeRef}
         style={style}
         className={[
-          "rounded-2xl bg-neutral-950/74 border border-neutral-800 shadow-sm overflow-hidden",
+          "stack-mobile-item-card rounded-2xl bg-neutral-950/74 border border-neutral-800 shadow-sm overflow-hidden",
           isDragging ? "opacity-70" : "opacity-100",
         ].join(" ")}
       >
@@ -5858,14 +6641,19 @@ function CardDraggable({
         <div className="p-4 flex gap-4">
           {/* LEFT: poster + note button */}
           <div className="shrink-0 space-y-2">
-            <div className="w-16 h-20 rounded-xl overflow-hidden bg-neutral-900 border border-neutral-800">
+            <button
+              type="button"
+              onClick={() => setShowDetail(true)}
+              className="w-16 h-20 rounded-xl overflow-hidden bg-neutral-900 border border-neutral-800 block"
+              title="Open details"
+            >
               {displayPoster ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
               ) : (
                 <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">—</div>
               )}
-            </div>
+            </button>
 
             <button
               type="button"
@@ -5883,7 +6671,13 @@ function CardDraggable({
           </div>
 
           <div className="min-w-0 flex-1">
-            <div className="font-semibold text-base text-neutral-200 truncate">{item.title}</div>
+            <button
+              type="button"
+              onClick={() => setShowDetail(true)}
+              className="font-semibold text-base text-neutral-200 truncate text-left hover:text-neutral-50 max-w-full"
+            >
+              {item.title}
+            </button>
 
             <div className="text-[11px] text-neutral-500 mt-1">
               {item.type === "game"
@@ -5999,7 +6793,167 @@ function readOnlyProgressLabel(item: MediaItem) {
   return "—";
 }
 
-function FriendReadOnlyBoardView({ items, ratingFormat }: { items: MediaItem[]; ratingFormat: RatingFormat }) {
+function MediaItemDetailModal({
+  item,
+  ratingFormat,
+  privacy = profilePrivacyFromSettings(),
+  friendsById,
+  onClose,
+  onUpdate,
+  onDelete,
+}: {
+  item: MediaItem;
+  ratingFormat: RatingFormat;
+  privacy?: ProfilePrivacyOptions;
+  friendsById?: Map<string, string>;
+  onClose: () => void;
+  onUpdate?: (patch: Partial<MediaItem>) => void;
+  onDelete?: () => void;
+}) {
+  const displayPoster = item.posterOverrideUrl || item.posterUrl;
+  const withFriends = (item.withFriendIds ?? [])
+    .map((id) => friendsById?.get(id) ?? id)
+    .filter(Boolean);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-end sm:place-items-center bg-black/70 p-0 sm:p-4"
+      onMouseDown={onClose}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div
+        className="w-full max-w-3xl max-h-[92dvh] sm:max-h-[86vh] rounded-t-3xl sm:rounded-2xl bg-neutral-950 border border-neutral-800 shadow-2xl overflow-hidden flex flex-col"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-neutral-800">
+          <div className="min-w-0">
+            <div className="text-sm text-neutral-200 font-medium truncate">{item.title}</div>
+            <div className="text-[11px] text-neutral-500">
+              {TYPE_LABEL[item.type]} • {item.status.replace("_", " ")}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="p-4 grid grid-cols-1 sm:grid-cols-[140px_minmax(0,1fr)] gap-4 overflow-y-auto stack-mobile-scroll-panel">
+          <div className="w-32 sm:w-full max-w-[160px] mx-auto sm:mx-0 aspect-[2/3] rounded-2xl overflow-hidden bg-neutral-900 border border-neutral-800">
+            {displayPoster ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
+            ) : (
+              <div className="w-full h-full grid place-items-center text-xs text-neutral-600">No cover</div>
+            )}
+          </div>
+
+          <div className="min-w-0 space-y-3">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+              <MiniStat label="Status" value={item.status.replace("_", " ")} />
+              <MiniStat label="Type" value={TYPE_LABEL[item.type]} />
+              <MiniStat label={item.type === "game" ? "Hours" : "Progress"} value={readOnlyProgressLabel(item)} />
+              <MiniStat label="Rating" value={privacy.showRatings ? formatRatingValue(item.rating, ratingFormat) : "Hidden"} />
+            </div>
+
+            <div className="rounded-2xl bg-neutral-900/40 border border-white/10 px-3 py-3 text-sm text-neutral-300">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-neutral-400">
+                <div>Date watched: <span className="text-neutral-200">{item.dateFinished || "—"}</span></div>
+                <div>Updated: <span className="text-neutral-200">{safeDateLabel(item.updatedAt ?? item.createdAt)}</span></div>
+                <div>Rewatch count: <span className="text-neutral-200">{Number(item.rewatchCount ?? 0) || 0}</span></div>
+                <div>Visibility: <span className="text-neutral-200">{item.isPrivate ? "Private" : "Public"}</span></div>
+              </div>
+            </div>
+
+            {privacy.showNotes ? (
+              <div className="rounded-2xl bg-neutral-900/40 border border-white/10 px-3 py-3">
+                <div className="text-xs text-neutral-500 mb-1">Notes</div>
+                <div className="text-sm text-neutral-200 whitespace-pre-wrap leading-relaxed">{item.notes || "No notes yet."}</div>
+              </div>
+            ) : null}
+
+            {privacy.showTags ? (
+              <div className="rounded-2xl bg-neutral-900/40 border border-white/10 px-3 py-3">
+                <div className="text-xs text-neutral-500 mb-2">Tags</div>
+                {item.tags?.length ? (
+                  <div className="flex flex-wrap gap-2">
+                    {item.tags.map((tag) => (
+                      <span key={tag} className="px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-xs text-neutral-200">
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-sm text-neutral-500">No tags yet.</div>
+                )}
+              </div>
+            ) : null}
+
+            {withFriends.length ? (
+              <div className="text-xs text-neutral-500">With: {withFriends.join(" • ")}</div>
+            ) : null}
+
+            {onUpdate || onDelete ? (
+              <div className="sticky bottom-0 flex flex-wrap gap-2 pt-3 pb-1 border-t border-white/10 bg-neutral-950/95 backdrop-blur">
+                {onUpdate ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => onUpdate({ favorite: !item.favorite })}
+                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                    >
+                      {item.favorite ? "Remove favorite" : "Favorite"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onUpdate({ isPrivate: !item.isPrivate })}
+                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                    >
+                      {item.isPrivate ? "Make public" : "Make private"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onUpdate({ status: "completed" })}
+                      className="text-xs px-3 py-2 rounded-xl stack-good hover:opacity-95"
+                    >
+                      Mark completed
+                    </button>
+                  </>
+                ) : null}
+                {onDelete ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onDelete();
+                      onClose();
+                    }}
+                    className="text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+                  >
+                    Delete
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FriendReadOnlyBoardView({
+  items,
+  ratingFormat,
+  privacy = profilePrivacyFromSettings(),
+}: {
+  items: MediaItem[];
+  ratingFormat: RatingFormat;
+  privacy?: ProfilePrivacyOptions;
+}) {
   const byStatus = useMemo(() => {
     const map: Record<Status, MediaItem[]> = { completed: [], in_progress: [], planned: [], dropped: [] };
     for (const item of items) map[item.status].push(item);
@@ -6020,7 +6974,7 @@ function FriendReadOnlyBoardView({ items, ratingFormat }: { items: MediaItem[]; 
 
           <div className="space-y-3">
             {byStatus[status.id].map((item) => (
-              <FriendReadOnlyCard key={item.id} item={item} ratingFormat={ratingFormat} />
+              <FriendReadOnlyCard key={item.id} item={item} ratingFormat={ratingFormat} privacy={privacy} />
             ))}
             {!byStatus[status.id].length ? (
               <div className="text-xs text-neutral-600 text-center py-8">No visible items</div>
@@ -6032,54 +6986,109 @@ function FriendReadOnlyBoardView({ items, ratingFormat }: { items: MediaItem[]; 
   );
 }
 
-function FriendReadOnlyCard({ item, ratingFormat }: { item: MediaItem; ratingFormat: RatingFormat }) {
+function FriendReadOnlyCard({
+  item,
+  ratingFormat,
+  privacy = profilePrivacyFromSettings(),
+}: {
+  item: MediaItem;
+  ratingFormat: RatingFormat;
+  privacy?: ProfilePrivacyOptions;
+}) {
+  const [showDetail, setShowDetail] = React.useState(false);
   const displayPoster = item.posterOverrideUrl || item.posterUrl;
-
-  return (
-    <div className="rounded-2xl bg-neutral-950/74 border border-neutral-800 shadow-sm overflow-hidden">
-      <div className="flex items-center justify-between gap-2 px-3 py-2 bg-neutral-950 border-b border-neutral-800">
-        <div className="text-xs text-neutral-500 capitalize">{item.status.replace("_", " ")}</div>
-        <div className="text-xs text-neutral-400">{TYPE_LABEL[item.type]}</div>
-      </div>
-
-      <div className="p-4 flex gap-4">
-        <div className="shrink-0">
-          <div className="w-16 h-20 rounded-xl overflow-hidden bg-neutral-900 border border-neutral-800">
-            {displayPoster ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
-            ) : (
-              <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">—</div>
-            )}
-          </div>
-        </div>
-
-        <div className="min-w-0 flex-1">
-          <div className="font-semibold text-base text-neutral-200 truncate">{item.title}</div>
-          <div className="text-[11px] text-neutral-500 mt-1">
-            {item.type === "game" ? "Hours" : "Progress"}: {readOnlyProgressLabel(item)}
-          </div>
-          <div className="text-[11px] text-neutral-500 mt-1">Score: {formatRatingValue(item.rating, ratingFormat)}</div>
-          {item.notes ? <div className="text-[11px] text-neutral-400 mt-1 line-clamp-2">{item.notes}</div> : null}
-          {item.tags?.length ? <div className="text-[11px] text-neutral-500 mt-1 line-clamp-1">{item.tags.join(" • ")}</div> : null}
-          <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
-            {item.favorite ? (
-              <span className="px-2 py-1 rounded-lg bg-amber-400/10 border border-amber-400/20 text-neutral-200">Favorite</span>
-            ) : null}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function FriendReadOnlyRow({ item, ratingFormat }: { item: MediaItem; ratingFormat: RatingFormat }) {
-  const [showFullNote, setShowFullNote] = React.useState(false);
-  const displayPoster = item.posterOverrideUrl || item.posterUrl;
-  const hasLongNote = !!item.notes && item.notes.length > 120;
 
   return (
     <>
+      {showDetail ? (
+        <MediaItemDetailModal
+          item={item}
+          ratingFormat={ratingFormat}
+          privacy={privacy}
+          onClose={() => setShowDetail(false)}
+        />
+      ) : null}
+
+      <div className="rounded-2xl bg-neutral-950/74 border border-neutral-800 shadow-sm overflow-hidden">
+        <div className="flex items-center justify-between gap-2 px-3 py-2 bg-neutral-950 border-b border-neutral-800">
+          <div className="text-xs text-neutral-500 capitalize">{item.status.replace("_", " ")}</div>
+          <div className="text-xs text-neutral-400">{TYPE_LABEL[item.type]}</div>
+        </div>
+
+        <div className="p-4 flex gap-4">
+          <div className="shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowDetail(true)}
+              className="w-16 h-20 rounded-xl overflow-hidden bg-neutral-900 border border-neutral-800 block"
+            >
+              {displayPoster ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
+              ) : (
+                <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">—</div>
+              )}
+            </button>
+          </div>
+
+          <div className="min-w-0 flex-1">
+            <button
+              type="button"
+              onClick={() => setShowDetail(true)}
+              className="font-semibold text-base text-neutral-200 truncate text-left hover:text-neutral-50 max-w-full"
+            >
+              {item.title}
+            </button>
+            <div className="text-[11px] text-neutral-500 mt-1">
+              {item.type === "game" ? "Hours" : "Progress"}: {readOnlyProgressLabel(item)}
+            </div>
+            {privacy.showRatings ? (
+              <div className="text-[11px] text-neutral-500 mt-1">Score: {formatRatingValue(item.rating, ratingFormat)}</div>
+            ) : null}
+            {privacy.showNotes && item.notes ? (
+              <div className="text-[11px] text-neutral-400 mt-1 line-clamp-2">{item.notes}</div>
+            ) : null}
+            {privacy.showTags && item.tags?.length ? (
+              <div className="text-[11px] text-neutral-500 mt-1 line-clamp-1">{item.tags.join(" • ")}</div>
+            ) : null}
+            <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+              {item.favorite ? (
+                <span className="px-2 py-1 rounded-lg bg-amber-400/10 border border-amber-400/20 text-neutral-200">Favorite</span>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function FriendReadOnlyRow({
+  item,
+  ratingFormat,
+  privacy = profilePrivacyFromSettings(),
+}: {
+  item: MediaItem;
+  ratingFormat: RatingFormat;
+  privacy?: ProfilePrivacyOptions;
+}) {
+  const [showFullNote, setShowFullNote] = React.useState(false);
+  const [showDetail, setShowDetail] = React.useState(false);
+  const displayPoster = item.posterOverrideUrl || item.posterUrl;
+  const visibleNote = privacy.showNotes ? item.notes : undefined;
+  const hasLongNote = !!visibleNote && visibleNote.length > 120;
+
+  return (
+    <>
+      {showDetail ? (
+        <MediaItemDetailModal
+          item={item}
+          ratingFormat={ratingFormat}
+          privacy={privacy}
+          onClose={() => setShowDetail(false)}
+        />
+      ) : null}
+
       {showFullNote ? (
         <div
           className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4"
@@ -6103,25 +7112,31 @@ function FriendReadOnlyRow({ item, ratingFormat }: { item: MediaItem; ratingForm
             </div>
             <div className="p-4">
               <div className="text-xs text-neutral-500 mb-2">Full note</div>
-              <div className="text-sm text-neutral-200 whitespace-pre-wrap leading-relaxed">{item.notes || "—"}</div>
+              <div className="text-sm text-neutral-200 whitespace-pre-wrap leading-relaxed">{visibleNote || "—"}</div>
             </div>
           </div>
         </div>
       ) : null}
 
-      <div className="rounded-2xl bg-neutral-950/72 ring-1 ring-neutral-800/80 overflow-hidden">
+      <div className="stack-mobile-item-card rounded-2xl bg-neutral-950/72 ring-1 ring-neutral-800/80 overflow-hidden">
         <div className="grid grid-cols-1 sm:grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(120px,18%)] gap-3 p-3 items-center">
-          <div className="w-[72px] h-[96px] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
+          <button
+            type="button"
+            onClick={() => setShowDetail(true)}
+            className="w-[72px] h-[96px] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800 block"
+          >
             {displayPoster ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
             ) : (
               <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">No cover</div>
             )}
-          </div>
+          </button>
 
           <div className="min-w-0">
-            <div className="font-semibold truncate">{item.title}</div>
+            <button type="button" onClick={() => setShowDetail(true)} className="font-semibold truncate text-left hover:text-neutral-50 max-w-full">
+              {item.title}
+            </button>
             <div className="text-xs text-neutral-400 mt-1 flex flex-wrap items-center gap-2">
               <span className="capitalize">{item.status.replace("_", " ")}</span>
               {item.dateFinished ? (
@@ -6138,9 +7153,9 @@ function FriendReadOnlyRow({ item, ratingFormat }: { item: MediaItem; ratingForm
               ) : null}
             </div>
 
-            {item.notes ? (
+            {visibleNote ? (
               <div className="mt-2">
-                <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div>
+                <div className="text-xs text-neutral-300 line-clamp-2">{visibleNote}</div>
                 {hasLongNote ? (
                   <button
                     type="button"
@@ -6153,7 +7168,7 @@ function FriendReadOnlyRow({ item, ratingFormat }: { item: MediaItem; ratingForm
               </div>
             ) : null}
 
-            {item.tags?.length ? (
+            {privacy.showTags && item.tags?.length ? (
               <div className="text-[11px] text-neutral-500 mt-1 truncate">{item.tags.join(" • ")}</div>
             ) : null}
 
@@ -6164,7 +7179,9 @@ function FriendReadOnlyRow({ item, ratingFormat }: { item: MediaItem; ratingForm
             </div>
           </div>
 
-          <div className="text-center text-sm text-neutral-300 tabular-nums">{formatRatingValue(item.rating, ratingFormat)}</div>
+          <div className="text-center text-sm text-neutral-300 tabular-nums">
+            {privacy.showRatings ? formatRatingValue(item.rating, ratingFormat) : "Hidden"}
+          </div>
           <div className="text-center text-sm text-neutral-300">{TYPE_LABEL[item.type]}</div>
           <div className="text-center text-sm text-neutral-200 tabular-nums whitespace-nowrap">{readOnlyProgressLabel(item)}</div>
         </div>
@@ -6198,6 +7215,15 @@ function Panel({
         {right ? <div className="shrink-0">{right}</div> : null}
       </div>
       {children}
+    </div>
+  );
+}
+
+function EmptyState({ title, message }: { title: string; message: string }) {
+  return (
+    <div className="rounded-3xl bg-neutral-950/55 border border-white/10 px-5 py-8 text-center shadow-sm">
+      <div className="text-sm font-medium text-neutral-200">{title}</div>
+      <div className="text-xs text-neutral-500 mt-2 max-w-md mx-auto">{message}</div>
     </div>
   );
 }
