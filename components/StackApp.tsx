@@ -1246,6 +1246,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     }>
   >([]);
 
+  const [siteUsers, setSiteUsers] = useState<SiteUserRow[]>([]);
+  const [siteUsersStatus, setSiteUsersStatus] = useState("");
+  const [siteUsersQuery, setSiteUsersQuery] = useState("");
+
   const [selectedFriendProfileId, setSelectedFriendProfileId] = useState<string | null>(null);
   const [friendProfileView, setFriendProfileView] = useState<"all" | Status>("all");
   const [friendProfileQuery, setFriendProfileQuery] = useState("");
@@ -1587,6 +1591,12 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
 
 type ProfileRow = { id: string; username: string | null; display_name?: string | null };
 
+type SiteUserRow = ProfileRow & {
+  displayLabel: string;
+  subLabel: string;
+  source: "profile" | "stack" | "both";
+};
+
 type IncomingRequestRow = {
   id: string;
   requester_id: string;
@@ -1807,6 +1817,81 @@ const loadOutgoingFriendRequests = useCallback(
   [userId]
 );
 
+const loadSiteUsers = useCallback(async () => {
+  if (!userId) return;
+
+  try {
+    setSiteUsersStatus("Loading users…");
+
+    const byId = new Map<string, SiteUserRow>();
+
+    const profileResult = await supabase
+      .from("profiles")
+      .select("id, username, display_name")
+      .limit(300);
+
+    if (profileResult.error) {
+      console.warn(profileResult.error);
+    }
+
+    for (const row of (profileResult.data ?? []) as ProfileRow[]) {
+      if (!row?.id || row.id === userId) continue;
+
+      const username = row.username?.trim() || "";
+      const displayName = row.display_name?.trim() || "";
+      const displayLabel = displayName || username || row.id;
+      const subLabel = username ? `@${username}` : row.id;
+
+      byId.set(row.id, {
+        id: row.id,
+        username: username || null,
+        display_name: displayName || null,
+        displayLabel,
+        subLabel,
+        source: "profile",
+      });
+    }
+
+    // Best-effort merge from Stack settings. If RLS hides some rows, the profile list still works.
+    const stackResult = await supabase
+      .from("media_items")
+      .select("user_id,data")
+      .limit(500);
+
+    if (stackResult.error) {
+      console.warn(stackResult.error);
+    }
+
+    for (const row of (stackResult.data ?? []) as Array<{ user_id: string; data: any }>) {
+      if (!row?.user_id || row.user_id === userId) continue;
+
+      const rowSettings = normalizeSettings(row?.data?.settings);
+      const displayName = rowSettings.displayName?.trim() || "";
+      const usernameTag = rowSettings.usernameTag?.trim().replace(/^@+/, "") || "";
+      const existing = byId.get(row.user_id);
+
+      const displayLabel = displayName || existing?.displayLabel || usernameTag || row.user_id;
+      const subLabel = usernameTag ? `@${usernameTag}` : existing?.subLabel || row.user_id;
+
+      byId.set(row.user_id, {
+        id: row.user_id,
+        username: existing?.username || usernameTag || null,
+        display_name: displayName || existing?.display_name || usernameTag || null,
+        displayLabel,
+        subLabel,
+        source: existing ? "both" : "stack",
+      });
+    }
+
+    const rows = Array.from(byId.values()).sort((a, b) => a.displayLabel.localeCompare(b.displayLabel));
+    setSiteUsers(rows);
+    setSiteUsersStatus(rows.length ? `Showing ${rows.length} user${rows.length === 1 ? "" : "s"}.` : "No users are visible yet.");
+  } catch (e) {
+    console.error(e);
+    setSiteUsersStatus("Could not load users with the current sharing rules.");
+  }
+}, [userId]);
+
 async function acceptFriendRequest(
   requestId: string,
   requesterId: string,
@@ -1925,23 +2010,14 @@ async function removeFriend(friendId: string) {
   await loadFriends(userId);
 }
 
-async function sendFriendRequest() {
-  setFriendStatus("");
-
+async function addProfileAsFriend(profile: ProfileRow, opts?: { clearInput?: boolean }) {
   if (!userId) {
     setFriendStatus("You must be logged in.");
     return;
   }
 
-  const { profile, ambiguous } = await findProfileByUsernameOrDisplayName(inputUsername);
-
-  if (ambiguous) {
-    setFriendStatus("More than one person matches that display name. Ask them for their exact Stack username.");
-    return;
-  }
-
   if (!profile?.id) {
-    setFriendStatus("User not found. Ask them to log into Stack once after setting their display name, or try their exact Stack username.");
+    setFriendStatus("User not found.");
     return;
   }
 
@@ -1952,35 +2028,7 @@ async function sendFriendRequest() {
     return;
   }
 
-  const finishFriendAdd = async (messagePrefix = "Friend request sent") => {
-    // RLS-safe: only create YOUR row in friends.
-    // The other person's row is created when their account loads Stack and auto-accepts the pending request.
-    const { error: friendshipError } = await supabase
-      .from("friends")
-      .upsert(
-        [{ user_id: userId, friend_id: profile.id }],
-        { onConflict: "user_id,friend_id" }
-      );
-
-    if (friendshipError) {
-      console.error(friendshipError);
-      setFriendStatus(friendshipError.message || "Found the user, but could not create your friendship row.");
-      return false;
-    }
-
-    setFriendStatus(`${messagePrefix}: ${profileLabel}. They will be added on their side when they open Stack.`);
-    setInputUsername("");
-
-    await Promise.all([
-      loadFriends(userId),
-      loadOutgoingFriendRequests(userId),
-      loadIncomingFriendRequests(userId, { autoAccept: false }),
-    ]);
-
-    return true;
-  };
-
-  // already friends?
+  // already friends on your side?
   const { data: existingFriend, error: friendCheckErr } = await supabase
     .from("friends")
     .select("friend_id")
@@ -1995,49 +2043,81 @@ async function sendFriendRequest() {
     return;
   }
 
-  // existing pending request either direction?
-  const { data: existingReq, error: reqErr } = await supabase
-    .from("friend_requests")
-    .select("id, status, requester_id, requested_id")
-    .or(
-      `and(requester_id.eq.${userId},requested_id.eq.${profile.id}),and(requester_id.eq.${profile.id},requested_id.eq.${userId})`
-    )
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  // RLS-safe: only create YOUR row in friends. This avoids the policy error.
+  const { error: friendshipError } = await supabase
+    .from("friends")
+    .upsert(
+      [{ user_id: userId, friend_id: profile.id }],
+      { onConflict: "user_id,friend_id" }
+    );
 
-  if (reqErr) console.error(reqErr);
+  if (friendshipError) {
+    console.error(friendshipError);
+    setFriendStatus(friendshipError.message || "Found the user, but could not add them with the current sharing rules.");
+    return;
+  }
 
-  if (existingReq?.id && existingReq.status === "pending") {
-    if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
-      setFriendStatus(`${profileLabel} already requested you — accepting…`);
+  // Best-effort request row so the other person can auto-complete their side later.
+  // If this is blocked or already exists, your own friend row still works.
+  try {
+    const { data: existingReq } = await supabase
+      .from("friend_requests")
+      .select("id, status, requester_id, requested_id")
+      .or(
+        `and(requester_id.eq.${userId},requested_id.eq.${profile.id}),and(requester_id.eq.${profile.id},requested_id.eq.${userId})`
+      )
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (existingReq?.id && existingReq.status === "pending" && existingReq.requester_id === profile.id) {
       await acceptFriendRequest(existingReq.id, profile.id);
-      setInputUsername("");
-      return;
+    } else if (!existingReq?.id) {
+      const requestInsert = await supabase.from("friend_requests").insert({
+        requester_id: userId,
+        requested_id: profile.id,
+        status: "pending",
+      });
+      if (requestInsert.error) console.warn(requestInsert.error);
     }
-
-    // You already sent the request before. Make sure YOUR side exists, but leave
-    // the request pending so the other person can auto-accept and create their side.
-    await finishFriendAdd("Friend request already sent");
-    return;
+  } catch (e) {
+    console.warn(e);
   }
 
-  // Keep a pending request row so the other account can auto-accept on their next load.
-  const requestInsert = await supabase.from("friend_requests").insert({
-    requester_id: userId,
-    requested_id: profile.id,
-    status: "pending",
-  });
+  setFriendStatus(`Added ${profileLabel}. They can add you back from the Users list when they open Stack.`);
+  if (opts?.clearInput) setInputUsername("");
 
-  if (requestInsert.error) {
-    console.error(requestInsert.error);
-    setFriendStatus(requestInsert.error.message || "Found the user, but could not send the friend request.");
-    return;
-  }
-
-  await finishFriendAdd("Friend request sent");
+  await Promise.all([
+    loadFriends(userId),
+    loadOutgoingFriendRequests(userId),
+    loadIncomingFriendRequests(userId, { autoAccept: false }),
+    loadFriendActivity(),
+    loadSiteUsers(),
+  ]);
 }
 
+async function sendFriendRequest() {
+  setFriendStatus("");
+
+  if (!userId) {
+    setFriendStatus("You must be logged in.");
+    return;
+  }
+
+  const { profile, ambiguous } = await findProfileByUsernameOrDisplayName(inputUsername);
+
+  if (ambiguous) {
+    setFriendStatus("More than one person matches that display name. Pick them from the Users list or ask for their exact Stack username.");
+    return;
+  }
+
+  if (!profile?.id) {
+    setFriendStatus("User not found. Ask them to log into Stack once, or pick them from the Users list below.");
+    return;
+  }
+
+  await addProfileAsFriend(profile, { clearInput: true });
+}
 
 const parseFeedbackEntries = (rawFeedback: unknown): FeedbackEntry[] => {
   return Array.isArray(rawFeedback)
@@ -2200,6 +2280,10 @@ useEffect(() => {
   loadOutgoingFriendRequests(userId);
   loadFriends(userId);
 }, [userId, loadIncomingFriendRequests, loadOutgoingFriendRequests, loadFriends]);
+
+useEffect(() => {
+  if (view === "friends" && userId) loadSiteUsers();
+}, [view, userId, loadSiteUsers]);
 
 useEffect(() => {
   if (!userId || !cloudLoaded) return;
@@ -3565,6 +3649,28 @@ async function pickForMe(mode: "best" | "random" = "best") {
   }, [items, selectedFriendProfile]);
 
   /* ================= FILTER ================= */
+  const filteredSiteUsers = useMemo(() => {
+    const q = siteUsersQuery.trim().toLowerCase();
+    const friendIds = new Set(friendsList.map((f) => f.friend_id));
+
+    return siteUsers
+      .slice()
+      .sort((a, b) => {
+        const aFriend = friendIds.has(a.id) ? 1 : 0;
+        const bFriend = friendIds.has(b.id) ? 1 : 0;
+        if (aFriend !== bFriend) return aFriend - bFriend;
+        return a.displayLabel.localeCompare(b.displayLabel);
+      })
+      .filter((u) => {
+        if (!q) return true;
+        return [u.displayLabel, u.subLabel, u.username, u.display_name, u.id]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase()
+          .includes(q);
+      });
+  }, [siteUsers, siteUsersQuery, friendsList]);
+
   const filteredFriendsList = useMemo(() => {
     const q = friendsQuery.trim().toLowerCase();
 
@@ -4959,6 +5065,73 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
               {friendStatus ? <div className="mt-3 text-sm text-neutral-300">{friendStatus}</div> : null}
             </div>
+
+            <Panel
+              title="Users on Stack"
+              right={
+                <button
+                  type="button"
+                  onClick={loadSiteUsers}
+                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                >
+                  Refresh users
+                </button>
+              }
+            >
+              <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3 items-end">
+                <label className="block">
+                  <div className="text-xs text-neutral-400 mb-1">Search users</div>
+                  <input
+                    value={siteUsersQuery}
+                    onChange={(e) => setSiteUsersQuery(e.target.value)}
+                    placeholder="Search display names or usernames..."
+                    className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
+                  />
+                </label>
+                <div className="text-xs text-neutral-500 sm:text-right pb-1">{siteUsersStatus}</div>
+              </div>
+
+              <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {filteredSiteUsers.length ? (
+                  filteredSiteUsers.map((u) => {
+                    const alreadyFriend = friendsList.some((f) => f.friend_id === u.id);
+                    const pending = outgoingRequests.some((r) => r.requested_id === u.id);
+
+                    return (
+                      <div
+                        key={u.id}
+                        className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="text-sm font-medium text-neutral-200 truncate">{u.displayLabel}</div>
+                            <div className="text-[11px] text-neutral-500 truncate">{u.subLabel}</div>
+                            <div className="text-[10px] text-neutral-700 truncate">{u.id}</div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={alreadyFriend}
+                            onClick={() => addProfileAsFriend(u)}
+                            className={[
+                              "text-xs px-3 py-2 rounded-xl border whitespace-nowrap",
+                              alreadyFriend
+                                ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-200/80 cursor-default"
+                                : "bg-white/10 border-white/10 hover:bg-white/15 text-neutral-100",
+                            ].join(" ")}
+                          >
+                            {alreadyFriend ? "Friends" : pending ? "Add again" : "Add friend"}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="text-sm text-neutral-500 sm:col-span-2">
+                    No users match this search. If nobody appears, the profiles table may not be visible with the current sharing rules.
+                  </div>
+                )}
+              </div>
+            </Panel>
 
             {/* List panel (table header row like main pages) */}
             <div className="rounded-3xl bg-neutral-950/68 ring-1 ring-white/10 shadow-xl shadow-black/10 backdrop-blur-xl p-4 sm:p-6">
