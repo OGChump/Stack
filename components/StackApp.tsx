@@ -1836,20 +1836,19 @@ async function acceptFriendRequest(
     return;
   }
 
-  // 2) create friendships both directions (avoid duplicates)
+  // 2) RLS-safe friendship insert.
+  // Most Supabase policies only allow a user to insert rows where friends.user_id = auth.uid().
+  // So the receiver creates only their own side here. The requester creates their side when they send.
   const { error: frErr } = await supabase
     .from("friends")
     .upsert(
-      [
-        { user_id: me, friend_id: requesterId },
-        { user_id: requesterId, friend_id: me },
-      ],
+      [{ user_id: me, friend_id: requesterId }],
       { onConflict: "user_id,friend_id" }
     );
 
   if (frErr) {
     console.error(frErr);
-    setFriendStatus(frErr.message || "Accepted, but failed to create friendship rows.");
+    setFriendStatus(frErr.message || "Accepted, but failed to create your friendship row.");
   } else {
     setFriendStatus(AUTO_ACCEPT_FRIEND_REQUESTS ? "Friend added ✅ (auto-accepted)" : "Friend added ✅");
   }
@@ -1953,24 +1952,23 @@ async function sendFriendRequest() {
     return;
   }
 
-  const finishFriendAdd = async (messagePrefix = "Friend added") => {
+  const finishFriendAdd = async (messagePrefix = "Friend request sent") => {
+    // RLS-safe: only create YOUR row in friends.
+    // The other person's row is created when their account loads Stack and auto-accepts the pending request.
     const { error: friendshipError } = await supabase
       .from("friends")
       .upsert(
-        [
-          { user_id: userId, friend_id: profile.id },
-          { user_id: profile.id, friend_id: userId },
-        ],
+        [{ user_id: userId, friend_id: profile.id }],
         { onConflict: "user_id,friend_id" }
       );
 
     if (friendshipError) {
       console.error(friendshipError);
-      setFriendStatus(friendshipError.message || "Found the user, but could not create the friendship.");
+      setFriendStatus(friendshipError.message || "Found the user, but could not create your friendship row.");
       return false;
     }
 
-    setFriendStatus(`${messagePrefix}: ${profileLabel}.`);
+    setFriendStatus(`${messagePrefix}: ${profileLabel}. They will be added on their side when they open Stack.`);
     setInputUsername("");
 
     await Promise.all([
@@ -2018,30 +2016,26 @@ async function sendFriendRequest() {
       return;
     }
 
-    // You already sent the request before. Instead of staying stuck as pending,
-    // finish the friendship immediately so adding friends works both directions.
-    await supabase
-      .from("friend_requests")
-      .update({ status: "accepted" })
-      .eq("id", existingReq.id)
-      .eq("requester_id", userId)
-      .eq("requested_id", profile.id);
-
-    await finishFriendAdd("Friend added from your pending request");
+    // You already sent the request before. Make sure YOUR side exists, but leave
+    // the request pending so the other person can auto-accept and create their side.
+    await finishFriendAdd("Friend request already sent");
     return;
   }
 
-  // Keep a request row for history if the current sharing rules allow it.
-  // The friendship itself is created below, so this can be best-effort.
+  // Keep a pending request row so the other account can auto-accept on their next load.
   const requestInsert = await supabase.from("friend_requests").insert({
     requester_id: userId,
     requested_id: profile.id,
-    status: "accepted",
+    status: "pending",
   });
 
-  if (requestInsert.error) console.warn(requestInsert.error);
+  if (requestInsert.error) {
+    console.error(requestInsert.error);
+    setFriendStatus(requestInsert.error.message || "Found the user, but could not send the friend request.");
+    return;
+  }
 
-  await finishFriendAdd("Friend added");
+  await finishFriendAdd("Friend request sent");
 }
 
 
@@ -3179,21 +3173,18 @@ async function pickForMe(mode: "best" | "random" = "best") {
         const friendship = await supabase
           .from("friends")
           .upsert(
-            [
-              { user_id: userId, friend_id: adminId },
-              { user_id: adminId, friend_id: userId },
-            ],
+            [{ user_id: userId, friend_id: adminId }],
             { onConflict: "user_id,friend_id" }
           );
 
         if (friendship.error) console.warn(friendship.error);
 
-        // Keep a request/history row too. If the friendship upsert is blocked by RLS,
-        // the admin's normal auto-accept flow can still accept this later.
+        // Keep a pending request/history row so the admin account can auto-accept
+        // and create the admin-side friendship row without violating RLS.
         const requestInsert = await supabase.from("friend_requests").insert({
           requester_id: userId,
           requested_id: adminId,
-          status: friendship.error ? "pending" : "accepted",
+          status: "pending",
         });
 
         if (requestInsert.error) console.warn(requestInsert.error);
