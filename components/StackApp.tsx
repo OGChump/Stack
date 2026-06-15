@@ -202,10 +202,17 @@ type ActivityEntry = {
   favorite?: boolean;
 };
 
+type AdminFeedbackEntry = FeedbackEntry & {
+  userId: string;
+  userLabel: string;
+};
+
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
 const LOCAL_LAST_GOOD_KEY = "stack-items-backup-v1-last-good";
 const LOCAL_BOARD_VIEW_KEY = "stack-board-view-v1";
 const LOCAL_COLOR_THEME_KEY = "stack-color-theme-v1";
+const STACK_ADMIN_USER_IDS = ["a990813e-af9d-4e1c-a15d-2e9281128c71"];
+
 
 function backupKeyForUser(uid?: string | null) {
   return uid ? `${LOCAL_BACKUP_KEY}:${uid}` : LOCAL_BACKUP_KEY;
@@ -415,7 +422,7 @@ function normalizeSettings(raw: unknown): StackSettings {
     soundEffects: typeof obj.soundEffects === "boolean" ? obj.soundEffects : DEFAULT_SETTINGS.soundEffects,
     soundVolume:
       typeof obj.soundVolume === "number" && Number.isFinite(obj.soundVolume)
-        ? clamp(obj.soundVolume, 0.25, 2)
+        ? clamp(obj.soundVolume, 0.25, 3)
         : DEFAULT_SETTINGS.soundVolume,
     ratingFormat,
     colorTheme,
@@ -486,7 +493,7 @@ function playStackSoundEffect(kind: "hover" | "click" = "click", volume = 1) {
     const ctx = new AudioCtor();
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
-    const safeVolume = clamp(Number.isFinite(volume) ? volume : 1, 0.25, 2);
+    const safeVolume = clamp(Number.isFinite(volume) ? volume : 1, 0.25, 3);
 
     osc.type = "sine";
     osc.frequency.value = kind === "click" ? 620 : 430;
@@ -1054,6 +1061,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     }>
   >([]);
 
+  const [selectedFriendProfileId, setSelectedFriendProfileId] = useState<string | null>(null);
+  const [friendProfileView, setFriendProfileView] = useState<"all" | Status>("all");
+  const [friendProfileQuery, setFriendProfileQuery] = useState("");
+  const [friendProfileSortMode, setFriendProfileSortMode] = useState<SortMode>("updated");
+  const [friendProfileBoardView, setFriendProfileBoardView] = useState(false);
+
+  const isAdminUser = !!userId && STACK_ADMIN_USER_IDS.includes(userId);
+  const [adminFeedbackRows, setAdminFeedbackRows] = useState<AdminFeedbackEntry[]>([]);
+  const [adminFeedbackStatus, setAdminFeedbackStatus] = useState("");
+
 
 
   const [picks, setPicks] = useState<MediaPick[]>([]);
@@ -1394,24 +1411,55 @@ type FriendRow = {
 
 const AUTO_ACCEPT_FRIEND_REQUESTS = true;
 
-/** Prefer exact match so we don’t error when multiple rows match */
-const findProfileByUsername = useCallback(async (username: string): Promise<ProfileRow | null> => {
-  const u = username.trim();
-  if (!u) return null;
+/** Prefer exact username first, then display name. Display names can repeat, so ambiguous matches ask for username. */
+const findProfileByUsernameOrDisplayName = useCallback(
+  async (input: string): Promise<{ profile: ProfileRow | null; ambiguous?: boolean }> => {
+    const q = input.trim();
+    if (!q) return { profile: null };
 
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id, username, display_name")
-    .eq("username", u)
-    .maybeSingle();
+    const { data: usernameMatch, error: usernameError } = await supabase
+      .from("profiles")
+      .select("id, username, display_name")
+      .eq("username", q)
+      .maybeSingle();
 
-  if (error) {
-    console.error(error);
-    return null;
-  }
+    if (usernameError) console.error(usernameError);
+    if (usernameMatch?.id) return { profile: usernameMatch as ProfileRow };
 
-  return (data as ProfileRow) ?? null;
-}, []);
+    const { data: exactDisplayMatches, error: exactDisplayError } = await supabase
+      .from("profiles")
+      .select("id, username, display_name")
+      .ilike("display_name", q)
+      .limit(3);
+
+    if (exactDisplayError) {
+      console.error(exactDisplayError);
+      return { profile: null };
+    }
+
+    const exactMatches = (exactDisplayMatches ?? []) as ProfileRow[];
+    if (exactMatches.length === 1) return { profile: exactMatches[0] };
+    if (exactMatches.length > 1) return { profile: null, ambiguous: true };
+
+    const { data: partialDisplayMatches, error: partialDisplayError } = await supabase
+      .from("profiles")
+      .select("id, username, display_name")
+      .ilike("display_name", `%${q}%`)
+      .limit(3);
+
+    if (partialDisplayError) {
+      console.error(partialDisplayError);
+      return { profile: null };
+    }
+
+    const partialMatches = (partialDisplayMatches ?? []) as ProfileRow[];
+    if (partialMatches.length === 1) return { profile: partialMatches[0] };
+    if (partialMatches.length > 1) return { profile: null, ambiguous: true };
+
+    return { profile: null };
+  },
+  []
+);
 
 /** ✅ DEFINE THIS FIRST so it can be referenced safely below */
 const loadFriends = useCallback(
@@ -1619,10 +1667,15 @@ async function sendFriendRequest() {
     return;
   }
 
-  const profile = await findProfileByUsername(inputUsername);
+  const { profile, ambiguous } = await findProfileByUsernameOrDisplayName(inputUsername);
+
+  if (ambiguous) {
+    setFriendStatus("More than one person matches that display name. Ask them for their exact Stack username.");
+    return;
+  }
 
   if (!profile?.id) {
-    setFriendStatus("User not found. (Make sure you typed their Stack username exactly.)");
+    setFriendStatus("User not found. Try their Stack username or display name.");
     return;
   }
 
@@ -2806,6 +2859,50 @@ async function pickForMe(mode: "best" | "random" = "best") {
     setFeedbackText("");
   }, [feedbackText, feedbackType]);
 
+  const loadAdminFeedback = useCallback(async () => {
+    if (!userId || !STACK_ADMIN_USER_IDS.includes(userId)) return;
+
+    try {
+      setAdminFeedbackStatus("Loading all feedback…");
+
+      const { data, error } = await supabase
+        .from("media_items")
+        .select("user_id,data");
+
+      if (error) {
+        console.error(error);
+        setAdminFeedbackStatus("Admin feedback is unavailable with the current sharing rules.");
+        return;
+      }
+
+      const rows: AdminFeedbackEntry[] = [];
+
+      for (const row of (data ?? []) as Array<{ user_id: string; data: any }>) {
+        const rowSettings = normalizeSettings(row?.data?.settings);
+        const userLabel = rowSettings.displayName?.trim() || rowSettings.usernameTag?.trim() || row.user_id;
+        const entries = parseFeedbackEntries(row?.data?.feedback);
+
+        for (const entry of entries) {
+          rows.push({
+            ...entry,
+            userId: row.user_id,
+            userLabel,
+          });
+        }
+      }
+
+      rows.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      setAdminFeedbackRows(rows);
+      setAdminFeedbackStatus(rows.length ? `Loaded ${rows.length} feedback item${rows.length === 1 ? "" : "s"}.` : "No feedback submitted yet.");
+    } catch {
+      setAdminFeedbackStatus("Admin feedback is unavailable right now.");
+    }
+  }, [userId]);
+
+  useEffect(() => {
+    if (view === "feedback" && isAdminUser) loadAdminFeedback();
+  }, [view, isAdminUser, loadAdminFeedback]);
+
   const loadFriendActivity = useCallback(async () => {
     if (!friendsList.length) {
       setFriendActivityRows([]);
@@ -2904,6 +3001,52 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
     return sortMediaItems(rows, friendLibrarySortMode);
   }, [friendActivityRows, friendLibraryFriendId, friendLibraryStatus, friendLibrarySortMode, friendsNameById]);
+
+  const selectedFriendProfile = useMemo(() => {
+    if (!selectedFriendProfileId) return null;
+
+    const friend = friendsList.find((f) => f.friend_id === selectedFriendProfileId);
+    if (!friend) return null;
+
+    const activityRow = friendActivityRows.find((row) => row.user_id === selectedFriendProfileId);
+    const profileSettings = normalizeSettings(activityRow?.data?.settings);
+    const display = getFriendDisplay(friend.friend_id, friend.friend);
+    const visibleItems = Array.isArray(activityRow?.data?.items)
+      ? (activityRow!.data.items as MediaItem[]).filter((item) => item && !item.isPrivate)
+      : [];
+
+    return {
+      id: friend.friend_id,
+      friend,
+      display,
+      settings: profileSettings,
+      items: visibleItems,
+    };
+  }, [selectedFriendProfileId, friendsList, friendActivityRows, getFriendDisplay]);
+
+  const friendProfileFilteredItems = useMemo(() => {
+    if (!selectedFriendProfile) return [];
+
+    let out = selectedFriendProfile.items.slice();
+
+    if (friendProfileView !== "all") out = out.filter((item) => item.status === friendProfileView);
+
+    const q = friendProfileQuery.trim().toLowerCase();
+    if (q) {
+      out = out.filter((item) =>
+        [item.title, item.notes, item.tags?.join(" ")]
+          .some((value) => String(value || "").toLowerCase().includes(q))
+      );
+    }
+
+    return sortMediaItems(out, friendProfileSortMode);
+  }, [selectedFriendProfile, friendProfileView, friendProfileQuery, friendProfileSortMode]);
+
+  const friendProfileByStatus = useMemo(() => {
+    const map: Record<Status, MediaItem[]> = { completed: [], in_progress: [], planned: [], dropped: [] };
+    for (const item of friendProfileFilteredItems) map[item.status].push(item);
+    return map;
+  }, [friendProfileFilteredItems]);
 
   /* ================= FILTER ================= */
   const filteredFriendsList = useMemo(() => {
@@ -3299,6 +3442,41 @@ async function pickForMe(mode: "best" | "random" = "best") {
     return { thisYearTop, lastYearTop, year: y };
   }, [items, excludeTypes]);
 
+
+  const handleLogout = useCallback(async () => {
+    if (!userId) return;
+
+    try {
+      setSaveStatus("Logging out…");
+
+      // Preserve the latest signed-in library backup before ending the session.
+      if (items.length > 0) saveLocalBackup(items, userId);
+
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+
+      setUserId(null);
+      setItems([]);
+      setFeedbackEntries([]);
+      setFriendsList([]);
+      setIncomingRequests([]);
+      setOutgoingRequests([]);
+      setFriendActivityRows([]);
+      setSelectedFriendProfileId(null);
+      setSelectedFriendIds([]);
+      setCloudLoaded(false);
+      setCloudExtraData({});
+      setSaveStatus("Logged out");
+
+      if (typeof window !== "undefined") {
+        window.location.href = "/";
+      }
+    } catch (e) {
+      console.error(e);
+      setSaveStatus("Logout failed");
+    }
+  }, [items, userId, saveLocalBackup]);
+
   /* ================= UI ================= */
 
   const displayCombinedTags = useMemo(() => {
@@ -3368,7 +3546,18 @@ async function pickForMe(mode: "best" | "random" = "best") {
               <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight">Stack</h1>
               <p className="text-sm text-neutral-400">Your personal media website</p>
             </div>
-            <div className="text-xs text-neutral-500 sm:text-right">{saveStatus}</div>
+            <div className="flex flex-col sm:items-end gap-2">
+              <div className="text-xs text-neutral-500 sm:text-right">{saveStatus}</div>
+              {userId ? (
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-300"
+                >
+                  Log out
+                </button>
+              ) : null}
+            </div>
           </div>
 
           <nav className="space-y-2" aria-label="Stack navigation">
@@ -4151,7 +4340,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-sm font-medium text-neutral-200">Add a friend</div>
-                  <div className="text-xs text-neutral-500">Enter their Stack username (profiles.username)</div>
+                  <div className="text-xs text-neutral-500">Enter their Stack username or display name</div>
                 </div>
               </div>
 
@@ -4159,7 +4348,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 <input
                   value={inputUsername}
                   onChange={(e) => setInputUsername(e.target.value)}
-                  placeholder="Enter username (e.g., OGChump)"
+                  placeholder="Enter username or display name (e.g., OGChump or Norey)"
                   className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
                 />
                 <button
@@ -4203,9 +4392,17 @@ async function pickForMe(mode: "best" | "random" = "best") {
                         >
                           <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(220px,280px)] gap-3 items-center">
                             <div className="min-w-0">
-                              <div className="text-sm text-neutral-200 truncate">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedFriendProfileId(f.friend_id);
+                                  setFriendProfileView("all");
+                                  setFriendProfileQuery("");
+                                }}
+                                className="text-sm text-neutral-200 hover:text-neutral-50 truncate text-left max-w-full"
+                              >
                                 {display.primary}
-                              </div>
+                              </button>
                               <div className="text-[11px] text-neutral-600 truncate">{display.secondary}</div>
                               {display.hasCustomTag ? (
                                 <div className="text-[11px] text-emerald-300/80 mt-1">Showing your nickname first</div>
@@ -4222,6 +4419,17 @@ async function pickForMe(mode: "best" | "random" = "best") {
                                   className="w-full rounded-lg bg-neutral-900 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
                                 />
                               </label>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedFriendProfileId(f.friend_id);
+                                  setFriendProfileView("all");
+                                  setFriendProfileQuery("");
+                                }}
+                                className="w-full text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-200"
+                              >
+                                View profile
+                              </button>
                               <button
                                 type="button"
                                 onClick={() => removeFriend(f.friend_id)}
@@ -4275,6 +4483,137 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 )}
               </div>
             </div>
+
+            {selectedFriendProfile ? (
+              <Panel
+                title={`${selectedFriendProfile.display.primary}'s profile`}
+                right={
+                  <button
+                    type="button"
+                    onClick={() => setSelectedFriendProfileId(null)}
+                    className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                  >
+                    Close profile
+                  </button>
+                }
+              >
+                <div className="rounded-2xl bg-neutral-950/60 border border-white/10 p-4 mb-4">
+                  <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-xl font-semibold text-neutral-100 truncate">
+                        {selectedFriendProfile.settings.displayName?.trim() || selectedFriendProfile.display.baseName}
+                      </div>
+                      <div className="text-xs text-neutral-500 mt-1 truncate">
+                        {selectedFriendProfile.display.idTag || selectedFriendProfile.friend.friend?.username || selectedFriendProfile.id}
+                      </div>
+                    </div>
+                    <div className="text-xs text-neutral-500 sm:text-right">
+                      {selectedFriendProfile.items.length} visible item{selectedFriendProfile.items.length === 1 ? "" : "s"}
+                    </div>
+                  </div>
+
+                  <div className="mt-3 text-sm text-neutral-300 whitespace-pre-wrap">
+                    {selectedFriendProfile.settings.profileBio?.trim() || "No profile description yet."}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-2 mb-4">
+                  <button
+                    type="button"
+                    onClick={() => setFriendProfileView("all")}
+                    className={[
+                      "px-3 py-2 rounded-xl border text-xs transition",
+                      friendProfileView === "all" ? "bg-white/15 border-white/25" : "bg-white/5 border-white/10 hover:bg-white/10",
+                    ].join(" ")}
+                  >
+                    All
+                  </button>
+                  {STATUSES.map((status) => (
+                    <button
+                      key={status.id}
+                      type="button"
+                      onClick={() => setFriendProfileView(status.id)}
+                      className={[
+                        "px-3 py-2 rounded-xl border text-xs transition",
+                        friendProfileView === status.id ? "bg-white/15 border-white/25" : "bg-white/5 border-white/10 hover:bg-white/10",
+                      ].join(" ")}
+                    >
+                      {status.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(180px,240px)_auto] gap-3 items-end mb-4">
+                  <label className="block">
+                    <div className="text-xs text-neutral-400 mb-1">Search</div>
+                    <input
+                      value={friendProfileQuery}
+                      onChange={(e) => setFriendProfileQuery(e.target.value)}
+                      placeholder="Search this friend's titles, notes, or tags..."
+                      className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
+                    />
+                  </label>
+
+                  <Select
+                    label="Sort"
+                    value={friendProfileSortMode}
+                    onChange={(v) => setFriendProfileSortMode(v as SortMode)}
+                    options={[
+                      { value: "newest", label: "Newest first" },
+                      { value: "oldest", label: "Oldest first" },
+                      { value: "title", label: "Title (A–Z)" },
+                      { value: "rating_high", label: "Rating (high → low)" },
+                      { value: "rating_low", label: "Rating (low → high)" },
+                      { value: "updated", label: "Last updated" },
+                      { value: "favorites", label: "Favorites first" },
+                    ]}
+                  />
+
+                  <div className="sm:pb-0">
+                    <Toggle label="Board view" checked={friendProfileBoardView} onChange={setFriendProfileBoardView} />
+                  </div>
+                </div>
+
+                {friendProfileFilteredItems.length ? (
+                  friendProfileBoardView && friendProfileView === "all" ? (
+                    <FriendReadOnlyBoardView
+                      items={friendProfileFilteredItems}
+                      ratingFormat={settings.ratingFormat ?? "ten"}
+                    />
+                  ) : (
+                    <div className="space-y-5">
+                      {(friendProfileView === "all"
+                        ? STATUSES.map((status) => ({ ...status, items: friendProfileByStatus[status.id] }))
+                        : [
+                            {
+                              id: friendProfileView,
+                              label: STATUSES.find((status) => status.id === friendProfileView)?.label ?? "Items",
+                              items: friendProfileFilteredItems,
+                            },
+                          ]
+                      ).map((section) =>
+                        section.items.length ? (
+                          <section key={section.id} className="space-y-2">
+                            <div className="text-sm text-neutral-300">{section.label}</div>
+                            <div className="space-y-3">
+                              {section.items.map((item) => (
+                                <FriendReadOnlyRow
+                                  key={item.id}
+                                  item={item}
+                                  ratingFormat={settings.ratingFormat ?? "ten"}
+                                />
+                              ))}
+                            </div>
+                          </section>
+                        ) : null
+                      )}
+                    </div>
+                  )
+                ) : (
+                  <div className="text-sm text-neutral-500">No visible items match this profile filter. Private items stay hidden.</div>
+                )}
+              </Panel>
+            ) : null}
 
             <Panel
               title="Friend media library"
@@ -4547,6 +4886,49 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 )}
               </div>
             </Panel>
+            {isAdminUser ? (
+              <Panel
+                title="Admin feedback inbox"
+                right={
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-neutral-500">{adminFeedbackStatus}</span>
+                    <button
+                      type="button"
+                      onClick={loadAdminFeedback}
+                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                }
+              >
+                <div className="text-xs text-neutral-500 mb-3">
+                  Only the admin account shows this section. It gathers saved Suggestions / Problems from visible Stack data.
+                </div>
+
+                <div className="space-y-2">
+                  {adminFeedbackRows.length ? (
+                    adminFeedbackRows.map((f) => (
+                      <div key={`${f.userId}:${f.id}`} className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs text-neutral-500 mb-1">
+                              {f.type === "problem" ? "Problem" : "Suggestion"} • {new Date(f.createdAt).toLocaleString()}
+                            </div>
+                            <div className="text-[11px] text-neutral-600 mb-2 truncate">
+                              From: {f.userLabel} • {f.userId}
+                            </div>
+                            <div className="text-sm text-neutral-200 whitespace-pre-wrap">{f.message}</div>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-sm text-neutral-500">No submitted feedback visible yet.</div>
+                  )}
+                </div>
+              </Panel>
+            ) : null}
           </div>
         ) : null}
 
@@ -4638,7 +5020,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 </div>
 
                 <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
-                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3 items-end">
                     <div>
                       <div className="text-xs text-neutral-400 mb-1">Sound effects</div>
                       <Toggle
@@ -4650,7 +5032,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                     <button
                       type="button"
                       onClick={() => playStackSoundEffect("click", settings.soundVolume ?? 1)}
-                      className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm"
+                      className="h-[42px] px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm"
                     >
                       Test sound
                     </button>
@@ -4664,7 +5046,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                     <input
                       type="range"
                       min="0.25"
-                      max="2"
+                      max="3"
                       step="0.05"
                       value={settings.soundVolume ?? 1}
                       onChange={(e) => updateSettings({ soundVolume: Number(e.target.value) })}
@@ -4673,7 +5055,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   </label>
 
                   <div className="text-[11px] text-neutral-500">
-                    Turn sounds on, then click once or press Test sound to unlock audio. Raise volume if the browser is quiet.
+                    Turn sounds on, then click once or press Test sound to unlock audio. Volume can go up to 300%.
                   </div>
                 </div>
               </div>
@@ -5585,6 +5967,210 @@ function CardDraggable({
     </>
   );
 
+}
+
+
+/* ================= FRIEND READ-ONLY PROFILE VIEW ================= */
+
+function readOnlyProgressLabel(item: MediaItem) {
+  if (item.type === "game") {
+    return typeof item.hoursPlayed === "number" ? `${item.hoursPlayed.toFixed(1)}h` : "—";
+  }
+
+  const movieProg = getMovieProgressDefaults(item);
+  const cur =
+    item.type === "movie"
+      ? movieProg.cur
+      : typeof item.progressCurOverride === "number"
+      ? item.progressCurOverride
+      : item.progressCur;
+
+  const total =
+    item.type === "movie"
+      ? movieProg.total
+      : typeof item.progressTotalOverride === "number"
+      ? item.progressTotalOverride
+      : item.progressTotal;
+
+  if (typeof cur === "number" || typeof total === "number") {
+    return typeof total === "number" ? `${cur ?? 0} / ${total}` : `${cur ?? 0}`;
+  }
+
+  return "—";
+}
+
+function FriendReadOnlyBoardView({ items, ratingFormat }: { items: MediaItem[]; ratingFormat: RatingFormat }) {
+  const byStatus = useMemo(() => {
+    const map: Record<Status, MediaItem[]> = { completed: [], in_progress: [], planned: [], dropped: [] };
+    for (const item of items) map[item.status].push(item);
+    return map;
+  }, [items]);
+
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 2xl:grid-cols-4 gap-6">
+      {STATUSES.map((status) => (
+        <section
+          key={status.id}
+          className="rounded-2xl ring-1 ring-neutral-800/80 bg-neutral-900/40 shadow-sm p-5 min-h-[240px]"
+        >
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <div className="text-sm font-medium text-neutral-200">{status.label}</div>
+            <div className="text-xs text-neutral-500">{byStatus[status.id].length}</div>
+          </div>
+
+          <div className="space-y-3">
+            {byStatus[status.id].map((item) => (
+              <FriendReadOnlyCard key={item.id} item={item} ratingFormat={ratingFormat} />
+            ))}
+            {!byStatus[status.id].length ? (
+              <div className="text-xs text-neutral-600 text-center py-8">No visible items</div>
+            ) : null}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function FriendReadOnlyCard({ item, ratingFormat }: { item: MediaItem; ratingFormat: RatingFormat }) {
+  const displayPoster = item.posterOverrideUrl || item.posterUrl;
+
+  return (
+    <div className="rounded-2xl bg-neutral-950/74 border border-neutral-800 shadow-sm overflow-hidden">
+      <div className="flex items-center justify-between gap-2 px-3 py-2 bg-neutral-950 border-b border-neutral-800">
+        <div className="text-xs text-neutral-500 capitalize">{item.status.replace("_", " ")}</div>
+        <div className="text-xs text-neutral-400">{TYPE_LABEL[item.type]}</div>
+      </div>
+
+      <div className="p-4 flex gap-4">
+        <div className="shrink-0">
+          <div className="w-16 h-20 rounded-xl overflow-hidden bg-neutral-900 border border-neutral-800">
+            {displayPoster ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
+            ) : (
+              <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">—</div>
+            )}
+          </div>
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <div className="font-semibold text-base text-neutral-200 truncate">{item.title}</div>
+          <div className="text-[11px] text-neutral-500 mt-1">
+            {item.type === "game" ? "Hours" : "Progress"}: {readOnlyProgressLabel(item)}
+          </div>
+          <div className="text-[11px] text-neutral-500 mt-1">Score: {formatRatingValue(item.rating, ratingFormat)}</div>
+          {item.notes ? <div className="text-[11px] text-neutral-400 mt-1 line-clamp-2">{item.notes}</div> : null}
+          {item.tags?.length ? <div className="text-[11px] text-neutral-500 mt-1 line-clamp-1">{item.tags.join(" • ")}</div> : null}
+          <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+            {item.favorite ? (
+              <span className="px-2 py-1 rounded-lg bg-amber-400/10 border border-amber-400/20 text-neutral-200">Favorite</span>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FriendReadOnlyRow({ item, ratingFormat }: { item: MediaItem; ratingFormat: RatingFormat }) {
+  const [showFullNote, setShowFullNote] = React.useState(false);
+  const displayPoster = item.posterOverrideUrl || item.posterUrl;
+  const hasLongNote = !!item.notes && item.notes.length > 120;
+
+  return (
+    <>
+      {showFullNote ? (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4"
+          onMouseDown={() => setShowFullNote(false)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <div
+            className="w-full max-w-2xl rounded-2xl bg-neutral-950 border border-neutral-800 shadow-2xl overflow-hidden"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-neutral-800">
+              <div className="text-sm text-neutral-200 font-medium truncate">{item.title}</div>
+              <button
+                type="button"
+                onClick={() => setShowFullNote(false)}
+                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+              >
+                Close
+              </button>
+            </div>
+            <div className="p-4">
+              <div className="text-xs text-neutral-500 mb-2">Full note</div>
+              <div className="text-sm text-neutral-200 whitespace-pre-wrap leading-relaxed">{item.notes || "—"}</div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="rounded-2xl bg-neutral-950/72 ring-1 ring-neutral-800/80 overflow-hidden">
+        <div className="grid grid-cols-1 sm:grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(120px,18%)] gap-3 p-3 items-center">
+          <div className="w-[72px] h-[96px] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
+            {displayPoster ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
+            ) : (
+              <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">No cover</div>
+            )}
+          </div>
+
+          <div className="min-w-0">
+            <div className="font-semibold truncate">{item.title}</div>
+            <div className="text-xs text-neutral-400 mt-1 flex flex-wrap items-center gap-2">
+              <span className="capitalize">{item.status.replace("_", " ")}</span>
+              {item.dateFinished ? (
+                <>
+                  <span className="text-neutral-600">•</span>
+                  <span className="text-neutral-500">{item.dateFinished}</span>
+                </>
+              ) : null}
+              {(Number(item.rewatchCount ?? 0) || 0) > 0 ? (
+                <>
+                  <span className="text-neutral-600">•</span>
+                  <span className="text-neutral-300">Rewatch x{Number(item.rewatchCount ?? 0) || 0}</span>
+                </>
+              ) : null}
+            </div>
+
+            {item.notes ? (
+              <div className="mt-2">
+                <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div>
+                {hasLongNote ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowFullNote(true)}
+                    className="mt-1 text-[11px] px-2 py-1 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-200"
+                  >
+                    Read full note
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+
+            {item.tags?.length ? (
+              <div className="text-[11px] text-neutral-500 mt-1 truncate">{item.tags.join(" • ")}</div>
+            ) : null}
+
+            <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+              {item.favorite ? (
+                <span className="px-2 py-1 rounded-lg bg-amber-400/10 border border-amber-400/20 text-neutral-200">Favorite</span>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="text-center text-sm text-neutral-300 tabular-nums">{formatRatingValue(item.rating, ratingFormat)}</div>
+          <div className="text-center text-sm text-neutral-300">{TYPE_LABEL[item.type]}</div>
+          <div className="text-center text-sm text-neutral-200 tabular-nums whitespace-nowrap">{readOnlyProgressLabel(item)}</div>
+        </div>
+      </div>
+    </>
+  );
 }
 
 /* ================= SMALL UI COMPONENTS ================= */
