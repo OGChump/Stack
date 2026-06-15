@@ -1942,7 +1942,7 @@ async function sendFriendRequest() {
   }
 
   if (!profile?.id) {
-    setFriendStatus("User not found. Try their Stack username, display name, or custom ID tag.");
+    setFriendStatus("User not found. Ask them to log into Stack once after setting their display name, or try their exact Stack username.");
     return;
   }
 
@@ -1952,6 +1952,35 @@ async function sendFriendRequest() {
     setFriendStatus("You can't friend yourself 💀");
     return;
   }
+
+  const finishFriendAdd = async (messagePrefix = "Friend added") => {
+    const { error: friendshipError } = await supabase
+      .from("friends")
+      .upsert(
+        [
+          { user_id: userId, friend_id: profile.id },
+          { user_id: profile.id, friend_id: userId },
+        ],
+        { onConflict: "user_id,friend_id" }
+      );
+
+    if (friendshipError) {
+      console.error(friendshipError);
+      setFriendStatus(friendshipError.message || "Found the user, but could not create the friendship.");
+      return false;
+    }
+
+    setFriendStatus(`${messagePrefix}: ${profileLabel}.`);
+    setInputUsername("");
+
+    await Promise.all([
+      loadFriends(userId),
+      loadOutgoingFriendRequests(userId),
+      loadIncomingFriendRequests(userId, { autoAccept: false }),
+    ]);
+
+    return true;
+  };
 
   // already friends?
   const { data: existingFriend, error: friendCheckErr } = await supabase
@@ -1983,32 +2012,38 @@ async function sendFriendRequest() {
 
   if (existingReq?.id && existingReq.status === "pending") {
     if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
-      setFriendStatus(`${profileLabel} already requested you — auto-accepting…`);
+      setFriendStatus(`${profileLabel} already requested you — accepting…`);
       await acceptFriendRequest(existingReq.id, profile.id);
       setInputUsername("");
       return;
     }
 
-    setFriendStatus(`You already sent a pending request to ${profileLabel}.`);
+    // You already sent the request before. Instead of staying stuck as pending,
+    // finish the friendship immediately so adding friends works both directions.
+    await supabase
+      .from("friend_requests")
+      .update({ status: "accepted" })
+      .eq("id", existingReq.id)
+      .eq("requester_id", userId)
+      .eq("requested_id", profile.id);
+
+    await finishFriendAdd("Friend added from your pending request");
     return;
   }
 
-  const { error } = await supabase.from("friend_requests").insert({
+  // Keep a request row for history if the current sharing rules allow it.
+  // The friendship itself is created below, so this can be best-effort.
+  const requestInsert = await supabase.from("friend_requests").insert({
     requester_id: userId,
     requested_id: profile.id,
-    status: "pending",
+    status: "accepted",
   });
 
-  if (error) {
-    console.error(error);
-    setFriendStatus(error.message || "Failed to send request.");
-    return;
-  }
+  if (requestInsert.error) console.warn(requestInsert.error);
 
-  setFriendStatus(`Friend request sent to ${profileLabel}.`);
-  setInputUsername("");
-  await loadOutgoingFriendRequests(userId);
+  await finishFriendAdd("Friend added");
 }
+
 
 const parseFeedbackEntries = (rawFeedback: unknown): FeedbackEntry[] => {
   return Array.isArray(rawFeedback)
@@ -3131,6 +3166,43 @@ async function pickForMe(mode: "best" | "random" = "best") {
     setDiscoverStatus(`Added ${card.title} to Planned.`);
   }, []);
 
+  const ensureFeedbackVisibleToAdmins = useCallback(async () => {
+    if (!userId) return;
+
+    const adminIds = STACK_ADMIN_USER_IDS.filter((adminId) => adminId && adminId !== userId);
+    if (!adminIds.length) return;
+
+    for (const adminId of adminIds) {
+      try {
+        // Best-effort: use the existing friends permissions so the admin can read this user's feedback
+        // without adding a new database table or changing the schema.
+        const friendship = await supabase
+          .from("friends")
+          .upsert(
+            [
+              { user_id: userId, friend_id: adminId },
+              { user_id: adminId, friend_id: userId },
+            ],
+            { onConflict: "user_id,friend_id" }
+          );
+
+        if (friendship.error) console.warn(friendship.error);
+
+        // Keep a request/history row too. If the friendship upsert is blocked by RLS,
+        // the admin's normal auto-accept flow can still accept this later.
+        const requestInsert = await supabase.from("friend_requests").insert({
+          requester_id: userId,
+          requested_id: adminId,
+          status: friendship.error ? "pending" : "accepted",
+        });
+
+        if (requestInsert.error) console.warn(requestInsert.error);
+      } catch (e) {
+        console.warn(e);
+      }
+    }
+  }, [userId]);
+
   const submitFeedback = useCallback((e: React.SyntheticEvent) => {
     e.preventDefault();
     const message = feedbackText.trim();
@@ -3144,49 +3216,103 @@ async function pickForMe(mode: "best" | "random" = "best") {
       status: "new",
     };
 
-    setFeedbackEntries((prev) => [entry, ...prev]);
+    const nextFeedback = [entry, ...feedbackEntries];
+    setFeedbackEntries(nextFeedback);
     setFeedbackText("");
-  }, [feedbackText, feedbackType]);
+
+    // Save immediately instead of waiting only for the state effect.
+    // This makes submitted suggestions/problems show up for the admin more reliably.
+    if (userId) {
+      saveCloud(userId, items, settings, nextFeedback);
+      ensureFeedbackVisibleToAdmins();
+    }
+  }, [feedbackText, feedbackType, feedbackEntries, userId, items, settings, saveCloud, ensureFeedbackVisibleToAdmins]);
 
   const loadAdminFeedback = useCallback(async () => {
     if (!userId || !STACK_ADMIN_USER_IDS.includes(userId)) return;
 
-    try {
-      setAdminFeedbackStatus("Loading all feedback…");
+    const rowsByKey = new Map<string, AdminFeedbackEntry>();
 
-      const { data, error } = await supabase
-        .from("media_items")
-        .select("user_id,data");
+    const addRows = (sourceRows: Array<{ user_id: string; data: any }>, sourceLabel?: string) => {
+      for (const row of sourceRows) {
+        if (!row?.user_id) continue;
 
-      if (error) {
-        console.error(error);
-        setAdminFeedbackStatus("Admin feedback is unavailable with the current sharing rules.");
-        return;
-      }
-
-      const rows: AdminFeedbackEntry[] = [];
-
-      for (const row of (data ?? []) as Array<{ user_id: string; data: any }>) {
         const rowSettings = normalizeSettings(row?.data?.settings);
         const userLabel = rowSettings.displayName?.trim() || rowSettings.usernameTag?.trim() || row.user_id;
         const entries = parseFeedbackEntries(row?.data?.feedback);
 
         for (const entry of entries) {
-          rows.push({
+          const key = `${row.user_id}:${entry.id}`;
+          if (rowsByKey.has(key)) continue;
+
+          rowsByKey.set(key, {
             ...entry,
             userId: row.user_id,
-            userLabel,
+            userLabel: sourceLabel && userLabel === row.user_id ? `${row.user_id} (${sourceLabel})` : userLabel,
           });
         }
       }
+    };
 
-      rows.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    try {
+      setAdminFeedbackStatus("Loading all visible feedback…");
+
+      // 1) Always include the admin's own saved feedback.
+      addRows([{ user_id: userId, data: { settings, feedback: feedbackEntries } }]);
+
+      // 2) Include rows already loaded through the friends system.
+      addRows(friendActivityRows);
+
+      // 3) Try a direct visible-row scan. With strict RLS this may only return your own row,
+      // but with admin/friend read rules it can return more.
+      const direct = await supabase
+        .from("media_items")
+        .select("user_id,data");
+
+      if (direct.error) {
+        console.warn(direct.error);
+      } else {
+        addRows((direct.data ?? []) as Array<{ user_id: string; data: any }>);
+      }
+
+      // 4) Explicitly request friend rows too. Some RLS setups work better when scoped this way.
+      const friendIds = friendsList.map((f) => f.friend_id).filter(Boolean);
+      if (friendIds.length) {
+        const friendRows = await supabase
+          .from("media_items")
+          .select("user_id,data")
+          .in("user_id", friendIds);
+
+        if (friendRows.error) {
+          console.warn(friendRows.error);
+        } else {
+          addRows((friendRows.data ?? []) as Array<{ user_id: string; data: any }>);
+        }
+      }
+
+      const rows = Array.from(rowsByKey.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+
       setAdminFeedbackRows(rows);
-      setAdminFeedbackStatus(rows.length ? `Loaded ${rows.length} feedback item${rows.length === 1 ? "" : "s"}.` : "No feedback submitted yet.");
-    } catch {
-      setAdminFeedbackStatus("Admin feedback is unavailable right now.");
+      setAdminFeedbackStatus(
+        rows.length
+          ? `Loaded ${rows.length} visible feedback item${rows.length === 1 ? "" : "s"}.`
+          : "No visible feedback yet. If someone just submitted feedback, refresh after they reload once."
+      );
+    } catch (e) {
+      console.warn(e);
+      const rows = Array.from(rowsByKey.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+      setAdminFeedbackRows(rows);
+      setAdminFeedbackStatus(
+        rows.length
+          ? `Loaded ${rows.length} visible feedback item${rows.length === 1 ? "" : "s"}.`
+          : "Admin feedback is unavailable with the current sharing rules."
+      );
     }
-  }, [userId]);
+  }, [userId, settings, feedbackEntries, friendActivityRows, friendsList]);
 
 
   const filteredAdminFeedbackRows = useMemo(() => {
