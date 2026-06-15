@@ -6133,6 +6133,8 @@ function MALRow({
   const hoursText = typeof item.hoursPlayed === "number" ? `${item.hoursPlayed.toFixed(1)}h` : "—";
 
   const hasLongNote = !!item.notes && item.notes.length > 120;
+  const mobileDateLabel = item.dateFinished ? item.dateFinished : "No date";
+  const mobileRatingLabel = formatRatingValue(item.rating, ratingFormat);
 
   return (
     <>
@@ -6178,7 +6180,291 @@ function MALRow({
       ) : null}
 
       <div className="stack-mobile-item-card rounded-2xl bg-neutral-950/72 ring-1 ring-neutral-800/80 overflow-hidden">
-        <div className="grid grid-cols-1 sm:grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 p-3 items-center">
+        <div className="sm:hidden p-3 space-y-3">
+          <div className="flex gap-3 items-start">
+            <button
+              type="button"
+              onClick={() => setShowDetail(true)}
+              className="w-20 h-28 rounded-2xl overflow-hidden bg-neutral-950 border border-neutral-800 shrink-0 shadow-lg shadow-black/20"
+              title="Open details"
+            >
+              {displayPoster ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
+              ) : (
+                <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">No cover</div>
+              )}
+            </button>
+
+            <div className="min-w-0 flex-1 space-y-2">
+              {isEditing ? (
+                <input
+                  value={draftTitle}
+                  onChange={(e) => setDraftTitle(e.target.value)}
+                  className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500"
+                  placeholder="Title"
+                />
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setShowDetail(true)}
+                  className="block w-full text-left text-base font-semibold leading-snug text-neutral-100 line-clamp-2"
+                >
+                  {item.title}
+                </button>
+              )}
+
+              <div className="flex flex-wrap gap-1.5 text-[11px]">
+                <span className="px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-neutral-300">{TYPE_LABEL[item.type]}</span>
+                <span className="px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-neutral-300">{mobileRatingLabel}</span>
+                {item.favorite ? (
+                  <span className="px-2 py-1 rounded-lg bg-amber-400/10 border border-amber-400/20 text-neutral-200">Favorite</span>
+                ) : null}
+                {item.isPrivate ? (
+                  <span className="px-2 py-1 rounded-lg bg-sky-400/10 border border-sky-400/20 text-neutral-200">Private</span>
+                ) : null}
+              </div>
+
+              <select
+                value={item.status}
+                onChange={(e) => onUpdate({ status: e.target.value as Status })}
+                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-xs outline-none focus:border-neutral-500"
+              >
+                <option value="completed">Completed</option>
+                <option value="in_progress">In Progress</option>
+                <option value="planned">Planned</option>
+                <option value="dropped">Dropped</option>
+              </select>
+
+              <div className="text-[11px] text-neutral-500">
+                {isEditing ? (
+                  <input
+                    type="date"
+                    value={draftDate}
+                    onChange={(e) => setDraftDate(e.target.value)}
+                    className="w-full rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+                    title="Date watched"
+                  />
+                ) : (
+                  <span>{mobileDateLabel}</span>
+                )}
+                {(Number(item.rewatchCount ?? 0) || 0) > 0 ? (
+                  <span className="text-neutral-300"> • Rewatch x{Number(item.rewatchCount ?? 0) || 0}</span>
+                ) : null}
+              </div>
+            </div>
+          </div>
+
+          {isEditing ? (
+            <div>
+              <div className="text-[11px] text-neutral-500 mb-1">Note</div>
+              <textarea
+                value={draftNotes}
+                onChange={(e) => setDraftNotes(e.target.value)}
+                rows={3}
+                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base outline-none focus:border-neutral-500 resize-none"
+                placeholder="Write a note…"
+              />
+            </div>
+          ) : item.notes ? (
+            <div className="rounded-2xl bg-white/[0.035] border border-white/10 px-3 py-2">
+              <div className="text-xs text-neutral-300 line-clamp-3">{item.notes}</div>
+              {hasLongNote ? (
+                <button
+                  type="button"
+                  onClick={() => setShowFullNote(true)}
+                  className="mt-2 text-[11px] px-2 py-1 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-200"
+                >
+                  Read full note
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+
+          {item.tags?.length || withFriends.length ? (
+            <div className="space-y-1">
+              {item.tags?.length ? (
+                <div className="text-[11px] text-neutral-500 line-clamp-2">{item.tags.join(" • ")}</div>
+              ) : null}
+              {withFriends.length ? (
+                <div className="text-[11px] text-neutral-500 line-clamp-1">With: {withFriends.join(" • ")}</div>
+              ) : null}
+            </div>
+          ) : null}
+
+          <div className="grid grid-cols-2 gap-2">
+            <div className="rounded-2xl bg-white/[0.035] border border-white/10 p-3">
+              <div className="text-[11px] text-neutral-500 mb-1">Score</div>
+              {isEditing ? (
+                <input
+                  value={draftRating}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === "" || /^\d{0,2}(\.\d{0,1})?$/.test(v)) setDraftRating(v);
+                  }}
+                  placeholder="—"
+                  className="w-full text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+                  title="Rating (0–10)"
+                />
+              ) : (
+                <div className="text-sm text-neutral-200 tabular-nums">{mobileRatingLabel}</div>
+              )}
+            </div>
+
+            <div className="rounded-2xl bg-white/[0.035] border border-white/10 p-3">
+              <div className="text-[11px] text-neutral-500 mb-1">{isGame ? "Hours" : "Progress"}</div>
+              <div className="text-sm text-neutral-200 tabular-nums">{isGame ? hoursText : progressText}</div>
+            </div>
+          </div>
+
+          <div className="rounded-2xl bg-white/[0.035] border border-white/10 p-3">
+            {isGame ? (
+              <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-2 items-center">
+                <span className="text-[11px] text-neutral-500">Hours</span>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.1"
+                  value={typeof item.hoursPlayed === "number" ? item.hoursPlayed : ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === "") return onUpdate({ hoursPlayed: undefined });
+                    const n = Math.max(0, Number(v) || 0);
+                    onUpdate({ hoursPlayed: n });
+                  }}
+                  className="w-full text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+                  placeholder="—"
+                />
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div className="grid grid-cols-[2.5rem_minmax(0,1fr)_2.5rem] gap-2 items-center">
+                  <button
+                    type="button"
+                    onClick={decCur}
+                    className="h-10 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-lg"
+                    aria-label="Decrease progress"
+                    title="Decrease progress"
+                  >
+                    −
+                  </button>
+
+                  <div className="text-center text-sm text-neutral-200 tabular-nums whitespace-nowrap">{progressText}</div>
+
+                  <button
+                    type="button"
+                    onClick={incCur}
+                    className="h-10 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-lg"
+                    aria-label="Increase progress"
+                    title="Increase progress"
+                  >
+                    +
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-2 items-center">
+                  <span className="text-[11px] text-neutral-500">Total</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={
+                      item.type === "movie"
+                        ? 1
+                        : typeof item.progressTotalOverride === "number"
+                        ? item.progressTotalOverride
+                        : typeof item.progressTotal === "number"
+                        ? item.progressTotal
+                        : ""
+                    }
+                    onChange={(e) => {
+                      if (item.type === "movie") return;
+                      const v = e.target.value;
+                      if (v === "") return onUpdate({ progressTotal: undefined, progressTotalOverride: undefined });
+                      const n = Math.max(0, Number(v) || 0);
+                      onUpdate({
+                        progressTotalOverride: n,
+                        progressCurOverride: undefined,
+                      });
+                    }}
+                    className="w-full text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
+                    placeholder="—"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            {isEditing ? (
+              <>
+                <button
+                  type="button"
+                  onClick={saveEdit}
+                  className="text-xs px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
+                  title="Save"
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  onClick={cancelEdit}
+                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                  title="Cancel"
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setShowDetail(true)}
+                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                >
+                  Details
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsEditing(true)}
+                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                >
+                  Edit
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdate({ favorite: !item.favorite })}
+                  className={[
+                    "text-xs px-3 py-2 rounded-xl border hover:bg-white/10",
+                    item.favorite ? "bg-amber-400/15 border-amber-400/25" : "bg-white/5 border-white/10",
+                  ].join(" ")}
+                  aria-pressed={!!item.favorite}
+                >
+                  {item.favorite ? "Unfavorite" : "Favorite"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdate({ isPrivate: !item.isPrivate })}
+                  className={[
+                    "text-xs px-3 py-2 rounded-xl border hover:bg-white/10",
+                    item.isPrivate ? "bg-sky-400/15 border-sky-400/25" : "bg-white/5 border-white/10",
+                  ].join(" ")}
+                  aria-pressed={!!item.isPrivate}
+                >
+                  {item.isPrivate ? "Private" : "Public"}
+                </button>
+                <button
+                  type="button"
+                  onClick={onDelete}
+                  className="col-span-2 text-xs px-3 py-2 rounded-xl stack-bad hover:opacity-95"
+                >
+                  Delete
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="hidden sm:grid sm:grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 p-3 items-center">
           {/* Poster */}
           <button
             type="button"
