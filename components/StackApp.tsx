@@ -1246,10 +1246,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     }>
   >([]);
 
-  const [siteUsers, setSiteUsers] = useState<SiteUserRow[]>([]);
-  const [siteUsersStatus, setSiteUsersStatus] = useState("");
-  const [siteUsersQuery, setSiteUsersQuery] = useState("");
-
   const [selectedFriendProfileId, setSelectedFriendProfileId] = useState<string | null>(null);
   const [friendProfileView, setFriendProfileView] = useState<"all" | Status>("all");
   const [friendProfileQuery, setFriendProfileQuery] = useState("");
@@ -1591,12 +1587,6 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
 
 type ProfileRow = { id: string; username: string | null; display_name?: string | null };
 
-type SiteUserRow = ProfileRow & {
-  displayLabel: string;
-  subLabel: string;
-  source: "profile" | "stack" | "both";
-};
-
 type IncomingRequestRow = {
   id: string;
   requester_id: string;
@@ -1817,81 +1807,6 @@ const loadOutgoingFriendRequests = useCallback(
   [userId]
 );
 
-const loadSiteUsers = useCallback(async () => {
-  if (!userId) return;
-
-  try {
-    setSiteUsersStatus("Loading users…");
-
-    const byId = new Map<string, SiteUserRow>();
-
-    const profileResult = await supabase
-      .from("profiles")
-      .select("id, username, display_name")
-      .limit(300);
-
-    if (profileResult.error) {
-      console.warn(profileResult.error);
-    }
-
-    for (const row of (profileResult.data ?? []) as ProfileRow[]) {
-      if (!row?.id || row.id === userId) continue;
-
-      const username = row.username?.trim() || "";
-      const displayName = row.display_name?.trim() || "";
-      const displayLabel = displayName || username || row.id;
-      const subLabel = username ? `@${username}` : row.id;
-
-      byId.set(row.id, {
-        id: row.id,
-        username: username || null,
-        display_name: displayName || null,
-        displayLabel,
-        subLabel,
-        source: "profile",
-      });
-    }
-
-    // Best-effort merge from Stack settings. If RLS hides some rows, the profile list still works.
-    const stackResult = await supabase
-      .from("media_items")
-      .select("user_id,data")
-      .limit(500);
-
-    if (stackResult.error) {
-      console.warn(stackResult.error);
-    }
-
-    for (const row of (stackResult.data ?? []) as Array<{ user_id: string; data: any }>) {
-      if (!row?.user_id || row.user_id === userId) continue;
-
-      const rowSettings = normalizeSettings(row?.data?.settings);
-      const displayName = rowSettings.displayName?.trim() || "";
-      const usernameTag = rowSettings.usernameTag?.trim().replace(/^@+/, "") || "";
-      const existing = byId.get(row.user_id);
-
-      const displayLabel = displayName || existing?.displayLabel || usernameTag || row.user_id;
-      const subLabel = usernameTag ? `@${usernameTag}` : existing?.subLabel || row.user_id;
-
-      byId.set(row.user_id, {
-        id: row.user_id,
-        username: existing?.username || usernameTag || null,
-        display_name: displayName || existing?.display_name || usernameTag || null,
-        displayLabel,
-        subLabel,
-        source: existing ? "both" : "stack",
-      });
-    }
-
-    const rows = Array.from(byId.values()).sort((a, b) => a.displayLabel.localeCompare(b.displayLabel));
-    setSiteUsers(rows);
-    setSiteUsersStatus(rows.length ? `Showing ${rows.length} user${rows.length === 1 ? "" : "s"}.` : "No users are visible yet.");
-  } catch (e) {
-    console.error(e);
-    setSiteUsersStatus("Could not load users with the current sharing rules.");
-  }
-}, [userId]);
-
 async function acceptFriendRequest(
   requestId: string,
   requesterId: string,
@@ -1921,19 +1836,20 @@ async function acceptFriendRequest(
     return;
   }
 
-  // 2) RLS-safe friendship insert.
-  // Most Supabase policies only allow a user to insert rows where friends.user_id = auth.uid().
-  // So the receiver creates only their own side here. The requester creates their side when they send.
+  // 2) create friendships both directions (avoid duplicates)
   const { error: frErr } = await supabase
     .from("friends")
     .upsert(
-      [{ user_id: me, friend_id: requesterId }],
+      [
+        { user_id: me, friend_id: requesterId },
+        { user_id: requesterId, friend_id: me },
+      ],
       { onConflict: "user_id,friend_id" }
     );
 
   if (frErr) {
     console.error(frErr);
-    setFriendStatus(frErr.message || "Accepted, but failed to create your friendship row.");
+    setFriendStatus(frErr.message || "Accepted, but failed to create friendship rows.");
   } else {
     setFriendStatus(AUTO_ACCEPT_FRIEND_REQUESTS ? "Friend added ✅ (auto-accepted)" : "Friend added ✅");
   }
@@ -2010,14 +1926,23 @@ async function removeFriend(friendId: string) {
   await loadFriends(userId);
 }
 
-async function addProfileAsFriend(profile: ProfileRow, opts?: { clearInput?: boolean }) {
+async function sendFriendRequest() {
+  setFriendStatus("");
+
   if (!userId) {
     setFriendStatus("You must be logged in.");
     return;
   }
 
+  const { profile, ambiguous } = await findProfileByUsernameOrDisplayName(inputUsername);
+
+  if (ambiguous) {
+    setFriendStatus("More than one person matches that display name. Ask them for their exact Stack username.");
+    return;
+  }
+
   if (!profile?.id) {
-    setFriendStatus("User not found.");
+    setFriendStatus("User not found. Try their Stack username, display name, or custom ID tag.");
     return;
   }
 
@@ -2028,7 +1953,7 @@ async function addProfileAsFriend(profile: ProfileRow, opts?: { clearInput?: boo
     return;
   }
 
-  // already friends on your side?
+  // already friends?
   const { data: existingFriend, error: friendCheckErr } = await supabase
     .from("friends")
     .select("friend_id")
@@ -2043,80 +1968,46 @@ async function addProfileAsFriend(profile: ProfileRow, opts?: { clearInput?: boo
     return;
   }
 
-  // RLS-safe: only create YOUR row in friends. This avoids the policy error.
-  const { error: friendshipError } = await supabase
-    .from("friends")
-    .upsert(
-      [{ user_id: userId, friend_id: profile.id }],
-      { onConflict: "user_id,friend_id" }
-    );
+  // existing pending request either direction?
+  const { data: existingReq, error: reqErr } = await supabase
+    .from("friend_requests")
+    .select("id, status, requester_id, requested_id")
+    .or(
+      `and(requester_id.eq.${userId},requested_id.eq.${profile.id}),and(requester_id.eq.${profile.id},requested_id.eq.${userId})`
+    )
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
-  if (friendshipError) {
-    console.error(friendshipError);
-    setFriendStatus(friendshipError.message || "Found the user, but could not add them with the current sharing rules.");
-    return;
-  }
+  if (reqErr) console.error(reqErr);
 
-  // Best-effort request row so the other person can auto-complete their side later.
-  // If this is blocked or already exists, your own friend row still works.
-  try {
-    const { data: existingReq } = await supabase
-      .from("friend_requests")
-      .select("id, status, requester_id, requested_id")
-      .or(
-        `and(requester_id.eq.${userId},requested_id.eq.${profile.id}),and(requester_id.eq.${profile.id},requested_id.eq.${userId})`
-      )
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (existingReq?.id && existingReq.status === "pending" && existingReq.requester_id === profile.id) {
+  if (existingReq?.id && existingReq.status === "pending") {
+    if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
+      setFriendStatus(`${profileLabel} already requested you — auto-accepting…`);
       await acceptFriendRequest(existingReq.id, profile.id);
-    } else if (!existingReq?.id) {
-      const requestInsert = await supabase.from("friend_requests").insert({
-        requester_id: userId,
-        requested_id: profile.id,
-        status: "pending",
-      });
-      if (requestInsert.error) console.warn(requestInsert.error);
+      setInputUsername("");
+      return;
     }
-  } catch (e) {
-    console.warn(e);
-  }
 
-  setFriendStatus(`Added ${profileLabel}. They can add you back from the Users list when they open Stack.`);
-  if (opts?.clearInput) setInputUsername("");
-
-  await Promise.all([
-    loadFriends(userId),
-    loadOutgoingFriendRequests(userId),
-    loadIncomingFriendRequests(userId, { autoAccept: false }),
-    loadFriendActivity(),
-    loadSiteUsers(),
-  ]);
-}
-
-async function sendFriendRequest() {
-  setFriendStatus("");
-
-  if (!userId) {
-    setFriendStatus("You must be logged in.");
+    setFriendStatus(`You already sent a pending request to ${profileLabel}.`);
     return;
   }
 
-  const { profile, ambiguous } = await findProfileByUsernameOrDisplayName(inputUsername);
+  const { error } = await supabase.from("friend_requests").insert({
+    requester_id: userId,
+    requested_id: profile.id,
+    status: "pending",
+  });
 
-  if (ambiguous) {
-    setFriendStatus("More than one person matches that display name. Pick them from the Users list or ask for their exact Stack username.");
+  if (error) {
+    console.error(error);
+    setFriendStatus(error.message || "Failed to send request.");
     return;
   }
 
-  if (!profile?.id) {
-    setFriendStatus("User not found. Ask them to log into Stack once, or pick them from the Users list below.");
-    return;
-  }
-
-  await addProfileAsFriend(profile, { clearInput: true });
+  setFriendStatus(`Friend request sent to ${profileLabel}.`);
+  setInputUsername("");
+  await loadOutgoingFriendRequests(userId);
 }
 
 const parseFeedbackEntries = (rawFeedback: unknown): FeedbackEntry[] => {
@@ -2280,10 +2171,6 @@ useEffect(() => {
   loadOutgoingFriendRequests(userId);
   loadFriends(userId);
 }, [userId, loadIncomingFriendRequests, loadOutgoingFriendRequests, loadFriends]);
-
-useEffect(() => {
-  if (view === "friends" && userId) loadSiteUsers();
-}, [view, userId, loadSiteUsers]);
 
 useEffect(() => {
   if (!userId || !cloudLoaded) return;
@@ -3244,40 +3131,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
     setDiscoverStatus(`Added ${card.title} to Planned.`);
   }, []);
 
-  const ensureFeedbackVisibleToAdmins = useCallback(async () => {
-    if (!userId) return;
-
-    const adminIds = STACK_ADMIN_USER_IDS.filter((adminId) => adminId && adminId !== userId);
-    if (!adminIds.length) return;
-
-    for (const adminId of adminIds) {
-      try {
-        // Best-effort: use the existing friends permissions so the admin can read this user's feedback
-        // without adding a new database table or changing the schema.
-        const friendship = await supabase
-          .from("friends")
-          .upsert(
-            [{ user_id: userId, friend_id: adminId }],
-            { onConflict: "user_id,friend_id" }
-          );
-
-        if (friendship.error) console.warn(friendship.error);
-
-        // Keep a pending request/history row so the admin account can auto-accept
-        // and create the admin-side friendship row without violating RLS.
-        const requestInsert = await supabase.from("friend_requests").insert({
-          requester_id: userId,
-          requested_id: adminId,
-          status: "pending",
-        });
-
-        if (requestInsert.error) console.warn(requestInsert.error);
-      } catch (e) {
-        console.warn(e);
-      }
-    }
-  }, [userId]);
-
   const submitFeedback = useCallback((e: React.SyntheticEvent) => {
     e.preventDefault();
     const message = feedbackText.trim();
@@ -3291,103 +3144,49 @@ async function pickForMe(mode: "best" | "random" = "best") {
       status: "new",
     };
 
-    const nextFeedback = [entry, ...feedbackEntries];
-    setFeedbackEntries(nextFeedback);
+    setFeedbackEntries((prev) => [entry, ...prev]);
     setFeedbackText("");
-
-    // Save immediately instead of waiting only for the state effect.
-    // This makes submitted suggestions/problems show up for the admin more reliably.
-    if (userId) {
-      saveCloud(userId, items, settings, nextFeedback);
-      ensureFeedbackVisibleToAdmins();
-    }
-  }, [feedbackText, feedbackType, feedbackEntries, userId, items, settings, saveCloud, ensureFeedbackVisibleToAdmins]);
+  }, [feedbackText, feedbackType]);
 
   const loadAdminFeedback = useCallback(async () => {
     if (!userId || !STACK_ADMIN_USER_IDS.includes(userId)) return;
 
-    const rowsByKey = new Map<string, AdminFeedbackEntry>();
+    try {
+      setAdminFeedbackStatus("Loading all feedback…");
 
-    const addRows = (sourceRows: Array<{ user_id: string; data: any }>, sourceLabel?: string) => {
-      for (const row of sourceRows) {
-        if (!row?.user_id) continue;
+      const { data, error } = await supabase
+        .from("media_items")
+        .select("user_id,data");
 
+      if (error) {
+        console.error(error);
+        setAdminFeedbackStatus("Admin feedback is unavailable with the current sharing rules.");
+        return;
+      }
+
+      const rows: AdminFeedbackEntry[] = [];
+
+      for (const row of (data ?? []) as Array<{ user_id: string; data: any }>) {
         const rowSettings = normalizeSettings(row?.data?.settings);
         const userLabel = rowSettings.displayName?.trim() || rowSettings.usernameTag?.trim() || row.user_id;
         const entries = parseFeedbackEntries(row?.data?.feedback);
 
         for (const entry of entries) {
-          const key = `${row.user_id}:${entry.id}`;
-          if (rowsByKey.has(key)) continue;
-
-          rowsByKey.set(key, {
+          rows.push({
             ...entry,
             userId: row.user_id,
-            userLabel: sourceLabel && userLabel === row.user_id ? `${row.user_id} (${sourceLabel})` : userLabel,
+            userLabel,
           });
         }
       }
-    };
 
-    try {
-      setAdminFeedbackStatus("Loading all visible feedback…");
-
-      // 1) Always include the admin's own saved feedback.
-      addRows([{ user_id: userId, data: { settings, feedback: feedbackEntries } }]);
-
-      // 2) Include rows already loaded through the friends system.
-      addRows(friendActivityRows);
-
-      // 3) Try a direct visible-row scan. With strict RLS this may only return your own row,
-      // but with admin/friend read rules it can return more.
-      const direct = await supabase
-        .from("media_items")
-        .select("user_id,data");
-
-      if (direct.error) {
-        console.warn(direct.error);
-      } else {
-        addRows((direct.data ?? []) as Array<{ user_id: string; data: any }>);
-      }
-
-      // 4) Explicitly request friend rows too. Some RLS setups work better when scoped this way.
-      const friendIds = friendsList.map((f) => f.friend_id).filter(Boolean);
-      if (friendIds.length) {
-        const friendRows = await supabase
-          .from("media_items")
-          .select("user_id,data")
-          .in("user_id", friendIds);
-
-        if (friendRows.error) {
-          console.warn(friendRows.error);
-        } else {
-          addRows((friendRows.data ?? []) as Array<{ user_id: string; data: any }>);
-        }
-      }
-
-      const rows = Array.from(rowsByKey.values()).sort(
-        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-      );
-
+      rows.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
       setAdminFeedbackRows(rows);
-      setAdminFeedbackStatus(
-        rows.length
-          ? `Loaded ${rows.length} visible feedback item${rows.length === 1 ? "" : "s"}.`
-          : "No visible feedback yet. If someone just submitted feedback, refresh after they reload once."
-      );
-    } catch (e) {
-      console.warn(e);
-      const rows = Array.from(rowsByKey.values()).sort(
-        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-      );
-      setAdminFeedbackRows(rows);
-      setAdminFeedbackStatus(
-        rows.length
-          ? `Loaded ${rows.length} visible feedback item${rows.length === 1 ? "" : "s"}.`
-          : "Admin feedback is unavailable with the current sharing rules."
-      );
+      setAdminFeedbackStatus(rows.length ? `Loaded ${rows.length} feedback item${rows.length === 1 ? "" : "s"}.` : "No feedback submitted yet.");
+    } catch {
+      setAdminFeedbackStatus("Admin feedback is unavailable right now.");
     }
-  }, [userId, settings, feedbackEntries, friendActivityRows, friendsList]);
+  }, [userId]);
 
 
   const filteredAdminFeedbackRows = useMemo(() => {
@@ -3649,28 +3448,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
   }, [items, selectedFriendProfile]);
 
   /* ================= FILTER ================= */
-  const filteredSiteUsers = useMemo(() => {
-    const q = siteUsersQuery.trim().toLowerCase();
-    const friendIds = new Set(friendsList.map((f) => f.friend_id));
-
-    return siteUsers
-      .slice()
-      .sort((a, b) => {
-        const aFriend = friendIds.has(a.id) ? 1 : 0;
-        const bFriend = friendIds.has(b.id) ? 1 : 0;
-        if (aFriend !== bFriend) return aFriend - bFriend;
-        return a.displayLabel.localeCompare(b.displayLabel);
-      })
-      .filter((u) => {
-        if (!q) return true;
-        return [u.displayLabel, u.subLabel, u.username, u.display_name, u.id]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase()
-          .includes(q);
-      });
-  }, [siteUsers, siteUsersQuery, friendsList]);
-
   const filteredFriendsList = useMemo(() => {
     const q = friendsQuery.trim().toLowerCase();
 
@@ -5065,73 +4842,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
               {friendStatus ? <div className="mt-3 text-sm text-neutral-300">{friendStatus}</div> : null}
             </div>
-
-            <Panel
-              title="Users on Stack"
-              right={
-                <button
-                  type="button"
-                  onClick={loadSiteUsers}
-                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                >
-                  Refresh users
-                </button>
-              }
-            >
-              <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3 items-end">
-                <label className="block">
-                  <div className="text-xs text-neutral-400 mb-1">Search users</div>
-                  <input
-                    value={siteUsersQuery}
-                    onChange={(e) => setSiteUsersQuery(e.target.value)}
-                    placeholder="Search display names or usernames..."
-                    className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
-                  />
-                </label>
-                <div className="text-xs text-neutral-500 sm:text-right pb-1">{siteUsersStatus}</div>
-              </div>
-
-              <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {filteredSiteUsers.length ? (
-                  filteredSiteUsers.map((u) => {
-                    const alreadyFriend = friendsList.some((f) => f.friend_id === u.id);
-                    const pending = outgoingRequests.some((r) => r.requested_id === u.id);
-
-                    return (
-                      <div
-                        key={u.id}
-                        className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm"
-                      >
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="min-w-0">
-                            <div className="text-sm font-medium text-neutral-200 truncate">{u.displayLabel}</div>
-                            <div className="text-[11px] text-neutral-500 truncate">{u.subLabel}</div>
-                            <div className="text-[10px] text-neutral-700 truncate">{u.id}</div>
-                          </div>
-                          <button
-                            type="button"
-                            disabled={alreadyFriend}
-                            onClick={() => addProfileAsFriend(u)}
-                            className={[
-                              "text-xs px-3 py-2 rounded-xl border whitespace-nowrap",
-                              alreadyFriend
-                                ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-200/80 cursor-default"
-                                : "bg-white/10 border-white/10 hover:bg-white/15 text-neutral-100",
-                            ].join(" ")}
-                          >
-                            {alreadyFriend ? "Friends" : pending ? "Add again" : "Add friend"}
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })
-                ) : (
-                  <div className="text-sm text-neutral-500 sm:col-span-2">
-                    No users match this search. If nobody appears, the profiles table may not be visible with the current sharing rules.
-                  </div>
-                )}
-              </div>
-            </Panel>
 
             {/* List panel (table header row like main pages) */}
             <div className="rounded-3xl bg-neutral-950/68 ring-1 ring-white/10 shadow-xl shadow-black/10 backdrop-blur-xl p-4 sm:p-6">
