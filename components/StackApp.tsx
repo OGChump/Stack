@@ -2,7 +2,7 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 "use client";
 
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import {
@@ -23,6 +23,10 @@ type GroupMode = "none" | "day" | "month" | "year";
 type SortMode = "newest" | "oldest" | "title" | "rating_high" | "rating_low" | "updated" | "favorites";
 type RatingFormat = "ten" | "five" | "stars" | "percent";
 type StackColorTheme = "midnight" | "ocean" | "emerald" | "violet" | "rose" | "amber";
+type StackLibraryStyle = "detailed" | "poster" | "classic";
+type StackPosterSize = "small" | "medium" | "large";
+type StackSurfaceStyle = "glass" | "solid";
+type StackCornerStyle = "rounded" | "soft" | "square";
 
 export type StackView =
   | "all"
@@ -53,46 +57,36 @@ type MediaItem = {
   title: string;
   type: MediaType;
 
-  rating?: number; // 0-10
-  posterUrl?: string; // autofill/base
-  posterOverrideUrl?: string; // user override (keeps db info intact)
+  rating?: number;
+  posterUrl?: string;
+  posterOverrideUrl?: string;
 
-  // TMDB fields (movie/tv only)
   tmdbId?: number;
   tmdbType?: "movie" | "tv";
-
-  // IGDB fields (game only)
   igdbId?: number;
-
-  // AniList fields (anime/manga)
   anilistId?: number;
   anilistType?: "ANIME" | "MANGA";
 
   inTheaters?: boolean;
-  dateFinished?: string; // YYYY-MM-DD
+  dateFinished?: string;
   notes?: string;
   rewatchCount?: number;
-  runtime?: number; // minutes (movie=full runtime; tv/anime=per-episode approx)
+  runtime?: number;
   status: Status;
   tags: string[];
-  createdAt: string; // ISO
-  updatedAt?: string; // ISO
+  createdAt: string;
+  updatedAt?: string;
   favorite?: boolean;
   isPrivate?: boolean;
   withFriendIds?: string[];
 
-  // Optional progress
   progressCur?: number;
   progressTotal?: number;
-
-  // optional manual override
   progressCurOverride?: number;
   progressTotalOverride?: number;
 
-  // games
-  hoursPlayed?: number; // manual hours played
+  hoursPlayed?: number;
 };
-
 
 type TmdbSearchResult = {
   results?: Array<{ id: number; title?: string; name?: string; release_date?: string; first_air_date?: string }>;
@@ -144,9 +138,8 @@ type MediaPick =
       igdbId: number;
     };
 
-
 type Suggestion = {
-  key: string; // unique key for list rendering
+  key: string;
   provider: "tmdb" | "igdb" | "anilist";
   title: string;
   subtitle?: string;
@@ -154,7 +147,6 @@ type Suggestion = {
   tags?: string[];
   runtime?: number;
   progressTotal?: number;
-  // ids
   tmdbId?: number;
   tmdbType?: "movie" | "tv";
   igdbId?: number;
@@ -172,16 +164,27 @@ type StackSettings = {
   colorTheme?: StackColorTheme;
   friendNicknames?: Record<string, string>;
 
-  // Friend/public profile privacy controls. These stay inside the existing settings JSON.
   showRatingsToFriends?: boolean;
   showNotesToFriends?: boolean;
   showTagsToFriends?: boolean;
   showProfileBioToFriends?: boolean;
 
-  // Display preferences saved with the existing settings JSON.
   compactMode?: boolean;
   defaultBoardView?: "board" | "list";
   defaultAddStatus?: Status;
+
+  libraryStyle?: StackLibraryStyle;
+  posterSize?: StackPosterSize;
+  surfaceStyle?: StackSurfaceStyle;
+  cornerStyle?: StackCornerStyle;
+  bannerImageUrl?: string;
+  backgroundImageUrl?: string;
+  reduceMotion?: boolean;
+  showListRating?: boolean;
+  showListType?: boolean;
+  showListProgress?: boolean;
+  showListNotes?: boolean;
+  showListTags?: boolean;
 };
 
 type FeedbackEntry = {
@@ -218,12 +221,42 @@ type AdminFeedbackEntry = FeedbackEntry & {
   userLabel: string;
 };
 
+type AdminMemberOverview = {
+  id: string;
+  email?: string | null;
+  createdAt?: string | null;
+  lastSignInAt?: string | null;
+  emailConfirmedAt?: string | null;
+  username?: string | null;
+  profileDisplayName?: string | null;
+  settings: StackSettings;
+  items: MediaItem[];
+  feedback: FeedbackEntry[];
+  friendCount: number;
+  incomingPending: number;
+  outgoingPending: number;
+};
+
+type AdminOverviewResponse = {
+  generatedAt: string;
+  summary: {
+    members: number;
+    mediaItems: number;
+    privateItems: number;
+    publicItems: number;
+    completedItems: number;
+    pendingFriendRequests: number;
+    friendships: number;
+    feedbackItems: number;
+  };
+  members: AdminMemberOverview[];
+};
+
 const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
 const LOCAL_LAST_GOOD_KEY = "stack-items-backup-v1-last-good";
 const LOCAL_BOARD_VIEW_KEY = "stack-board-view-v1";
 const LOCAL_COLOR_THEME_KEY = "stack-color-theme-v1";
 const STACK_ADMIN_USER_IDS = ["a990813e-af9d-4e1c-a15d-2e9281128c71"];
-
 
 function backupKeyForUser(uid?: string | null) {
   return uid ? `${LOCAL_BACKUP_KEY}:${uid}` : LOCAL_BACKUP_KEY;
@@ -260,16 +293,16 @@ const TYPE_LABEL: Record<MediaType, string> = {
 };
 
 const PIE_COLORS = [
-  "#22d3ee", // bright cyan
-  "#f97316", // orange
-  "#a78bfa", // violet
-  "#84cc16", // lime
-  "#f43f5e", // rose
-  "#facc15", // yellow
-  "#38bdf8", // sky
-  "#e879f9", // fuchsia
-  "#10b981", // emerald
-  "#ef4444", // red
+  "#22d3ee",
+  "#f97316",
+  "#a78bfa",
+  "#84cc16",
+  "#f43f5e",
+  "#facc15",
+  "#38bdf8",
+  "#e879f9",
+  "#10b981",
+  "#ef4444",
 ];
 
 const STACK_COLOR_THEME_OPTIONS: Array<{ value: StackColorTheme; label: string; description: string }> = [
@@ -431,7 +464,6 @@ const STACK_COLOR_THEME_CSS_VARS: Record<StackColorTheme, Record<string, string>
   amber: stackThemeToCssVars(STACK_COLOR_THEMES.amber),
 };
 
-const STACK_THEME_BOOT_SCRIPT = `(function(){try{var key=${JSON.stringify(LOCAL_COLOR_THEME_KEY)};var themes=${JSON.stringify(STACK_COLOR_THEME_CSS_VARS).replace(/</g, "\u003c")};var theme=localStorage.getItem(key);if(!themes[theme]){var match=document.cookie.match(/(?:^|; )stack_color_theme=([^;]+)/);theme=match?decodeURIComponent(match[1]):"midnight";}if(!themes[theme])theme="midnight";var root=document.documentElement;var vars=themes[theme];Object.keys(vars).forEach(function(k){root.style.setProperty(k,vars[k]);});root.dataset.stackTheme=theme;root.style.colorScheme="dark";}catch(e){}})();`;
 
 function applyStackThemeToDocument(themeValue: unknown) {
   if (typeof document === "undefined") return;
@@ -461,6 +493,16 @@ const DEFAULT_SETTINGS: Required<
     | "compactMode"
     | "defaultBoardView"
     | "defaultAddStatus"
+    | "libraryStyle"
+    | "posterSize"
+    | "surfaceStyle"
+    | "cornerStyle"
+    | "reduceMotion"
+    | "showListRating"
+    | "showListType"
+    | "showListProgress"
+    | "showListNotes"
+    | "showListTags"
   >
 > &
   Omit<
@@ -476,6 +518,16 @@ const DEFAULT_SETTINGS: Required<
     | "compactMode"
     | "defaultBoardView"
     | "defaultAddStatus"
+    | "libraryStyle"
+    | "posterSize"
+    | "surfaceStyle"
+    | "cornerStyle"
+    | "reduceMotion"
+    | "showListRating"
+    | "showListType"
+    | "showListProgress"
+    | "showListNotes"
+    | "showListTags"
   > = {
   displayName: "",
   usernameTag: "",
@@ -492,6 +544,18 @@ const DEFAULT_SETTINGS: Required<
   compactMode: false,
   defaultBoardView: "board",
   defaultAddStatus: "planned",
+  libraryStyle: "detailed",
+  posterSize: "medium",
+  surfaceStyle: "glass",
+  cornerStyle: "rounded",
+  bannerImageUrl: "",
+  backgroundImageUrl: "",
+  reduceMotion: false,
+  showListRating: true,
+  showListType: true,
+  showListProgress: true,
+  showListNotes: true,
+  showListTags: true,
 };
 
 function uid() {
@@ -499,7 +563,6 @@ function uid() {
     return crypto.randomUUID();
   }
 
-  // Browser fallback for older Safari/WebView versions.
   return `stack_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
@@ -535,10 +598,33 @@ function normalizeSettings(raw: unknown): StackSettings {
         ? obj.showProfileBioToFriends
         : DEFAULT_SETTINGS.showProfileBioToFriends,
     compactMode: typeof obj.compactMode === "boolean" ? obj.compactMode : DEFAULT_SETTINGS.compactMode,
-    defaultBoardView: obj.defaultBoardView === "list" || obj.defaultBoardView === "board" ? obj.defaultBoardView : DEFAULT_SETTINGS.defaultBoardView,
+    defaultBoardView:
+      obj.defaultBoardView === "list" || obj.defaultBoardView === "board"
+        ? obj.defaultBoardView
+        : DEFAULT_SETTINGS.defaultBoardView,
     defaultAddStatus: STATUSES.some((s) => s.id === obj.defaultAddStatus)
       ? (obj.defaultAddStatus as Status)
       : DEFAULT_SETTINGS.defaultAddStatus,
+    libraryStyle: ["detailed", "poster", "classic"].includes(obj.libraryStyle)
+      ? (obj.libraryStyle as StackLibraryStyle)
+      : DEFAULT_SETTINGS.libraryStyle,
+    posterSize: ["small", "medium", "large"].includes(obj.posterSize)
+      ? (obj.posterSize as StackPosterSize)
+      : DEFAULT_SETTINGS.posterSize,
+    surfaceStyle: obj.surfaceStyle === "solid" || obj.surfaceStyle === "glass"
+      ? (obj.surfaceStyle as StackSurfaceStyle)
+      : DEFAULT_SETTINGS.surfaceStyle,
+    cornerStyle: ["rounded", "soft", "square"].includes(obj.cornerStyle)
+      ? (obj.cornerStyle as StackCornerStyle)
+      : DEFAULT_SETTINGS.cornerStyle,
+    bannerImageUrl: typeof obj.bannerImageUrl === "string" ? obj.bannerImageUrl : "",
+    backgroundImageUrl: typeof obj.backgroundImageUrl === "string" ? obj.backgroundImageUrl : "",
+    reduceMotion: typeof obj.reduceMotion === "boolean" ? obj.reduceMotion : DEFAULT_SETTINGS.reduceMotion,
+    showListRating: typeof obj.showListRating === "boolean" ? obj.showListRating : DEFAULT_SETTINGS.showListRating,
+    showListType: typeof obj.showListType === "boolean" ? obj.showListType : DEFAULT_SETTINGS.showListType,
+    showListProgress: typeof obj.showListProgress === "boolean" ? obj.showListProgress : DEFAULT_SETTINGS.showListProgress,
+    showListNotes: typeof obj.showListNotes === "boolean" ? obj.showListNotes : DEFAULT_SETTINGS.showListNotes,
+    showListTags: typeof obj.showListTags === "boolean" ? obj.showListTags : DEFAULT_SETTINGS.showListTags,
     friendNicknames:
       obj.friendNicknames && typeof obj.friendNicknames === "object" && !Array.isArray(obj.friendNicknames)
         ? (Object.fromEntries(
@@ -602,6 +688,22 @@ type ProfilePrivacyOptions = {
   showTags: boolean;
 };
 
+type ListDisplayPreferences = {
+  showRating: boolean;
+  showType: boolean;
+  showProgress: boolean;
+  showNotes: boolean;
+  showTags: boolean;
+};
+
+const DEFAULT_LIST_DISPLAY: ListDisplayPreferences = {
+  showRating: true,
+  showType: true,
+  showProgress: true,
+  showNotes: true,
+  showTags: true,
+};
+
 function profilePrivacyFromSettings(settings?: StackSettings): ProfilePrivacyOptions {
   return {
     showRatings: settings?.showRatingsToFriends !== false,
@@ -653,6 +755,20 @@ function safeDateLabel(value?: string) {
   }
 }
 
+function friendInitials(name: string) {
+  const clean = String(name || "").trim();
+  if (!clean) return "?";
+
+  const parts = clean
+    .split(/\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+
+  return `${parts[0]?.[0] ?? ""}${parts[parts.length - 1]?.[0] ?? ""}`.toUpperCase();
+}
+
 function playStackSoundEffect(kind: "hover" | "click" = "click", volume = 1) {
   if (typeof window === "undefined") return;
 
@@ -685,7 +801,10 @@ function playStackSoundEffect(kind: "hover" | "click" = "click", volume = 1) {
 }
 
 function omitKnownDataKeys(raw: unknown) {
-  const obj = raw && typeof raw === "object" && raw !== null && !Array.isArray(raw) ? { ...(raw as Record<string, any>) } : {};
+  const obj =
+    raw && typeof raw === "object" && raw !== null && !Array.isArray(raw)
+      ? { ...(raw as Record<string, any>) }
+      : {};
   delete obj.items;
   delete obj.settings;
   delete obj.feedback;
@@ -729,7 +848,6 @@ async function anilistRandomManga(): Promise<{ title: string; anilistId: number;
   return { title, anilistId: picked.id, posterUrl };
 }
 
-
 function todayYMD() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -768,7 +886,6 @@ function normTitle(s: string) {
     .trim();
 }
 
-/** Levenshtein distance */
 function levenshtein(a: string, b: string) {
   const s = a;
   const t = b;
@@ -793,14 +910,12 @@ function levenshtein(a: string, b: string) {
   return dp[n];
 }
 
-/** Similarity score 0..1 (1 = identical) */
 function similarityScore(aRaw: string, bRaw: string) {
   const a = normTitle(aRaw);
   const b = normTitle(bRaw);
   if (!a || !b) return 0;
   if (a === b) return 1;
 
-  // prefix boost for tab-to-complete
   if (b.startsWith(a)) {
     const prefixBoost = 0.15 * Math.min(1, a.length / Math.max(1, b.length));
     return Math.min(1, 0.85 + prefixBoost);
@@ -812,8 +927,10 @@ function similarityScore(aRaw: string, bRaw: string) {
 }
 
 function getMovieProgressDefaults(item: MediaItem) {
-  const total = typeof item.progressTotalOverride === "number" ? item.progressTotalOverride : item.progressTotal;
-  const cur = typeof item.progressCurOverride === "number" ? item.progressCurOverride : item.progressCur;
+  const total =
+    typeof item.progressTotalOverride === "number" ? item.progressTotalOverride : item.progressTotal;
+  const cur =
+    typeof item.progressCurOverride === "number" ? item.progressCurOverride : item.progressCur;
 
   if (item.type !== "movie") return { cur, total };
 
@@ -911,7 +1028,8 @@ async function anilistDetails(
 
   const json: AniListDetailsResponse = await res.json();
   const m = json?.data?.Media;
-  const coverUrl = m?.coverImage?.extraLarge || m?.coverImage?.large || m?.coverImage?.medium || undefined;
+  const coverUrl =
+    m?.coverImage?.extraLarge || m?.coverImage?.large || m?.coverImage?.medium || undefined;
   const genres = Array.isArray(m?.genres) ? (m.genres as string[]) : undefined;
 
   return {
@@ -924,7 +1042,7 @@ async function anilistDetails(
   };
 }
 
-// ================= RECOMMENDER HELPERS (TMDB) =================
+/* ================= RECOMMENDER HELPERS (TMDB) ================= */
 
 type TmdbDiscoverResult = {
   results?: Array<{
@@ -944,7 +1062,6 @@ async function tmdbDiscoverRandom(type: "movie" | "tv") {
   const key = process.env.NEXT_PUBLIC_TMDB_KEY;
   if (!key) throw new Error("Missing TMDB key (NEXT_PUBLIC_TMDB_KEY).");
 
-  // TMDB caps discover pages; 1..500 is the typical safe range
   const page = 1 + Math.floor(Math.random() * 500);
 
   const url = new URL(`https://api.themoviedb.org/3/discover/${type}`);
@@ -962,14 +1079,15 @@ async function tmdbDiscoverRandom(type: "movie" | "tv") {
 
   const picked = list[Math.floor(Math.random() * list.length)];
   const title = (picked.title || picked.name || "").trim();
-  const posterUrl = picked.poster_path ? `https://image.tmdb.org/t/p/w500${picked.poster_path}` : undefined;
+  const posterUrl = picked.poster_path
+    ? `https://image.tmdb.org/t/p/w500${picked.poster_path}`
+    : undefined;
 
   return { title, tmdbId: picked.id, tmdbType: type, posterUrl };
 }
 
 async function anilistRandomAnime(): Promise<{ title: string; anilistId: number; posterUrl?: string }> {
-  // Random page of popular anime, then random entry in that page
-  const page = 1 + Math.floor(Math.random() * 200); // wide enough to feel random
+  const page = 1 + Math.floor(Math.random() * 200);
   const perPage = 25;
 
   const query = `
@@ -999,11 +1117,11 @@ async function anilistRandomAnime(): Promise<{ title: string; anilistId: number;
   const picked = list[Math.floor(Math.random() * list.length)];
   const title =
     (picked?.title?.english || picked?.title?.romaji || picked?.title?.native || "").trim() || "Unknown";
-  const posterUrl = picked?.coverImage?.extraLarge || picked?.coverImage?.large || picked?.coverImage?.medium || undefined;
+  const posterUrl =
+    picked?.coverImage?.extraLarge || picked?.coverImage?.large || picked?.coverImage?.medium || undefined;
 
   return { title, anilistId: picked.id, posterUrl };
 }
-
 
 type TmdbTrendingResult = {
   results?: Array<{ id: number; title?: string; name?: string }>;
@@ -1025,7 +1143,6 @@ function clamp01(n: number) {
 }
 
 function computeTasteProfile(items: MediaItem[]) {
-  // Use completed items, prioritize highly-rated ones
   const completed = items.filter((i) => i.status === "completed");
   const rated = completed
     .filter((i) => typeof i.rating === "number")
@@ -1033,10 +1150,9 @@ function computeTasteProfile(items: MediaItem[]) {
 
   const seeds = rated.slice(0, 12);
 
-  // Top tags (genres) weighted by rating
   const tagScore = new Map<string, number>();
   for (const i of seeds) {
-    const w = (i.rating ?? 0) / 10; // 0..1
+    const w = (i.rating ?? 0) / 10;
     for (const t of i.tags ?? []) {
       const k = normTag(t);
       if (!k) continue;
@@ -1049,7 +1165,6 @@ function computeTasteProfile(items: MediaItem[]) {
     .slice(0, 12)
     .map(([k]) => k);
 
-  // Type preference from last ~30 items (what you’ve been consuming)
   const recent = items.slice(0, 30);
   const typeCounts = new Map<MediaType, number>();
   for (const i of recent) typeCounts.set(i.type, (typeCounts.get(i.type) ?? 0) + 1);
@@ -1099,13 +1214,12 @@ async function tmdbDiscoverByGenres(type: "movie" | "tv", genreIds: number[]) {
   const key = process.env.NEXT_PUBLIC_TMDB_KEY;
   if (!key) throw new Error("Missing TMDB key (NEXT_PUBLIC_TMDB_KEY).");
 
-  // keep it “fresh” and varied
   const page = 1 + Math.floor(Math.random() * 50);
 
   const url = new URL(`https://api.themoviedb.org/3/discover/${type}`);
   url.searchParams.set("api_key", key);
   url.searchParams.set("include_adult", "false");
-  url.searchParams.set("sort_by", "vote_count.desc"); // better than pure popularity for “good picks”
+  url.searchParams.set("sort_by", "vote_count.desc");
   url.searchParams.set("page", String(page));
 
   if (genreIds.length) url.searchParams.set("with_genres", genreIds.join(","));
@@ -1116,7 +1230,6 @@ async function tmdbDiscoverByGenres(type: "movie" | "tv", genreIds: number[]) {
   const json = (await res.json()) as TmdbDiscoverResult;
   return (json.results ?? []).filter((x) => x && x.id);
 }
-
 
 function scoreCandidate(opts: { candidateTags: string[]; userTopTags: string[]; typeBoost: number }) {
   const cand = uniq(opts.candidateTags.map(normTag)).filter(Boolean);
@@ -1155,18 +1268,34 @@ function diversifyPicks<T extends { score: number; tags: string[] }>(
   return out.length ? out : picks.slice(0, 8);
 }
 
-
 /* ================= APP ================= */
 
 export default function StackApp({ view = "all" }: { view?: StackView }) {
-  // ✅ Stats month filter ("all" = no filter)
   const [statsMonth, setStatsMonth] = useState<string>("all");
   const [items, setItems] = useState<MediaItem[]>([]);
   const [userId, setUserId] = useState<string | null>(null);
   const [settings, setSettings] = useState<StackSettings>(() => ({
     ...DEFAULT_SETTINGS,
-    colorTheme: loadLocalColorTheme(),
+    colorTheme: "midnight",
   }));
+
+  useEffect(() => {
+    const savedTheme = loadLocalColorTheme();
+
+    // The root boot script has already painted this palette before React.
+    // Re-applying here is idempotent and keeps the runtime state in sync.
+    applyStackThemeToDocument(savedTheme);
+
+    setSettings((prev) => {
+      if (prev.colorTheme === savedTheme) return prev;
+
+      return {
+        ...prev,
+        colorTheme: savedTheme,
+      };
+    });
+  }, []);
+
   const [feedbackEntries, setFeedbackEntries] = useState<FeedbackEntry[]>([]);
   const [cloudExtraData, setCloudExtraData] = useState<Record<string, any>>({});
 
@@ -1179,8 +1308,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [friendProfileMobileTab, setFriendProfileMobileTab] = useState<"profile" | "library" | "stats">("profile");
   const [boardView, setBoardView] = useState<boolean>(true);
   const [ownFriendPreviewOpen, setOwnFriendPreviewOpen] = useState(false);
-  const [adminFeedbackFilter, setAdminFeedbackFilter] = useState<"all" | "suggestion" | "problem" | "new" | "reviewed" | "done">("all");
+  const [adminFeedbackFilter, setAdminFeedbackFilter] = useState<
+    "all" | "suggestion" | "problem" | "new" | "reviewed" | "done"
+  >("all");
   const [adminHideDone, setAdminHideDone] = useState(true);
+  const [settingsTab, setSettingsTab] = useState<"profile" | "appearance" | "privacy" | "behavior" | "admin">("profile");
+  const [adminOverview, setAdminOverview] = useState<AdminOverviewResponse | null>(null);
+  const [adminOverviewStatus, setAdminOverviewStatus] = useState("");
+  const [adminMemberQuery, setAdminMemberQuery] = useState("");
+  const [selectedAdminMemberId, setSelectedAdminMemberId] = useState<string | null>(null);
 
   useEffect(() => {
     try {
@@ -1190,7 +1326,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         return;
       }
 
-      // Keep desktop the same, but make first-time mobile use default to the safer list view.
       if (typeof window !== "undefined" && window.matchMedia("(max-width: 640px)").matches) {
         setBoardView(false);
       }
@@ -1205,7 +1340,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     } catch {}
   }, [settings.defaultBoardView]);
 
-
   const [autofillStatus, setAutofillStatus] = useState("");
   const [autoAutofill, setAutoAutofill] = useState(true);
   const autofillTimer = useRef<number | null>(null);
@@ -1213,9 +1347,11 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const [cloudLoaded, setCloudLoaded] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
+
   // ================= FRIENDS =================
   const [inputUsername, setInputUsername] = useState("");
   const [friendStatus, setFriendStatus] = useState("");
+  const [friendsRefreshing, setFriendsRefreshing] = useState(false);
 
   const [incomingRequests, setIncomingRequests] = useState<
     Array<{
@@ -1256,12 +1392,9 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [adminFeedbackRows, setAdminFeedbackRows] = useState<AdminFeedbackEntry[]>([]);
   const [adminFeedbackStatus, setAdminFeedbackStatus] = useState("");
 
-
-
   const [picks, setPicks] = useState<MediaPick[]>([]);
   const [pickStatus, setPickStatus] = useState("");
   const seenPickKeysRef = useRef<Set<string>>(new Set());
-
 
   const [excludeTypes, setExcludeTypes] = useState<Set<MediaType>>(new Set());
   const toggleExclude = useCallback((t: MediaType) => {
@@ -1273,41 +1406,28 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     });
   }, []);
 
-
-  // Autofill UX improvements
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [showSuggest, setShowSuggest] = useState(false);
   const [ghostTitle, setGhostTitle] = useState<string>("");
   const [activeSuggestIdx, setActiveSuggestIdx] = useState(0);
 
-// For "delete 0 and type" UX
-const [ratingText, setRatingText] = useState<string>(""); // decimal ok
+  const [ratingText, setRatingText] = useState<string>("");
+  const [isRewatch, setIsRewatch] = useState<boolean>(false);
+  const [rewatchText, setRewatchText] = useState<string>("0");
+  const lastRewatchOnRef = useRef<string>("1");
 
-// ✅ Rewatch: separate toggle + separate count text
-const [isRewatch, setIsRewatch] = useState<boolean>(false);
-const [rewatchText, setRewatchText] = useState<string>("0"); // integer
+  useEffect(() => {
+    const n = Math.floor(Number(rewatchText));
+    if (Number.isFinite(n) && n > 0) lastRewatchOnRef.current = String(n);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-// ✅ remembers last valid count while toggle is ON (restores when you re-enable)
-const lastRewatchOnRef = useRef<string>("1");
+  const [progressCurText, setProgressCurText] = useState<string>("");
+  const [progressTotalText, setProgressTotalText] = useState<string>("");
 
-useEffect(() => {
-  // keep ref sane if state starts as something else later
-  const n = Math.floor(Number(rewatchText));
-  if (Number.isFinite(n) && n > 0) lastRewatchOnRef.current = String(n);
-  // run once
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, []);
-
-
-const [progressCurText, setProgressCurText] = useState<string>(""); // integer
-const [progressTotalText, setProgressTotalText] = useState<string>(""); // integer
-
-
-  // Manual tags editor (keeps autofilled tags but allows extras)
   const [autoTags, setAutoTags] = useState<string[]>([]);
   const [manualTags, setManualTags] = useState<string[]>([]);
 
-  // ✅ Undo delete
   const [undoState, setUndoState] = useState<{ item: MediaItem; index: number } | null>(null);
   const undoTimerRef = useRef<number | null>(null);
 
@@ -1317,15 +1437,12 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
     } catch {}
   }, [boardView]);
 
-  // ✅ Cleanup undo timer on unmount
   useEffect(() => {
     return () => {
       if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
     };
   }, []);
 
-
-  // Add form lives only on /add
   const [form, setForm] = useState<Partial<MediaItem>>({
     title: "",
     type: "movie",
@@ -1336,21 +1453,17 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
     dateFinished: "",
     rewatchCount: 0,
     rating: undefined,
-
     posterUrl: "",
     posterOverrideUrl: "",
-
     tmdbId: undefined,
     tmdbType: undefined,
     igdbId: undefined,
     anilistId: undefined,
     anilistType: undefined,
-
     progressCur: undefined,
     progressTotal: undefined,
   });
 
-  // ✅ keep latest form in a ref (prevents stale status/type inside applySuggestion)
   const formRef = useRef<Partial<MediaItem>>(form);
   useEffect(() => {
     formRef.current = form;
@@ -1363,8 +1476,7 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
     setForm((prev) => ({ ...prev, status: defaultStatus }));
   }, [settings.defaultAddStatus, form.title]);
 
-  // ✅ Friends UI
-  const [friendsTab, setFriendsTab] = useState<"friends" | "requests">("friends");
+  const [friendsTab, setFriendsTab] = useState<"friends" | "requests" | "activity">("friends");
   const [friendsQuery, setFriendsQuery] = useState("");
   const [friendLibraryFriendId, setFriendLibraryFriendId] = useState<string>("all");
   const [friendLibraryStatus, setFriendLibraryStatus] = useState<FriendLibraryStatusFilter>("all");
@@ -1400,6 +1512,35 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
     return map;
   }, [friendActivityRows]);
 
+  const friendSummaryById = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        visible: number;
+        completed: number;
+        active: number;
+        latest?: MediaItem;
+      }
+    >();
+
+    for (const row of friendActivityRows) {
+      const visibleItems = Array.isArray(row?.data?.items)
+        ? (row.data.items as MediaItem[]).filter((item) => item && !item.isPrivate)
+        : [];
+
+      const latest = sortMediaItems(visibleItems, "updated")[0];
+
+      map.set(row.user_id, {
+        visible: visibleItems.length,
+        completed: visibleItems.filter((item) => item.status === "completed").length,
+        active: visibleItems.filter((item) => item.status === "in_progress").length,
+        latest,
+      });
+    }
+
+    return map;
+  }, [friendActivityRows]);
+
   const getFriendDisplay = useCallback(
     (
       friendId: string,
@@ -1416,9 +1557,7 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
       const tagLabel = settingsTag || (username ? `@${username}` : "");
       const primary = nickname || baseName;
 
-      const secondaryParts = nickname
-        ? [baseName, tagLabel, friendId]
-        : [tagLabel, friendId];
+      const secondaryParts = nickname ? [baseName, tagLabel, friendId] : [tagLabel, friendId];
 
       const secondary = secondaryParts
         .filter((x): x is string => !!x && x !== primary)
@@ -1446,16 +1585,14 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
 
   const updateSettings = useCallback((patch: Partial<StackSettings>) => {
     if (isStackColorTheme(patch.colorTheme)) {
+      // Apply the selected palette immediately so the UI never paints one frame
+      // with the previous/default theme before React commits the settings update.
+      applyStackThemeToDocument(patch.colorTheme);
       saveLocalColorTheme(patch.colorTheme);
     }
 
     setSettings((prev) => ({ ...prev, ...patch }));
   }, []);
-
-  useEffect(() => {
-    const theme = settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme;
-    if (isStackColorTheme(theme)) saveLocalColorTheme(theme);
-  }, [settings.colorTheme]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1464,6 +1601,7 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
       if (e.key !== LOCAL_COLOR_THEME_KEY) return;
       if (!isStackColorTheme(e.newValue)) return;
 
+      applyStackThemeToDocument(e.newValue);
       setSettings((prev) => ({ ...prev, colorTheme: e.newValue as StackColorTheme }));
     };
 
@@ -1527,18 +1665,12 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
     []
   );
 
-
   /* ================= LOCAL BACKUP ================= */
 
   const loadLocalBackup = useCallback((uid?: string | null): MediaItem[] | null => {
     try {
       const keys = uid
-        ? [
-            backupKeyForUser(uid),
-            lastGoodKeyForUser(uid),
-            LOCAL_BACKUP_KEY,
-            LOCAL_LAST_GOOD_KEY,
-          ]
+        ? [backupKeyForUser(uid), lastGoodKeyForUser(uid), LOCAL_BACKUP_KEY, LOCAL_LAST_GOOD_KEY]
         : [LOCAL_BACKUP_KEY, LOCAL_LAST_GOOD_KEY];
 
       for (const key of Array.from(new Set(keys))) {
@@ -1560,7 +1692,9 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
       const existingPrimary = parseBackupItems(localStorage.getItem(primaryKey));
       const existingLastGood = parseBackupItems(localStorage.getItem(lastGoodKey));
       const existingGeneral = uid ? parseBackupItems(localStorage.getItem(LOCAL_BACKUP_KEY)) : null;
-      const existingGeneralLastGood = uid ? parseBackupItems(localStorage.getItem(LOCAL_LAST_GOOD_KEY)) : null;
+      const existingGeneralLastGood = uid
+        ? parseBackupItems(localStorage.getItem(LOCAL_LAST_GOOD_KEY))
+        : null;
 
       const bestExisting = [existingPrimary, existingLastGood, existingGeneral, existingGeneralLastGood]
         .filter((x): x is MediaItem[] => Array.isArray(x) && x.length > 0)
@@ -1583,1092 +1717,1146 @@ const [progressTotalText, setProgressTotalText] = useState<string>(""); // integ
     } catch {}
   }, []);
 
-/* ================= SUPABASE ================= */
+  /* ================= SUPABASE ================= */
 
-type ProfileRow = { id: string; username: string | null; display_name?: string | null };
+  type ProfileRow = { id: string; username: string | null; display_name?: string | null };
 
-type IncomingRequestRow = {
-  id: string;
-  requester_id: string;
-  requested_id: string;
-  status: "pending" | "accepted" | "declined";
-  created_at?: string;
-  requester?: { username?: string | null; display_name?: string | null } | null;
-};
+  type IncomingRequestRow = {
+    id: string;
+    requester_id: string;
+    requested_id: string;
+    status: "pending" | "accepted" | "declined";
+    created_at?: string;
+    requester?: { username?: string | null; display_name?: string | null } | null;
+  };
 
-type FriendRow = {
-  friend_id: string;
-  friend?: { username?: string | null; display_name?: string | null } | null;
-};
+  type OutgoingRequestRow = {
+    id: string;
+    requester_id: string;
+    requested_id: string;
+    status: "pending" | "accepted" | "declined";
+    created_at?: string;
+    requested?: { username?: string | null; display_name?: string | null } | null;
+  };
 
-const AUTO_ACCEPT_FRIEND_REQUESTS = true;
+  type FriendRow = {
+    friend_id: string;
+    friend?: { username?: string | null; display_name?: string | null } | null;
+  };
 
-/** Prefer exact username first, then display name. Display names can repeat, so ambiguous matches ask for username. */
-const findProfileByUsernameOrDisplayName = useCallback(
-  async (input: string): Promise<{ profile: ProfileRow | null; ambiguous?: boolean }> => {
-    const q = input.trim();
-    if (!q) return { profile: null };
+  const findProfileByUsernameOrDisplayName = useCallback(
+    async (input: string): Promise<{ profile: ProfileRow | null; ambiguous?: boolean }> => {
+      const q = input.trim();
+      if (!q) return { profile: null };
 
-    const normalizeLookup = (value: unknown) =>
-      String(value ?? "")
-        .trim()
-        .replace(/^@+/, "")
-        .replace(/\s+/g, " ")
-        .toLowerCase();
+      const normalizeLookup = (value: unknown) =>
+        String(value ?? "")
+          .trim()
+          .replace(/^@+/, "")
+          .replace(/\s+/g, " ")
+          .toLowerCase();
 
-    const cleanQ = q.replace(/^@+/, "").trim();
-    const qNorm = normalizeLookup(q);
+      const cleanQ = q.replace(/^@+/, "").trim();
+      const qNorm = normalizeLookup(q);
 
-    const dedupeMatches = (rows: ProfileRow[]) => {
-      const map = new Map<string, ProfileRow>();
-      for (const row of rows) {
-        if (!row?.id) continue;
-        if (!map.has(row.id)) map.set(row.id, row);
+      const dedupeMatches = (rows: ProfileRow[]) => {
+        const map = new Map<string, ProfileRow>();
+        for (const row of rows) {
+          if (!row?.id) continue;
+          if (!map.has(row.id)) map.set(row.id, row);
+        }
+        return Array.from(map.values());
+      };
+
+      const resolveMatches = (rows: ProfileRow[]) => {
+        const matches = dedupeMatches(rows);
+        if (matches.length === 1) return { profile: matches[0] };
+        if (matches.length > 1) return { profile: null, ambiguous: true };
+        return { profile: null };
+      };
+
+      const { data: usernameMatches, error: usernameError } = await supabase
+        .from("profiles")
+        .select("id, username, display_name")
+        .ilike("username", cleanQ)
+        .limit(3);
+
+      if (usernameError) console.error(usernameError);
+      const exactUsername = resolveMatches((usernameMatches ?? []) as ProfileRow[]);
+      if (exactUsername.profile || exactUsername.ambiguous) return exactUsername;
+
+      const { data: exactDisplayMatches, error: exactDisplayError } = await supabase
+        .from("profiles")
+        .select("id, username, display_name")
+        .ilike("display_name", q)
+        .limit(3);
+
+      if (exactDisplayError) {
+        console.error(exactDisplayError);
+        return { profile: null };
       }
-      return Array.from(map.values());
-    };
 
-    const resolveMatches = (rows: ProfileRow[]) => {
-      const matches = dedupeMatches(rows);
-      if (matches.length === 1) return { profile: matches[0] };
-      if (matches.length > 1) return { profile: null, ambiguous: true };
+      const exactProfileDisplay = resolveMatches((exactDisplayMatches ?? []) as ProfileRow[]);
+      if (exactProfileDisplay.profile || exactProfileDisplay.ambiguous) return exactProfileDisplay;
+
+      const { data: stackRows, error: stackRowsError } = await supabase
+        .from("media_items")
+        .select("user_id,data")
+        .limit(500);
+
+      if (stackRowsError) console.warn(stackRowsError);
+
+      const stackProfiles = ((stackRows ?? []) as Array<{ user_id: string; data: any }>)
+        .map((row) => {
+          const rowSettings = normalizeSettings(row?.data?.settings);
+          const displayName = rowSettings.displayName?.trim() || "";
+          const usernameTag = rowSettings.usernameTag?.trim() || "";
+
+          return {
+            profile: {
+              id: row.user_id,
+              username: usernameTag ? usernameTag.replace(/^@+/, "") : null,
+              display_name: displayName || usernameTag || null,
+            } satisfies ProfileRow,
+            displayName,
+            usernameTag,
+          };
+        })
+        .filter((row) => row.profile.id);
+
+      const exactStackMatches = stackProfiles
+        .filter(
+          (row) =>
+            normalizeLookup(row.displayName) === qNorm ||
+            normalizeLookup(row.usernameTag) === qNorm
+        )
+        .map((row) => row.profile);
+
+      const exactStackDisplay = resolveMatches(exactStackMatches);
+      if (exactStackDisplay.profile || exactStackDisplay.ambiguous) return exactStackDisplay;
+
+      const { data: partialDisplayMatches, error: partialDisplayError } = await supabase
+        .from("profiles")
+        .select("id, username, display_name")
+        .ilike("display_name", `%${q}%`)
+        .limit(3);
+
+      if (partialDisplayError) {
+        console.error(partialDisplayError);
+        return { profile: null };
+      }
+
+      const partialProfileDisplay = resolveMatches((partialDisplayMatches ?? []) as ProfileRow[]);
+      if (partialProfileDisplay.profile || partialProfileDisplay.ambiguous) return partialProfileDisplay;
+
+      const partialStackMatches = stackProfiles
+        .filter((row) => {
+          const display = normalizeLookup(row.displayName);
+          const tag = normalizeLookup(row.usernameTag);
+          return (display && display.includes(qNorm)) || (tag && tag.includes(qNorm));
+        })
+        .map((row) => row.profile);
+
+      const partialStackDisplay = resolveMatches(partialStackMatches);
+      if (partialStackDisplay.profile || partialStackDisplay.ambiguous) return partialStackDisplay;
+
       return { profile: null };
-    };
+    },
+    []
+  );
 
-    // 1) Exact username, case-insensitive, with or without @.
-    const { data: usernameMatches, error: usernameError } = await supabase
-      .from("profiles")
-      .select("id, username, display_name")
-      .ilike("username", cleanQ)
-      .limit(3);
+  const loadFriends = useCallback(
+    async (uid?: string) => {
+      const me = uid ?? userId;
+      if (!me) return;
 
-    if (usernameError) console.error(usernameError);
-    const exactUsername = resolveMatches((usernameMatches ?? []) as ProfileRow[]);
-    if (exactUsername.profile || exactUsername.ambiguous) return exactUsername;
+      const { data, error } = await supabase
+        .from("friends")
+        .select("friend_id, friend:friend_id(username, display_name)")
+        .eq("user_id", me);
 
-    // 2) Exact profile display_name, case-insensitive.
-    const { data: exactDisplayMatches, error: exactDisplayError } = await supabase
-      .from("profiles")
-      .select("id, username, display_name")
-      .ilike("display_name", q)
-      .limit(3);
+      if (error) {
+        console.error(error);
+        return;
+      }
 
-    if (exactDisplayError) {
-      console.error(exactDisplayError);
-      return { profile: null };
+      setFriendsList((data ?? []) as FriendRow[]);
+    },
+    [userId]
+  );
+
+  const loadIncomingFriendRequests = useCallback(
+    async (uid?: string) => {
+      const me = uid ?? userId;
+      if (!me) return;
+
+      const { data, error } = await supabase
+        .from("friend_requests")
+        .select(
+          "id, requester_id, requested_id, status, created_at, requester:requester_id(username, display_name)"
+        )
+        .eq("requested_id", me)
+        .eq("status", "pending")
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error(error);
+        return;
+      }
+
+      setIncomingRequests((data ?? []) as IncomingRequestRow[]);
+    },
+    [userId]
+  );
+
+  const loadOutgoingFriendRequests = useCallback(
+    async (uid?: string) => {
+      const me = uid ?? userId;
+      if (!me) return;
+
+      const { data, error } = await supabase
+        .from("friend_requests")
+        .select(
+          "id, requester_id, requested_id, status, created_at, requested:requested_id(username, display_name)"
+        )
+        .eq("requester_id", me)
+        .eq("status", "pending")
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error(error);
+        return;
+      }
+
+      setOutgoingRequests((data ?? []) as OutgoingRequestRow[]);
+    },
+    [userId]
+  );
+
+  async function acceptFriendRequest(
+    requestId: string,
+    _requesterId?: string,
+    opts?: { skipReload?: boolean; me?: string }
+  ) {
+    const me = opts?.me ?? userId;
+
+    if (!me) {
+      setFriendStatus("You must be logged in.");
+      return;
     }
 
-    const exactProfileDisplay = resolveMatches((exactDisplayMatches ?? []) as ProfileRow[]);
-    if (exactProfileDisplay.profile || exactProfileDisplay.ambiguous) return exactProfileDisplay;
+    setFriendStatus("Accepting friend request…");
 
-    // 3) Exact Stack display name / custom ID tag from the existing media_items.data.settings JSON.
-    // This is needed because the Settings page saves displayName in media_items.data.settings,
-    // while friend search was only checking profiles.display_name before.
-    const { data: stackRows, error: stackRowsError } = await supabase
-      .from("media_items")
-      .select("user_id,data")
-      .limit(500);
+    const { error } = await supabase.rpc("accept_friend_request", {
+      p_request_id: requestId,
+    });
 
-    if (stackRowsError) console.warn(stackRowsError);
-
-    const stackProfiles = ((stackRows ?? []) as Array<{ user_id: string; data: any }>)
-      .map((row) => {
-        const rowSettings = normalizeSettings(row?.data?.settings);
-        const displayName = rowSettings.displayName?.trim() || "";
-        const usernameTag = rowSettings.usernameTag?.trim() || "";
-
-        return {
-          profile: {
-            id: row.user_id,
-            username: usernameTag ? usernameTag.replace(/^@+/, "") : null,
-            display_name: displayName || usernameTag || null,
-          } satisfies ProfileRow,
-          displayName,
-          usernameTag,
-        };
-      })
-      .filter((row) => row.profile.id);
-
-    const exactStackMatches = stackProfiles
-      .filter((row) => normalizeLookup(row.displayName) === qNorm || normalizeLookup(row.usernameTag) === qNorm)
-      .map((row) => row.profile);
-
-    const exactStackDisplay = resolveMatches(exactStackMatches);
-    if (exactStackDisplay.profile || exactStackDisplay.ambiguous) return exactStackDisplay;
-
-    // 4) Partial profile display_name match.
-    const { data: partialDisplayMatches, error: partialDisplayError } = await supabase
-      .from("profiles")
-      .select("id, username, display_name")
-      .ilike("display_name", `%${q}%`)
-      .limit(3);
-
-    if (partialDisplayError) {
-      console.error(partialDisplayError);
-      return { profile: null };
+    if (error) {
+      console.error(error);
+      setFriendStatus(error.message || "Failed to accept friend request.");
+      return;
     }
 
-    const partialProfileDisplay = resolveMatches((partialDisplayMatches ?? []) as ProfileRow[]);
-    if (partialProfileDisplay.profile || partialProfileDisplay.ambiguous) return partialProfileDisplay;
+    setFriendStatus("Friend added ✓");
 
-    // 5) Partial Stack display name / custom ID tag match.
-    const partialStackMatches = stackProfiles
-      .filter((row) => {
-        const display = normalizeLookup(row.displayName);
-        const tag = normalizeLookup(row.usernameTag);
-        return (display && display.includes(qNorm)) || (tag && tag.includes(qNorm));
-      })
-      .map((row) => row.profile);
+    if (opts?.skipReload) return;
 
-    const partialStackDisplay = resolveMatches(partialStackMatches);
-    if (partialStackDisplay.profile || partialStackDisplay.ambiguous) return partialStackDisplay;
+    await Promise.all([
+      loadIncomingFriendRequests(me),
+      loadOutgoingFriendRequests(me),
+      loadFriends(me),
+    ]);
+  }
 
-    return { profile: null };
-  },
-  []
-);
+  async function declineFriendRequest(requestId: string) {
+    if (!userId) return;
 
-/** ✅ DEFINE THIS FIRST so it can be referenced safely below */
-const loadFriends = useCallback(
-  async (uid?: string) => {
-    const me = uid ?? userId;
-    if (!me) return;
+    const { error } = await supabase
+      .from("friend_requests")
+      .update({ status: "declined" })
+      .eq("id", requestId)
+      .eq("requested_id", userId)
+      .eq("status", "pending");
 
-    const { data, error } = await supabase
+    if (error) {
+      console.error(error);
+      setFriendStatus(error.message || "Failed to decline request.");
+      return;
+    }
+
+    setFriendStatus("Friend request declined.");
+
+    await Promise.all([
+      loadIncomingFriendRequests(userId),
+      loadOutgoingFriendRequests(userId),
+    ]);
+  }
+
+  async function cancelOutgoingFriendRequest(requestId: string) {
+    if (!userId) return;
+
+    const { error } = await supabase
+      .from("friend_requests")
+      .delete()
+      .eq("id", requestId)
+      .eq("requester_id", userId)
+      .eq("status", "pending");
+
+    if (error) {
+      console.error(error);
+      setFriendStatus(error.message || "Failed to cancel friend request.");
+      return;
+    }
+
+    setFriendStatus("Friend request canceled.");
+    await loadOutgoingFriendRequests(userId);
+  }
+
+  async function removeFriend(friendId: string) {
+    if (!userId) return;
+
+    const friendName = friendsNameById.get(friendId) ?? friendId;
+    const confirmed =
+      typeof window === "undefined"
+        ? true
+        : window.confirm(`Remove ${friendName} from your friends list?`);
+
+    if (!confirmed) return;
+
+    const { error } = await supabase
       .from("friends")
-      .select("friend_id, friend:friend_id(username, display_name)")
-      .eq("user_id", me);
+      .delete()
+      .eq("user_id", userId)
+      .eq("friend_id", friendId);
 
     if (error) {
       console.error(error);
+      setFriendStatus(error.message || "Failed to remove friend.");
       return;
     }
 
-    setFriendsList((data ?? []) as FriendRow[]);
-  },
-  [userId]
-);
+    const reciprocal = await supabase
+      .from("friends")
+      .delete()
+      .eq("user_id", friendId)
+      .eq("friend_id", userId);
 
-const loadIncomingFriendRequests = useCallback(
-  async (uid?: string, opts?: { autoAccept?: boolean }) => {
-    const me = uid ?? userId;
-    if (!me) return;
+    if (reciprocal.error) console.warn(reciprocal.error);
 
-    const { data, error } = await supabase
-      .from("friend_requests")
-      .select("id, requester_id, requested_id, status, created_at, requester:requester_id(username, display_name)")
-      .eq("requested_id", me)
-      .eq("status", "pending")
-      .order("created_at", { ascending: false });
+    setSettings((prev) => {
+      const nextNicknames = { ...(prev.friendNicknames ?? {}) };
+      delete nextNicknames[friendId];
+      return { ...prev, friendNicknames: nextNicknames };
+    });
 
-    if (error) {
-      console.error(error);
+    setSelectedFriendProfileId((prev) => (prev === friendId ? null : prev));
+    setSelectedFriendIds((prev) => prev.filter((id) => id !== friendId));
+    setFriendActivityRows((prev) => prev.filter((row) => row.user_id !== friendId));
+    setFriendLibraryFriendId((prev) => (prev === friendId ? "all" : prev));
+    setFriendStatus(`Removed ${friendName} from your friends list.`);
+
+    await loadFriends(userId);
+  }
+
+  async function sendFriendRequest() {
+    setFriendStatus("");
+
+    if (!userId) {
+      setFriendStatus("You must be logged in.");
       return;
     }
 
-    const rows = (data ?? []) as IncomingRequestRow[];
-    setIncomingRequests(rows);
+    const { profile, ambiguous } = await findProfileByUsernameOrDisplayName(inputUsername);
 
-    const shouldAutoAccept = opts?.autoAccept ?? AUTO_ACCEPT_FRIEND_REQUESTS;
-    if (!shouldAutoAccept) return;
-
-    for (const r of rows) {
-      try {
-        await acceptFriendRequest(r.id, r.requester_id, { skipReload: true, me });
-      } catch (e) {
-        console.error(e);
-      }
-    }
-
-    await Promise.all([loadIncomingFriendRequests(me, { autoAccept: false }), loadFriends(me)]);
-  },
-  [userId, loadFriends]
-);
-
-const loadOutgoingFriendRequests = useCallback(
-  async (uid?: string) => {
-    const me = uid ?? userId;
-    if (!me) return;
-
-    const { data, error } = await supabase
-      .from("friend_requests")
-      .select("id, requester_id, requested_id, status, created_at, requested:requested_id(username, display_name)")
-      .eq("requester_id", me)
-      .eq("status", "pending")
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      console.error(error);
+    if (ambiguous) {
+      setFriendStatus(
+        "More than one person matches that display name. Ask them for their exact Stack username."
+      );
       return;
     }
 
-    setOutgoingRequests((data ?? []) as any[]);
-  },
-  [userId]
-);
-
-async function acceptFriendRequest(
-  requestId: string,
-  requesterId: string,
-  opts?: { skipReload?: boolean; me?: string }
-) {
-  const me = opts?.me ?? userId;
-  if (!me) return;
-
-  // 1) mark request accepted (idempotent-ish)
-  const { data: updated, error: upErr } = await supabase
-    .from("friend_requests")
-    .update({ status: "accepted" })
-    .eq("id", requestId)
-    .eq("requested_id", me)
-    .eq("status", "pending")
-    .select("id,status")
-    .maybeSingle();
-
-  if (upErr) {
-    console.error(upErr);
-    setFriendStatus(upErr.message || "Failed to accept request.");
-    return;
-  }
-
-  if (!updated) {
-    if (!opts?.skipReload) setFriendStatus("Nothing to accept (already handled).");
-    return;
-  }
-
-  // 2) create friendships both directions (avoid duplicates)
-  const { error: frErr } = await supabase
-    .from("friends")
-    .upsert(
-      [
-        { user_id: me, friend_id: requesterId },
-        { user_id: requesterId, friend_id: me },
-      ],
-      { onConflict: "user_id,friend_id" }
-    );
-
-  if (frErr) {
-    console.error(frErr);
-    setFriendStatus(frErr.message || "Accepted, but failed to create friendship rows.");
-  } else {
-    setFriendStatus(AUTO_ACCEPT_FRIEND_REQUESTS ? "Friend added ✅ (auto-accepted)" : "Friend added ✅");
-  }
-
-  if (opts?.skipReload) return;
-
-  await Promise.all([loadIncomingFriendRequests(me, { autoAccept: false }), loadFriends(me)]);
-}
-
-async function declineFriendRequest(requestId: string) {
-  if (!userId) return;
-
-  const { error } = await supabase
-    .from("friend_requests")
-    .update({ status: "declined" })
-    .eq("id", requestId)
-    .eq("requested_id", userId)
-    .eq("status", "pending");
-
-  if (error) {
-    console.error(error);
-    setFriendStatus(error.message || "Failed to decline request.");
-    return;
-  }
-
-  setFriendStatus("Request declined.");
-  await loadIncomingFriendRequests(userId, { autoAccept: false });
-}
-
-async function removeFriend(friendId: string) {
-  if (!userId) return;
-
-  const friendName = friendsNameById.get(friendId) ?? friendId;
-  const confirmed =
-    typeof window === "undefined"
-      ? true
-      : window.confirm(`Remove ${friendName} from your friends list?`);
-
-  if (!confirmed) return;
-
-  const { error } = await supabase
-    .from("friends")
-    .delete()
-    .eq("user_id", userId)
-    .eq("friend_id", friendId);
-
-  if (error) {
-    console.error(error);
-    setFriendStatus(error.message || "Failed to remove friend.");
-    return;
-  }
-
-  // Best-effort cleanup of the mirrored row. Some RLS setups may block this,
-  // but the friend is removed from your own list either way.
-  const reciprocal = await supabase
-    .from("friends")
-    .delete()
-    .eq("user_id", friendId)
-    .eq("friend_id", userId);
-
-  if (reciprocal.error) console.warn(reciprocal.error);
-
-  setSettings((prev) => {
-    const nextNicknames = { ...(prev.friendNicknames ?? {}) };
-    delete nextNicknames[friendId];
-    return { ...prev, friendNicknames: nextNicknames };
-  });
-
-  setSelectedFriendIds((prev) => prev.filter((id) => id !== friendId));
-  setFriendActivityRows((prev) => prev.filter((row) => row.user_id !== friendId));
-  setFriendLibraryFriendId((prev) => (prev === friendId ? "all" : prev));
-  setFriendStatus(`Removed ${friendName} from your friends list.`);
-
-  await loadFriends(userId);
-}
-
-async function sendFriendRequest() {
-  setFriendStatus("");
-
-  if (!userId) {
-    setFriendStatus("You must be logged in.");
-    return;
-  }
-
-  const { profile, ambiguous } = await findProfileByUsernameOrDisplayName(inputUsername);
-
-  if (ambiguous) {
-    setFriendStatus("More than one person matches that display name. Ask them for their exact Stack username.");
-    return;
-  }
-
-  if (!profile?.id) {
-    setFriendStatus("User not found. Try their Stack username, display name, or custom ID tag.");
-    return;
-  }
-
-  const profileLabel = profile.display_name?.trim() || profile.username?.trim() || "that user";
-
-  if (profile.id === userId) {
-    setFriendStatus("You can't friend yourself 💀");
-    return;
-  }
-
-  // already friends?
-  const { data: existingFriend, error: friendCheckErr } = await supabase
-    .from("friends")
-    .select("friend_id")
-    .eq("user_id", userId)
-    .eq("friend_id", profile.id)
-    .maybeSingle();
-
-  if (friendCheckErr) console.error(friendCheckErr);
-
-  if (existingFriend?.friend_id) {
-    setFriendStatus(`You're already friends with ${profileLabel}.`);
-    return;
-  }
-
-  // existing pending request either direction?
-  const { data: existingReq, error: reqErr } = await supabase
-    .from("friend_requests")
-    .select("id, status, requester_id, requested_id")
-    .or(
-      `and(requester_id.eq.${userId},requested_id.eq.${profile.id}),and(requester_id.eq.${profile.id},requested_id.eq.${userId})`
-    )
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (reqErr) console.error(reqErr);
-
-  if (existingReq?.id && existingReq.status === "pending") {
-    if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
-      setFriendStatus(`${profileLabel} already requested you — auto-accepting…`);
-      await acceptFriendRequest(existingReq.id, profile.id);
-      setInputUsername("");
+    if (!profile?.id) {
+      setFriendStatus("User not found. Try their Stack username, display name, or custom ID tag.");
       return;
     }
 
-    setFriendStatus(`You already sent a pending request to ${profileLabel}.`);
-    return;
-  }
+    const profileLabel = profile.display_name?.trim() || profile.username?.trim() || "that user";
 
-  const { error } = await supabase.from("friend_requests").insert({
-    requester_id: userId,
-    requested_id: profile.id,
-    status: "pending",
-  });
+    if (profile.id === userId) {
+      setFriendStatus("You can't friend yourself 💀");
+      return;
+    }
 
-  if (error) {
-    console.error(error);
-    setFriendStatus(error.message || "Failed to send request.");
-    return;
-  }
-
-  setFriendStatus(`Friend request sent to ${profileLabel}.`);
-  setInputUsername("");
-  await loadOutgoingFriendRequests(userId);
-}
-
-const parseFeedbackEntries = (rawFeedback: unknown): FeedbackEntry[] => {
-  return Array.isArray(rawFeedback)
-    ? (rawFeedback as any[])
-        .filter((x) => x && typeof x.id === "string" && typeof x.message === "string")
-        .map((x) => ({
-          id: x.id,
-          type: x.type === "problem" ? "problem" : "suggestion",
-          message: String(x.message),
-          createdAt: typeof x.createdAt === "string" ? x.createdAt : new Date().toISOString(),
-          status: x.status === "reviewed" || x.status === "done" ? x.status : "new",
-        }))
-    : [];
-};
-
-const loadCloud = useCallback(
-  async (uidStr: string) => {
-    setSaveStatus("Loading…");
-    setCloudLoaded(false);
-
-    const localBackup = loadLocalBackup(uidStr);
-    const localBackupCount = localBackup?.length ?? 0;
-
-    const { data, error } = await supabase
-      .from("media_items")
-      .select("data")
-      .eq("user_id", uidStr)
+    const { data: existingFriend, error: friendCheckErr } = await supabase
+      .from("friends")
+      .select("friend_id")
+      .eq("user_id", userId)
+      .eq("friend_id", profile.id)
       .maybeSingle();
 
-    if (error) {
-      console.error(error);
-      if (localBackupCount > 0) {
-        setItems(localBackup!);
-        saveLocalBackup(localBackup!, uidStr);
-      }
-      setCloudLoaded(true);
-      setSaveStatus(localBackupCount > 0 ? `Loaded local backup (${localBackupCount})` : "Cloud load error");
+    if (friendCheckErr) console.error(friendCheckErr);
+
+    if (existingFriend?.friend_id) {
+      setFriendStatus(`You're already friends with ${profileLabel}.`);
       return;
     }
 
-    const raw = data?.data as unknown;
-    const rawObj = raw && typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as any) : null;
+    const { data: existingReq, error: reqErr } = await supabase
+      .from("friend_requests")
+      .select("id, status, requester_id, requested_id")
+      .or(
+        `and(requester_id.eq.${userId},requested_id.eq.${profile.id}),and(requester_id.eq.${profile.id},requested_id.eq.${userId})`
+      )
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    const parsedItems =
-      rawObj &&
-      "items" in rawObj &&
-      Array.isArray(rawObj.items)
-        ? (rawObj.items as any[])
-            .filter((x) => x && typeof x.id === "string" && typeof x.title === "string")
-            .map((x) => x as MediaItem)
-        : Array.isArray(raw)
+    if (reqErr) console.error(reqErr);
+
+    if (existingReq?.id && existingReq.status === "pending") {
+      if (existingReq.requester_id === profile.id && existingReq.requested_id === userId) {
+        setFriendStatus(`${profileLabel} already sent you a request — accepting it…`);
+        await acceptFriendRequest(existingReq.id, profile.id);
+        setInputUsername("");
+        setFriendsTab("friends");
+        return;
+      }
+
+      setFriendStatus(`You already sent a pending request to ${profileLabel}.`);
+      return;
+    }
+
+    const { error } = await supabase.from("friend_requests").insert({
+      requester_id: userId,
+      requested_id: profile.id,
+      status: "pending",
+    });
+
+    if (error) {
+      console.error(error);
+      setFriendStatus(error.message || "Failed to send request.");
+      return;
+    }
+
+    setFriendStatus(`Friend request sent to ${profileLabel}.`);
+    setInputUsername("");
+    setFriendsTab("requests");
+    await loadOutgoingFriendRequests(userId);
+  }
+
+  const parseFeedbackEntries = (rawFeedback: unknown): FeedbackEntry[] => {
+    return Array.isArray(rawFeedback)
+      ? (rawFeedback as any[])
+          .filter((x) => x && typeof x.id === "string" && typeof x.message === "string")
+          .map((x) => ({
+            id: x.id,
+            type: x.type === "problem" ? "problem" : "suggestion",
+            message: String(x.message),
+            createdAt: typeof x.createdAt === "string" ? x.createdAt : new Date().toISOString(),
+            status: x.status === "reviewed" || x.status === "done" ? x.status : "new",
+          }))
+      : [];
+  };
+
+  const applyLoadedSettings = useCallback((rawSettings: unknown) => {
+    const nextSettings = normalizeSettings(rawSettings);
+    const theme = nextSettings.colorTheme ?? DEFAULT_SETTINGS.colorTheme;
+
+    if (isStackColorTheme(theme)) {
+      applyStackThemeToDocument(theme);
+      saveLocalColorTheme(theme);
+    }
+
+    setSettings(nextSettings);
+  }, []);
+
+  const loadCloud = useCallback(
+    async (uidStr: string) => {
+      setSaveStatus("Loading…");
+      setCloudLoaded(false);
+
+      const localBackup = loadLocalBackup(uidStr);
+      const localBackupCount = localBackup?.length ?? 0;
+
+      const { data, error } = await supabase
+        .from("media_items")
+        .select("data")
+        .eq("user_id", uidStr)
+        .maybeSingle();
+
+      if (error) {
+        console.error(error);
+        if (localBackupCount > 0) {
+          setItems(localBackup!);
+          saveLocalBackup(localBackup!, uidStr);
+        }
+        setCloudLoaded(true);
+        setSaveStatus(
+          localBackupCount > 0 ? `Loaded local backup (${localBackupCount})` : "Cloud load error"
+        );
+        return;
+      }
+
+      const raw = data?.data as unknown;
+      const rawObj =
+        raw && typeof raw === "object" && raw !== null && !Array.isArray(raw)
+          ? (raw as any)
+          : null;
+
+      const parsedItems =
+        rawObj && "items" in rawObj && Array.isArray(rawObj.items)
+          ? (rawObj.items as any[])
+              .filter((x) => x && typeof x.id === "string" && typeof x.title === "string")
+              .map((x) => x as MediaItem)
+          : Array.isArray(raw)
           ? (raw as any[])
               .filter((x) => x && typeof x.id === "string" && typeof x.title === "string")
               .map((x) => x as MediaItem)
           : null;
 
-    if (parsedItems) {
-      if (parsedItems.length === 0 && localBackupCount > 0) {
+      if (parsedItems) {
+        if (parsedItems.length === 0 && localBackupCount > 0) {
+          setItems(localBackup!);
+          applyLoadedSettings(rawObj?.settings);
+          setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
+          setCloudExtraData(omitKnownDataKeys(raw));
+          saveLocalBackup(localBackup!, uidStr);
+          setCloudLoaded(true);
+          setSaveStatus(`Recovery mode: cloud was empty, showing backup (${localBackupCount})`);
+          return;
+        }
+
+        setItems(parsedItems);
+        applyLoadedSettings(rawObj?.settings);
+        setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
+        setCloudExtraData(omitKnownDataKeys(raw));
+        saveLocalBackup(parsedItems, uidStr);
+        setCloudLoaded(true);
+        setSaveStatus("Loaded");
+        return;
+      }
+
+      if (localBackupCount > 0) {
         setItems(localBackup!);
-        setSettings(normalizeSettings(rawObj?.settings));
+        applyLoadedSettings(rawObj?.settings);
         setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
         setCloudExtraData(omitKnownDataKeys(raw));
         saveLocalBackup(localBackup!, uidStr);
         setCloudLoaded(true);
-        setSaveStatus(`Recovery mode: cloud was empty, showing backup (${localBackupCount})`);
+        setSaveStatus(`Recovery mode: missing cloud items, showing backup (${localBackupCount})`);
         return;
       }
 
-      setItems(parsedItems);
-      setSettings(normalizeSettings(rawObj?.settings));
-      setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
-      setCloudExtraData(omitKnownDataKeys(raw));
-      saveLocalBackup(parsedItems, uidStr);
+      const initialData = { items: [], settings: DEFAULT_SETTINGS, feedback: [] };
+      const up = await supabase
+        .from("media_items")
+        .upsert([{ user_id: uidStr, data: initialData }], { onConflict: "user_id" });
+
+      if (up.error) {
+        console.error(up.error);
+        setCloudLoaded(true);
+        setSaveStatus("Cloud setup error");
+        return;
+      }
+
+      setItems([]);
+      applyStackThemeToDocument(DEFAULT_SETTINGS.colorTheme);
+      saveLocalColorTheme(DEFAULT_SETTINGS.colorTheme);
+      setSettings(DEFAULT_SETTINGS);
+      setFeedbackEntries([]);
+      setCloudExtraData({});
       setCloudLoaded(true);
       setSaveStatus("Loaded");
-      return;
-    }
-
-    if (localBackupCount > 0) {
-      setItems(localBackup!);
-      setSettings(normalizeSettings(rawObj?.settings));
-      setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
-      setCloudExtraData(omitKnownDataKeys(raw));
-      saveLocalBackup(localBackup!, uidStr);
-      setCloudLoaded(true);
-      setSaveStatus(`Recovery mode: missing cloud items, showing backup (${localBackupCount})`);
-      return;
-    }
-
-    const initialData = { items: [], settings: DEFAULT_SETTINGS, feedback: [] };
-    const up = await supabase
-      .from("media_items")
-      .upsert([{ user_id: uidStr, data: initialData }], { onConflict: "user_id" });
-
-    if (up.error) {
-      console.error(up.error);
-      setCloudLoaded(true);
-      setSaveStatus("Cloud setup error");
-      return;
-    }
-
-    setItems([]);
-    setSettings(DEFAULT_SETTINGS);
-    setFeedbackEntries([]);
-    setCloudExtraData({});
-    setCloudLoaded(true);
-    setSaveStatus("Loaded");
-  },
-  [loadLocalBackup, saveLocalBackup]
-);
-
-const saveCloud = useCallback(
-  async (uidStr: string, next: MediaItem[], nextSettings: StackSettings, nextFeedback: FeedbackEntry[]) => {
-    if (next.length === 0) {
-      const backup = loadLocalBackup(uidStr);
-
-      if (backup && backup.length > 0) {
-        setItems(backup);
-        saveLocalBackup(backup, uidStr);
-        setSaveStatus(`Blocked empty save; restored backup (${backup.length})`);
-        return;
-      }
-    }
-
-    saveLocalBackup(next, uidStr);
-    if (!cloudLoaded) return;
-
-    setSaveStatus("Saving…");
-
-    const dataPayload = {
-      ...cloudExtraData,
-      items: next,
-      settings: normalizeSettings(nextSettings),
-      feedback: nextFeedback,
-    };
-
-    const { error } = await supabase
-      .from("media_items")
-      .upsert([{ user_id: uidStr, data: dataPayload }], { onConflict: "user_id" });
-
-    if (error) {
-      console.error(error);
-      setSaveStatus("Saved locally (cloud error)");
-      return;
-    }
-
-    setSaveStatus("Saved");
-  },
-  [cloudLoaded, saveLocalBackup, loadLocalBackup, cloudExtraData]
-);
-
-useEffect(() => {
-  const backup = loadLocalBackup(null);
-  if (backup) setItems(backup);
-}, [loadLocalBackup]);
-
-useEffect(() => {
-  if (!userId) return;
-  loadIncomingFriendRequests(userId);
-  loadOutgoingFriendRequests(userId);
-  loadFriends(userId);
-}, [userId, loadIncomingFriendRequests, loadOutgoingFriendRequests, loadFriends]);
-
-useEffect(() => {
-  if (!userId || !cloudLoaded) return;
-
-  const displayName = (settings.displayName ?? "").trim();
-  const timer = window.setTimeout(async () => {
-    try {
-      const { error } = await supabase
-        .from("profiles")
-        .update({ display_name: displayName || null })
-        .eq("id", userId);
-
-      if (error) console.warn("Could not sync Stack display name to profiles.display_name", error);
-    } catch (e) {
-      console.warn("Could not sync Stack display name to profiles.display_name", e);
-    }
-  }, 600);
-
-  return () => window.clearTimeout(timer);
-}, [userId, cloudLoaded, settings.displayName]);
-
-useEffect(() => {
-  let mounted = true;
-
-  supabase.auth.getUser().then(({ data }) => {
-    if (!mounted) return;
-    const uidStr = data.user?.id ?? null;
-    setUserId(uidStr);
-    if (uidStr) loadCloud(uidStr);
-  });
-
-  const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
-    const uidStr = session?.user?.id ?? null;
-    setUserId(uidStr);
-    if (uidStr) loadCloud(uidStr);
-  });
-
-  return () => {
-    mounted = false;
-    sub?.subscription?.unsubscribe();
-  };
-
-}, [loadCloud]);
-
-useEffect(() => {
-  if (!userId || !cloudLoaded) return;
-
-  const reloadFromCloud = () => {
-    loadCloud(userId);
-  };
-
-  const onVisibilityChange = () => {
-    if (document.visibilityState === "visible") reloadFromCloud();
-  };
-
-  window.addEventListener("focus", reloadFromCloud);
-  document.addEventListener("visibilitychange", onVisibilityChange);
-
-  return () => {
-    window.removeEventListener("focus", reloadFromCloud);
-    document.removeEventListener("visibilitychange", onVisibilityChange);
-  };
-}, [userId, cloudLoaded, loadCloud]);
-
-useEffect(() => {
-  if (userId) saveCloud(userId, items, settings, feedbackEntries);
-  else saveLocalBackup(items, null);
-}, [items, settings, feedbackEntries, userId, saveCloud, saveLocalBackup]);
-
-
-
-/* ================= ACTIONS ================= */
-
-function addItem(e: React.SyntheticEvent) {
-  e.preventDefault();
-  if (!form.title) return;
-
-  const status = (form.status as Status) ?? "planned";
-
-  const manualDate = (form.dateFinished || "").trim();
-  const autoDate = status === "completed" ? todayYMD() : "";
-  const finalDate = manualDate || autoDate || undefined;
-
-  const ratingNum = ratingText.trim() === "" ? undefined : Number(ratingText);
-  const rating =
-    typeof ratingNum === "number" && Number.isFinite(ratingNum) ? clamp(ratingNum, 0, 10) : undefined;
-
-  const rewatchCount = isRewatch
-    ? Math.max(1, Math.floor(Number(rewatchText.trim() || "1") || 1))
-    : 0;
-
-
-  const pc = progressCurText.trim() === "" ? undefined : Math.max(0, Number(progressCurText) || 0);
-  const pt = progressTotalText.trim() === "" ? undefined : Math.max(0, Number(progressTotalText) || 0);
-
-  // Progress defaults:
-  const inferredTotal = (form.type as MediaType) === "movie" ? (typeof pt === "number" ? pt : 1) : pt;
-  const inferredCur =
-    typeof pc === "number"
-      ? pc
-      : status === "completed" && typeof inferredTotal === "number"
-      ? inferredTotal
-      : undefined;
-
-  const tags = uniqTags([...(autoTags ?? []), ...(manualTags ?? [])]);
-
-  const item: MediaItem = {
-    id: uid(),
-    title: String(form.title).trim(),
-    type: form.type as MediaType,
-    status,
-    inTheaters: !!form.inTheaters,
-    dateFinished: finalDate,
-
-    posterUrl: (form.posterUrl || "").trim() || undefined,
-    posterOverrideUrl: (form.posterOverrideUrl || "").trim() || undefined,
-
-    runtime: typeof form.runtime === "number" ? form.runtime : undefined,
-    notes: (form.notes || "").trim() || undefined,
-    tags,
-    rewatchCount,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    rating,
-    favorite: false,
-    isPrivate: false,
-    withFriendIds: selectedFriendIds.length ? selectedFriendIds : undefined,
-
-    tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
-    tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
-    igdbId: typeof form.igdbId === "number" ? form.igdbId : undefined,
-    anilistId: typeof form.anilistId === "number" ? form.anilistId : undefined,
-    anilistType: form.anilistType === "ANIME" || form.anilistType === "MANGA" ? form.anilistType : undefined,
-
-    progressCur: typeof inferredCur === "number" ? inferredCur : undefined,
-    progressTotal: typeof inferredTotal === "number" ? inferredTotal : undefined,
-
-    hoursPlayed: typeof form.hoursPlayed === "number" ? form.hoursPlayed : undefined,
-  };
-
-  setItems((p) => [item, ...p]);
-
-  // reset
-  setAutofillStatus("");
-  setSuggestions([]);
-  setShowSuggest(false);
-  setGhostTitle("");
-  setActiveSuggestIdx(0);
-
-  setForm((prev) => ({
-    title: "",
-    type: prev.type ?? "movie",
-    status: settings.defaultAddStatus ?? DEFAULT_SETTINGS.defaultAddStatus,
-    tags: [],
-    inTheaters: false,
-    notes: "",
-    dateFinished: "",
-    posterUrl: "",
-    posterOverrideUrl: "",
-    runtime: undefined,
-    rewatchCount: 0,
-    rating: undefined,
-    tmdbId: undefined,
-    tmdbType: undefined,
-    igdbId: undefined,
-    anilistId: undefined,
-    anilistType: undefined,
-    progressCur: undefined,
-    progressTotal: undefined,
-    hoursPlayed: undefined,
-  }));
-
-  setAutoTags([]);
-  setManualTags([]);
-
-  setRatingText("");
-  setIsRewatch(false);
-  setRewatchText("0");
-  setProgressCurText("");
-  setProgressTotalText("");
-  setSelectedFriendIds([]);
-
-}
-
-// ✅ Undo delete
-function removeItem(id: string) {
-  setItems((prev) => {
-    const idx = prev.findIndex((x) => x.id === id);
-    if (idx === -1) return prev;
-
-    const deleted = prev[idx];
-
-    if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
-
-    setUndoState({ item: deleted, index: idx });
-
-    undoTimerRef.current = window.setTimeout(() => {
-      setUndoState(null);
-      undoTimerRef.current = null;
-    }, 7000);
-
-    return prev.filter((x) => x.id !== id);
-  });
-}
-
-// ✅ Smart status + smart date + progress auto-complete
-function updateItem(id: string, patch: Partial<MediaItem>) {
-  const nowIso = new Date().toISOString();
-
-  setItems((prev) =>
-    prev.map((x) => {
-      if (x.id !== id) return x;
-
-      const merged: MediaItem = { ...x, ...patch, updatedAt: nowIso };
-
-      const hadCompleted = x.status === "completed";
-      const nowCompleted = merged.status === "completed";
-
-      // ✅ Was status explicitly changed by the user in this update?
-      const statusExplicit = Object.prototype.hasOwnProperty.call(patch, "status");
-
-      const getEffectiveProgress = (it: MediaItem) => {
-        if (it.type === "movie") {
-          const d = getMovieProgressDefaults(it);
-          return { cur: d.cur, total: d.total };
+    },
+    [loadLocalBackup, saveLocalBackup, applyLoadedSettings]
+  );
+
+  const saveCloud = useCallback(
+    async (
+      uidStr: string,
+      next: MediaItem[],
+      nextSettings: StackSettings,
+      nextFeedback: FeedbackEntry[]
+    ) => {
+      if (next.length === 0) {
+        const backup = loadLocalBackup(uidStr);
+
+        if (backup && backup.length > 0) {
+          setItems(backup);
+          saveLocalBackup(backup, uidStr);
+          setSaveStatus(`Blocked empty save; restored backup (${backup.length})`);
+          return;
         }
+      }
 
-        const cur = typeof it.progressCurOverride === "number" ? it.progressCurOverride : it.progressCur;
-        const total = typeof it.progressTotalOverride === "number" ? it.progressTotalOverride : it.progressTotal;
-        return { cur, total };
+      saveLocalBackup(next, uidStr);
+      if (!cloudLoaded) return;
+
+      setSaveStatus("Saving…");
+
+      const dataPayload = {
+        ...cloudExtraData,
+        items: next,
+        settings: normalizeSettings(nextSettings),
+        feedback: nextFeedback,
       };
 
-      // If status becomes completed and no date, set to today
-      if (!hadCompleted && nowCompleted && !merged.dateFinished) {
-        merged.dateFinished = todayYMD();
+      const { error } = await supabase
+        .from("media_items")
+        .upsert([{ user_id: uidStr, data: dataPayload }], { onConflict: "user_id" });
+
+      if (error) {
+        console.error(error);
+        setSaveStatus("Saved locally (cloud error)");
+        return;
       }
 
-      const { cur, total } = getEffectiveProgress(merged);
-      const totalNum = typeof total === "number" && Number.isFinite(total) ? total : undefined;
-      const curNum = typeof cur === "number" && Number.isFinite(cur) ? cur : undefined;
+      setSaveStatus("Saved");
+    },
+    [cloudLoaded, saveLocalBackup, loadLocalBackup, cloudExtraData]
+  );
 
-      // ✅ Only auto-complete from progress when status was NOT manually changed
-      if (
-        !statusExplicit &&
-        merged.status !== "completed" &&
-        typeof totalNum === "number" &&
-        totalNum > 0 &&
-        typeof curNum === "number" &&
-        curNum >= totalNum
-      ) {
-        merged.status = "completed";
-        if (!merged.dateFinished) merged.dateFinished = todayYMD();
+  useEffect(() => {
+    const backup = loadLocalBackup(null);
+    if (backup) setItems(backup);
+  }, [loadLocalBackup]);
+
+  useEffect(() => {
+    if (!userId) return;
+
+    Promise.all([
+      loadIncomingFriendRequests(userId),
+      loadOutgoingFriendRequests(userId),
+      loadFriends(userId),
+    ]);
+  }, [userId, loadIncomingFriendRequests, loadOutgoingFriendRequests, loadFriends]);
+
+  useEffect(() => {
+    if (!userId || !cloudLoaded) return;
+
+    const displayName = (settings.displayName ?? "").trim();
+    const timer = window.setTimeout(async () => {
+      try {
+        const { error } = await supabase
+          .from("profiles")
+          .update({ display_name: displayName || null })
+          .eq("id", userId);
+
+        if (error) console.warn("Could not sync Stack display name to profiles.display_name", error);
+      } catch (e) {
+        console.warn("Could not sync Stack display name to profiles.display_name", e);
       }
+    }, 600);
 
-      // When completed, make progress "finished" where appropriate
-      if (merged.status === "completed") {
-        if (merged.type === "movie") {
-          merged.progressTotal = 1;
-          merged.progressCur = 1;
-        } else if (merged.type === "tv" || merged.type === "anime" || merged.type === "manga") {
-          if (typeof totalNum === "number" && totalNum > 0) {
-            const currentCur =
-              typeof merged.progressCurOverride === "number" ? merged.progressCurOverride : merged.progressCur;
+    return () => window.clearTimeout(timer);
+  }, [userId, cloudLoaded, settings.displayName]);
 
-            if (typeof currentCur !== "number" || currentCur < totalNum) {
-              merged.progressCur = totalNum;
+  useEffect(() => {
+    let mounted = true;
+
+    supabase.auth.getUser().then(({ data }) => {
+      if (!mounted) return;
+      const uidStr = data.user?.id ?? null;
+      setUserId(uidStr);
+      if (uidStr) loadCloud(uidStr);
+    });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
+      const uidStr = session?.user?.id ?? null;
+      setUserId(uidStr);
+      if (uidStr) loadCloud(uidStr);
+    });
+
+    return () => {
+      mounted = false;
+      sub?.subscription?.unsubscribe();
+    };
+  }, [loadCloud]);
+
+  useEffect(() => {
+    if (!userId || !cloudLoaded) return;
+
+    const reloadFromCloud = () => {
+      loadCloud(userId);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") reloadFromCloud();
+    };
+
+    window.addEventListener("focus", reloadFromCloud);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    return () => {
+      window.removeEventListener("focus", reloadFromCloud);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [userId, cloudLoaded, loadCloud]);
+
+  useEffect(() => {
+    if (userId) saveCloud(userId, items, settings, feedbackEntries);
+    else saveLocalBackup(items, null);
+  }, [items, settings, feedbackEntries, userId, saveCloud, saveLocalBackup]);
+
+  /* ================= ACTIONS ================= */
+
+  function addItem(e: React.SyntheticEvent) {
+    e.preventDefault();
+    if (!form.title) return;
+
+    const status = (form.status as Status) ?? "planned";
+
+    const manualDate = (form.dateFinished || "").trim();
+    const autoDate = status === "completed" ? todayYMD() : "";
+    const finalDate = manualDate || autoDate || undefined;
+
+    const ratingNum = ratingText.trim() === "" ? undefined : Number(ratingText);
+    const rating =
+      typeof ratingNum === "number" && Number.isFinite(ratingNum)
+        ? clamp(ratingNum, 0, 10)
+        : undefined;
+
+    const rewatchCount = isRewatch
+      ? Math.max(1, Math.floor(Number(rewatchText.trim() || "1") || 1))
+      : 0;
+
+    const pc =
+      progressCurText.trim() === "" ? undefined : Math.max(0, Number(progressCurText) || 0);
+    const pt =
+      progressTotalText.trim() === "" ? undefined : Math.max(0, Number(progressTotalText) || 0);
+
+    const inferredTotal =
+      (form.type as MediaType) === "movie" ? (typeof pt === "number" ? pt : 1) : pt;
+    const inferredCur =
+      typeof pc === "number"
+        ? pc
+        : status === "completed" && typeof inferredTotal === "number"
+        ? inferredTotal
+        : undefined;
+
+    const tags = uniqTags([...(autoTags ?? []), ...(manualTags ?? [])]);
+
+    const item: MediaItem = {
+      id: uid(),
+      title: String(form.title).trim(),
+      type: form.type as MediaType,
+      status,
+      inTheaters: !!form.inTheaters,
+      dateFinished: finalDate,
+      posterUrl: (form.posterUrl || "").trim() || undefined,
+      posterOverrideUrl: (form.posterOverrideUrl || "").trim() || undefined,
+      runtime: typeof form.runtime === "number" ? form.runtime : undefined,
+      notes: (form.notes || "").trim() || undefined,
+      tags,
+      rewatchCount,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      rating,
+      favorite: false,
+      isPrivate: false,
+      withFriendIds: selectedFriendIds.length ? selectedFriendIds : undefined,
+      tmdbId: typeof form.tmdbId === "number" ? form.tmdbId : undefined,
+      tmdbType: form.tmdbType === "movie" || form.tmdbType === "tv" ? form.tmdbType : undefined,
+      igdbId: typeof form.igdbId === "number" ? form.igdbId : undefined,
+      anilistId: typeof form.anilistId === "number" ? form.anilistId : undefined,
+      anilistType:
+        form.anilistType === "ANIME" || form.anilistType === "MANGA"
+          ? form.anilistType
+          : undefined,
+      progressCur: typeof inferredCur === "number" ? inferredCur : undefined,
+      progressTotal: typeof inferredTotal === "number" ? inferredTotal : undefined,
+      hoursPlayed: typeof form.hoursPlayed === "number" ? form.hoursPlayed : undefined,
+    };
+
+    setItems((p) => [item, ...p]);
+
+    setAutofillStatus("");
+    setSuggestions([]);
+    setShowSuggest(false);
+    setGhostTitle("");
+    setActiveSuggestIdx(0);
+
+    setForm((prev) => ({
+      title: "",
+      type: prev.type ?? "movie",
+      status: settings.defaultAddStatus ?? DEFAULT_SETTINGS.defaultAddStatus,
+      tags: [],
+      inTheaters: false,
+      notes: "",
+      dateFinished: "",
+      posterUrl: "",
+      posterOverrideUrl: "",
+      runtime: undefined,
+      rewatchCount: 0,
+      rating: undefined,
+      tmdbId: undefined,
+      tmdbType: undefined,
+      igdbId: undefined,
+      anilistId: undefined,
+      anilistType: undefined,
+      progressCur: undefined,
+      progressTotal: undefined,
+      hoursPlayed: undefined,
+    }));
+
+    setAutoTags([]);
+    setManualTags([]);
+    setRatingText("");
+    setIsRewatch(false);
+    setRewatchText("0");
+    setProgressCurText("");
+    setProgressTotalText("");
+    setSelectedFriendIds([]);
+  }
+
+  function removeItem(id: string) {
+    setItems((prev) => {
+      const idx = prev.findIndex((x) => x.id === id);
+      if (idx === -1) return prev;
+
+      const deleted = prev[idx];
+
+      if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+
+      setUndoState({ item: deleted, index: idx });
+
+      undoTimerRef.current = window.setTimeout(() => {
+        setUndoState(null);
+        undoTimerRef.current = null;
+      }, 7000);
+
+      return prev.filter((x) => x.id !== id);
+    });
+  }
+
+  function updateItem(id: string, patch: Partial<MediaItem>) {
+    const nowIso = new Date().toISOString();
+
+    setItems((prev) =>
+      prev.map((x) => {
+        if (x.id !== id) return x;
+
+        const merged: MediaItem = { ...x, ...patch, updatedAt: nowIso };
+
+        const hadCompleted = x.status === "completed";
+        const nowCompleted = merged.status === "completed";
+        const statusExplicit = Object.prototype.hasOwnProperty.call(patch, "status");
+
+        const getEffectiveProgress = (it: MediaItem) => {
+          if (it.type === "movie") {
+            const d = getMovieProgressDefaults(it);
+            return { cur: d.cur, total: d.total };
+          }
+
+          const cur =
+            typeof it.progressCurOverride === "number" ? it.progressCurOverride : it.progressCur;
+          const total =
+            typeof it.progressTotalOverride === "number"
+              ? it.progressTotalOverride
+              : it.progressTotal;
+          return { cur, total };
+        };
+
+        if (!hadCompleted && nowCompleted && !merged.dateFinished) {
+          merged.dateFinished = todayYMD();
+        }
+
+        const { cur, total } = getEffectiveProgress(merged);
+        const totalNum =
+          typeof total === "number" && Number.isFinite(total) ? total : undefined;
+        const curNum = typeof cur === "number" && Number.isFinite(cur) ? cur : undefined;
+
+        if (
+          !statusExplicit &&
+          merged.status !== "completed" &&
+          typeof totalNum === "number" &&
+          totalNum > 0 &&
+          typeof curNum === "number" &&
+          curNum >= totalNum
+        ) {
+          merged.status = "completed";
+          if (!merged.dateFinished) merged.dateFinished = todayYMD();
+        }
+
+        if (merged.status === "completed") {
+          if (merged.type === "movie") {
+            merged.progressTotal = 1;
+            merged.progressCur = 1;
+          } else if (
+            merged.type === "tv" ||
+            merged.type === "anime" ||
+            merged.type === "manga"
+          ) {
+            if (typeof totalNum === "number" && totalNum > 0) {
+              const currentCur =
+                typeof merged.progressCurOverride === "number"
+                  ? merged.progressCurOverride
+                  : merged.progressCur;
+
+              if (typeof currentCur !== "number" || currentCur < totalNum) {
+                merged.progressCur = totalNum;
+              }
             }
           }
         }
-      }
 
-      return merged;
-    })
-  );
-}
+        return merged;
+      })
+    );
+  }
 
-async function pickForMe(mode: "best" | "random" = "best") {
-  try {
-    setPickStatus(mode === "random" ? "Finding something random…" : "Finding picks…");
-    setPicks([]);
+  async function pickForMe(mode: "best" | "random" = "best") {
+    try {
+      setPickStatus(mode === "random" ? "Finding something random…" : "Finding picks…");
+      setPicks([]);
 
-    const existingTitles = new Set(items.map((i) => i.title.toLowerCase()));
-    const taste = computeTasteProfile(items);
+      const existingTitles = new Set(items.map((i) => i.title.toLowerCase()));
+      const taste = computeTasteProfile(items);
 
-    const seed = items
-      .filter((i) => i.tmdbId && (i.tmdbType === "movie" || i.tmdbType === "tv") && typeof i.rating === "number")
-      .sort((a, b) => (b.rating ?? -1) - (a.rating ?? -1))
-      .slice(0, 10);
+      const seed = items
+        .filter(
+          (i) =>
+            i.tmdbId &&
+            (i.tmdbType === "movie" || i.tmdbType === "tv") &&
+            typeof i.rating === "number"
+        )
+        .sort((a, b) => (b.rating ?? -1) - (a.rating ?? -1))
+        .slice(0, 10);
 
-    const fallbackSeed = items
-      .filter((i) => i.tmdbId && (i.tmdbType === "movie" || i.tmdbType === "tv"))
-      .slice(0, 8);
+      const fallbackSeed = items
+        .filter((i) => i.tmdbId && (i.tmdbType === "movie" || i.tmdbType === "tv"))
+        .slice(0, 8);
 
-    const seeds = seed.length ? seed : fallbackSeed;
+      const seeds = seed.length ? seed : fallbackSeed;
 
-    const pool: Array<{ title: string; tmdbId: number; tmdbType: "movie" | "tv" }> = [];
+      const pool: Array<{ title: string; tmdbId: number; tmdbType: "movie" | "tv" }> = [];
 
-    // 1) Recommendations from your best seeds (what you already do)
-    for (const i of seeds) {
-      const tmdbId = i.tmdbId!;
-      const tmdbType = i.tmdbType!;
-      const rec = await tmdbRecommendations(tmdbId, tmdbType);
+      for (const i of seeds) {
+        const tmdbId = i.tmdbId!;
+        const tmdbType = i.tmdbType!;
+        const rec = await tmdbRecommendations(tmdbId, tmdbType);
 
-      for (const r of rec.results ?? []) {
-        const t = (r.title || r.name || "").trim();
-        if (!t) continue;
-        if (existingTitles.has(t.toLowerCase())) continue;
-        pool.push({ title: t, tmdbId: r.id, tmdbType });
-      }
-    }
-
-    // 2) Trending injection (what you already do)
-    const [trendMovie, trendTv] = await Promise.all([tmdbTrending("movie"), tmdbTrending("tv")]);
-
-    for (const r of trendMovie.results ?? []) {
-      const t = (r.title || r.name || "").trim();
-      if (!t) continue;
-      if (existingTitles.has(t.toLowerCase())) continue;
-      pool.push({ title: t, tmdbId: r.id, tmdbType: "movie" });
-    }
-
-    for (const r of trendTv.results ?? []) {
-      const t = (r.title || r.name || "").trim();
-      if (!t) continue;
-      if (existingTitles.has(t.toLowerCase())) continue;
-      pool.push({ title: t, tmdbId: r.id, tmdbType: "tv" });
-    }
-
-    // 3) ✅ NEW: Discover based on your top genre tags (big “best pick” upgrade)
-    const [movieGenres, tvGenres] = await Promise.all([tmdbGenreList("movie"), tmdbGenreList("tv")]);
-
-    const toGenreIds = (type: "movie" | "tv") => {
-      const list = type === "movie" ? movieGenres : tvGenres;
-      const map = new Map(list.map((g) => [normTag(g.name), g.id]));
-      const ids = (taste.topTags ?? [])
-        .map((t) => map.get(normTag(t)))
-        .filter((x): x is number => typeof x === "number");
-      return Array.from(new Set(ids)).slice(0, 3); // top 3 genre IDs
-    };
-
-    const movieGenreIds = toGenreIds("movie");
-    const tvGenreIds = toGenreIds("tv");
-
-    const [discMovies, discTv] = await Promise.all([
-      tmdbDiscoverByGenres("movie", movieGenreIds),
-      tmdbDiscoverByGenres("tv", tvGenreIds),
-    ]);
-
-    for (const d of discMovies) {
-      const t = (d.title || d.name || "").trim();
-      if (!t) continue;
-      if (existingTitles.has(t.toLowerCase())) continue;
-      pool.push({ title: t, tmdbId: d.id, tmdbType: "movie" });
-    }
-
-    for (const d of discTv) {
-      const t = (d.title || d.name || "").trim();
-      if (!t) continue;
-      if (existingTitles.has(t.toLowerCase())) continue;
-      pool.push({ title: t, tmdbId: d.id, tmdbType: "tv" });
-    }
-
-    const seen = new Set<string>();
-    const unique = pool.filter((x) => {
-      const k = `${x.tmdbType}:${x.tmdbId}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    });
-
-    if (!unique.length) {
-      setPickStatus("No new picks found (try rating more items).");
-      return;
-    }
-
-    const candidates = unique.slice(0, 80);
-    const enriched: Array<{
-      provider: "tmdb";
-      title: string;
-      tmdbId: number;
-      tmdbType: "movie" | "tv";
-      posterUrl?: string;
-      score: number;
-      tags: string[];
-    }> = [];
-
-    for (const c of candidates) {
-      try {
-        const d = await tmdbDetails(c.tmdbId, c.tmdbType);
-        const posterUrl = d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : undefined;
-        const tags = (d.genres ?? []).map((g) => g.name);
-
-        const typeBoost = c.tmdbType === "movie" ? taste.typePref.movie : taste.typePref.tv;
-
-        const score = scoreCandidate({
-          candidateTags: tags,
-          userTopTags: taste.topTags,
-          typeBoost,
-        });
-
-        enriched.push({
-          provider: "tmdb",
-          title: c.title,
-          tmdbId: c.tmdbId,
-          tmdbType: c.tmdbType,
-          posterUrl,
-          score,
-          tags,
-        });
-      } catch {
-        // ignore TMDB failures for individual items
-      }
-    }
-
-    enriched.sort((a, b) => b.score - a.score);
-
-    if (mode === "best") {
-      const top = diversifyPicks(enriched);
-
-      setPicks(
-        top.map((p) => ({
-          provider: "tmdb",
-          title: p.title,
-          tmdbId: p.tmdbId,
-          tmdbType: p.tmdbType,
-          posterUrl: p.posterUrl,
-        }))
-      );
-
-      setPickStatus("Here you go.");
-      return;
-    }
-
-    if (mode === "random") {
-      setPickStatus("Rolling the dice…");
-
-      // ✅ Truly random: ignore your library/taste, pull from provider catalogs
-      // (Movie/TV: TMDB discover random. Anime/Manga: AniList random pages.)
-      // NOTE: Games “true random” needs a new IGDB endpoint; see note below.
-      const sources: Array<"tmdb_movie" | "tmdb_tv" | "anilist_anime" | "anilist_manga"> = [
-        "tmdb_movie",
-        "tmdb_tv",
-        "anilist_anime",
-        "anilist_manga",
-      ];
-
-      // try a few times in case we hit something already in your list
-      for (let attempt = 0; attempt < 10; attempt++) {
-        const src = sources[Math.floor(Math.random() * sources.length)];
-
-        try {
-          if (src === "tmdb_movie") {
-            const r = await tmdbDiscoverRandom("movie");
-            if (existingTitles.has(r.title.toLowerCase())) continue;
-
-            setPicks([{ provider: "tmdb", title: r.title, tmdbId: r.tmdbId, tmdbType: "movie", posterUrl: r.posterUrl }]);
-            setPickStatus("Here you go.");
-            return;
-          }
-
-          if (src === "tmdb_tv") {
-            const r = await tmdbDiscoverRandom("tv");
-            if (existingTitles.has(r.title.toLowerCase())) continue;
-
-            setPicks([{ provider: "tmdb", title: r.title, tmdbId: r.tmdbId, tmdbType: "tv", posterUrl: r.posterUrl }]);
-            setPickStatus("Here you go.");
-            return;
-          }
-
-          if (src === "anilist_anime") {
-            const r = await anilistRandomAnime();
-            if (existingTitles.has(r.title.toLowerCase())) continue;
-
-            setPicks([{ provider: "anilist", title: r.title, anilistId: r.anilistId, anilistType: "ANIME", posterUrl: r.posterUrl }]);
-            setPickStatus("Here you go.");
-            return;
-          }
-
-          // anilist_manga
-          const r = await anilistRandomManga();
-          if (existingTitles.has(r.title.toLowerCase())) continue;
-
-          setPicks([{ provider: "anilist", title: r.title, anilistId: r.anilistId, anilistType: "MANGA", posterUrl: r.posterUrl }]);
-          setPickStatus("Here you go.");
-          return;
-        } catch {
-          // try another source/attempt
+        for (const r of rec.results ?? []) {
+          const t = (r.title || r.name || "").trim();
+          if (!t) continue;
+          if (existingTitles.has(t.toLowerCase())) continue;
+          pool.push({ title: t, tmdbId: r.id, tmdbType });
         }
       }
 
-      setPickStatus("Couldn’t find a new random pick (try again).");
-      return;
-    }
+      const [trendMovie, trendTv] = await Promise.all([
+        tmdbTrending("movie"),
+        tmdbTrending("tv"),
+      ]);
 
-  } catch {
-    setPickStatus("Something went wrong.");
+      for (const r of trendMovie.results ?? []) {
+        const t = (r.title || r.name || "").trim();
+        if (!t) continue;
+        if (existingTitles.has(t.toLowerCase())) continue;
+        pool.push({ title: t, tmdbId: r.id, tmdbType: "movie" });
+      }
+
+      for (const r of trendTv.results ?? []) {
+        const t = (r.title || r.name || "").trim();
+        if (!t) continue;
+        if (existingTitles.has(t.toLowerCase())) continue;
+        pool.push({ title: t, tmdbId: r.id, tmdbType: "tv" });
+      }
+
+      const [movieGenres, tvGenres] = await Promise.all([
+        tmdbGenreList("movie"),
+        tmdbGenreList("tv"),
+      ]);
+
+      const toGenreIds = (type: "movie" | "tv") => {
+        const list = type === "movie" ? movieGenres : tvGenres;
+        const map = new Map(list.map((g) => [normTag(g.name), g.id]));
+        const ids = (taste.topTags ?? [])
+          .map((t) => map.get(normTag(t)))
+          .filter((x): x is number => typeof x === "number");
+        return Array.from(new Set(ids)).slice(0, 3);
+      };
+
+      const movieGenreIds = toGenreIds("movie");
+      const tvGenreIds = toGenreIds("tv");
+
+      const [discMovies, discTv] = await Promise.all([
+        tmdbDiscoverByGenres("movie", movieGenreIds),
+        tmdbDiscoverByGenres("tv", tvGenreIds),
+      ]);
+
+      for (const d of discMovies) {
+        const t = (d.title || d.name || "").trim();
+        if (!t) continue;
+        if (existingTitles.has(t.toLowerCase())) continue;
+        pool.push({ title: t, tmdbId: d.id, tmdbType: "movie" });
+      }
+
+      for (const d of discTv) {
+        const t = (d.title || d.name || "").trim();
+        if (!t) continue;
+        if (existingTitles.has(t.toLowerCase())) continue;
+        pool.push({ title: t, tmdbId: d.id, tmdbType: "tv" });
+      }
+
+      const seen = new Set<string>();
+      const unique = pool.filter((x) => {
+        const k = `${x.tmdbType}:${x.tmdbId}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+
+      if (!unique.length) {
+        setPickStatus("No new picks found (try rating more items).");
+        return;
+      }
+
+      const candidates = unique.slice(0, 80);
+      const enriched: Array<{
+        provider: "tmdb";
+        title: string;
+        tmdbId: number;
+        tmdbType: "movie" | "tv";
+        posterUrl?: string;
+        score: number;
+        tags: string[];
+      }> = [];
+
+      for (const c of candidates) {
+        try {
+          const d = await tmdbDetails(c.tmdbId, c.tmdbType);
+          const posterUrl = d.poster_path
+            ? `https://image.tmdb.org/t/p/w500${d.poster_path}`
+            : undefined;
+          const tags = (d.genres ?? []).map((g) => g.name);
+
+          const typeBoost =
+            c.tmdbType === "movie" ? taste.typePref.movie : taste.typePref.tv;
+
+          const score = scoreCandidate({
+            candidateTags: tags,
+            userTopTags: taste.topTags,
+            typeBoost,
+          });
+
+          enriched.push({
+            provider: "tmdb",
+            title: c.title,
+            tmdbId: c.tmdbId,
+            tmdbType: c.tmdbType,
+            posterUrl,
+            score,
+            tags,
+          });
+        } catch {}
+      }
+
+      enriched.sort((a, b) => b.score - a.score);
+
+      if (mode === "best") {
+        const top = diversifyPicks(enriched);
+
+        setPicks(
+          top.map((p) => ({
+            provider: "tmdb",
+            title: p.title,
+            tmdbId: p.tmdbId,
+            tmdbType: p.tmdbType,
+            posterUrl: p.posterUrl,
+          }))
+        );
+
+        setPickStatus("Here you go.");
+        return;
+      }
+
+      if (mode === "random") {
+        setPickStatus("Rolling the dice…");
+
+        const sources: Array<
+          "tmdb_movie" | "tmdb_tv" | "anilist_anime" | "anilist_manga"
+        > = ["tmdb_movie", "tmdb_tv", "anilist_anime", "anilist_manga"];
+
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const src = sources[Math.floor(Math.random() * sources.length)];
+
+          try {
+            if (src === "tmdb_movie") {
+              const r = await tmdbDiscoverRandom("movie");
+              if (existingTitles.has(r.title.toLowerCase())) continue;
+
+              setPicks([
+                {
+                  provider: "tmdb",
+                  title: r.title,
+                  tmdbId: r.tmdbId,
+                  tmdbType: "movie",
+                  posterUrl: r.posterUrl,
+                },
+              ]);
+              setPickStatus("Here you go.");
+              return;
+            }
+
+            if (src === "tmdb_tv") {
+              const r = await tmdbDiscoverRandom("tv");
+              if (existingTitles.has(r.title.toLowerCase())) continue;
+
+              setPicks([
+                {
+                  provider: "tmdb",
+                  title: r.title,
+                  tmdbId: r.tmdbId,
+                  tmdbType: "tv",
+                  posterUrl: r.posterUrl,
+                },
+              ]);
+              setPickStatus("Here you go.");
+              return;
+            }
+
+            if (src === "anilist_anime") {
+              const r = await anilistRandomAnime();
+              if (existingTitles.has(r.title.toLowerCase())) continue;
+
+              setPicks([
+                {
+                  provider: "anilist",
+                  title: r.title,
+                  anilistId: r.anilistId,
+                  anilistType: "ANIME",
+                  posterUrl: r.posterUrl,
+                },
+              ]);
+              setPickStatus("Here you go.");
+              return;
+            }
+
+            const r = await anilistRandomManga();
+            if (existingTitles.has(r.title.toLowerCase())) continue;
+
+            setPicks([
+              {
+                provider: "anilist",
+                title: r.title,
+                anilistId: r.anilistId,
+                anilistType: "MANGA",
+                posterUrl: r.posterUrl,
+              },
+            ]);
+            setPickStatus("Here you go.");
+            return;
+          } catch {}
+        }
+
+        setPickStatus("Couldn’t find a new random pick (try again).");
+        return;
+      }
+    } catch {
+      setPickStatus("Something went wrong.");
+    }
   }
-}
 
   /* ================= DRAG & DROP ================= */
 
@@ -2690,81 +2878,90 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
   /* ================= APPLY SUGGESTION ================= */
 
-  const applySuggestion = useCallback(async (s: Suggestion, opts?: { keepManualTags?: boolean }) => {
-  const keepManual = opts?.keepManualTags ?? true;
+  const applySuggestion = useCallback(
+    async (s: Suggestion, opts?: { keepManualTags?: boolean }) => {
+      const keepManual = opts?.keepManualTags ?? true;
 
-  const getCurrent = () => {
-    const { type = "movie", status = "planned" } = formRef.current ?? {};
-    return { type: type as MediaType, status: status as Status };
-  };
-
-
-  setAutofillStatus(`Applying: ${s.title}…`);
-
-  setForm((f) => {
-    const base = {
-      ...f,
-      title: s.title,
-      posterUrl: s.posterUrl || f.posterUrl,
-      runtime: typeof s.runtime === "number" ? s.runtime : f.runtime,
-    };
-
-    if (s.provider === "tmdb") {
-      return {
-        ...base,
-        tmdbId: s.tmdbId,
-        tmdbType: s.tmdbType,
-        igdbId: undefined,
-        anilistId: undefined,
-        anilistType: undefined,
+      const getCurrent = () => {
+        const { type = "movie", status = "planned" } = formRef.current ?? {};
+        return { type: type as MediaType, status: status as Status };
       };
-    }
 
-    if (s.provider === "igdb") {
-      return {
-        ...base,
-        igdbId: s.igdbId,
-        tmdbId: undefined,
-        tmdbType: undefined,
-        anilistId: undefined,
-        anilistType: undefined,
-      };
-    }
+      setAutofillStatus(`Applying: ${s.title}…`);
 
-    return {
-      ...base,
-      anilistId: s.anilistId,
-      anilistType: s.anilistType,
-      tmdbId: undefined,
-      tmdbType: undefined,
-      igdbId: undefined,
-    };
-  });
+      setForm((f) => {
+        const base = {
+          ...f,
+          title: s.title,
+          posterUrl: s.posterUrl || f.posterUrl,
+          runtime: typeof s.runtime === "number" ? s.runtime : f.runtime,
+        };
 
-  const newAuto = uniqTags([...(s.tags ?? [])]);
-  setAutoTags(newAuto);
-  if (!keepManual) setManualTags([]);
+        if (s.provider === "tmdb") {
+          return {
+            ...base,
+            tmdbId: s.tmdbId,
+            tmdbType: s.tmdbType,
+            igdbId: undefined,
+            anilistId: undefined,
+            anilistType: undefined,
+          };
+        }
 
-  const { type: currentType, status: currentStatus } = getCurrent();
+        if (s.provider === "igdb") {
+          return {
+            ...base,
+            igdbId: s.igdbId,
+            tmdbId: undefined,
+            tmdbType: undefined,
+            anilistId: undefined,
+            anilistType: undefined,
+          };
+        }
 
-  if (typeof s.progressTotal === "number" && s.progressTotal > 0) {
-    setProgressTotalText((prev) => (prev.trim() === "" ? String(s.progressTotal) : prev));
-    setProgressCurText((prev) => {
-      if (prev.trim() !== "") return prev;
-      if (currentStatus === "completed") return String(s.progressTotal);
-      return prev;
-    });
-  } else if (currentType === "movie") {
-    setProgressTotalText((prev) => (prev.trim() === "" ? "1" : prev));
-    if (currentStatus === "completed") {
-      setProgressCurText((prev) => (prev.trim() === "" ? "1" : prev));
-    }
-  }
+        return {
+          ...base,
+          anilistId: s.anilistId,
+          anilistType: s.anilistType,
+          tmdbId: undefined,
+          tmdbType: undefined,
+          igdbId: undefined,
+        };
+      });
 
-  setAutofillStatus("Auto-fill complete.");
-}, [setAutofillStatus, setForm, setAutoTags, setManualTags, setProgressTotalText, setProgressCurText]);
+      const newAuto = uniqTags([...(s.tags ?? [])]);
+      setAutoTags(newAuto);
+      if (!keepManual) setManualTags([]);
 
+      const { type: currentType, status: currentStatus } = getCurrent();
 
+      if (typeof s.progressTotal === "number" && s.progressTotal > 0) {
+        setProgressTotalText((prev) =>
+          prev.trim() === "" ? String(s.progressTotal) : prev
+        );
+        setProgressCurText((prev) => {
+          if (prev.trim() !== "") return prev;
+          if (currentStatus === "completed") return String(s.progressTotal);
+          return prev;
+        });
+      } else if (currentType === "movie") {
+        setProgressTotalText((prev) => (prev.trim() === "" ? "1" : prev));
+        if (currentStatus === "completed") {
+          setProgressCurText((prev) => (prev.trim() === "" ? "1" : prev));
+        }
+      }
+
+      setAutofillStatus("Auto-fill complete.");
+    },
+    [
+      setAutofillStatus,
+      setForm,
+      setAutoTags,
+      setManualTags,
+      setProgressTotalText,
+      setProgressCurText,
+    ]
+  );
 
   /* ================= AUTO AUTOFILL ================= */
 
@@ -2784,14 +2981,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
     const key = `${type}:${title.toLowerCase()}`;
     lastAutofillKey.current = key;
 
-
     if (autofillTimer.current) window.clearTimeout(autofillTimer.current);
 
     autofillTimer.current = window.setTimeout(async () => {
       try {
         setAutofillStatus("Searching…");
         if (lastAutofillKey.current !== key) return;
-
 
         const pushSuggestions = async (list: Suggestion[]) => {
           if (lastAutofillKey.current !== key) return;
@@ -2814,9 +3009,9 @@ async function pickForMe(mode: "best" | "random" = "best") {
           const isCompletion = !!best && bNorm.startsWith(qNorm) && qNorm.length >= 2;
           setGhostTitle(isCompletion ? best!.title : "");
 
-          // Do NOT auto-apply while typing.
-          // Only show suggestions + ghost preview. User must select (Enter/click) or Tab-accept.
-          setAutofillStatus(best ? `Suggestions ready (${Math.round(bestScore * 100)}% match).` : "No match found.");
+          setAutofillStatus(
+            best ? `Suggestions ready (${Math.round(bestScore * 100)}% match).` : "No match found."
+          );
         };
 
         if (type === "movie" || type === "tv") {
@@ -2835,7 +3030,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
           const list: Suggestion[] = results.map((r) => {
             const t = (r.title || r.name || "").trim();
 
-            // ✅ ADD THIS
             const posterUrl = (r as any).poster_path
               ? `https://image.tmdb.org/t/p/w185${(r as any).poster_path}`
               : undefined;
@@ -2852,7 +3046,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
                   : r.first_air_date
                   ? r.first_air_date.slice(0, 4)
                   : "",
-              posterUrl, // ✅ THIS IS THE FIX
+              posterUrl,
               tmdbId: r.id,
               tmdbType,
             };
@@ -2862,9 +3056,11 @@ async function pickForMe(mode: "best" | "random" = "best") {
           return;
         }
 
-
         if (type === "game") {
-          const res = await fetch(`/api/igdb/search?q=${encodeURIComponent(title)}&limit=7`, { method: "GET" });
+          const res = await fetch(
+            `/api/igdb/search?q=${encodeURIComponent(title)}&limit=7`,
+            { method: "GET" }
+          );
           const json = (await res.json()) as IgdbSearchResponse;
 
           if (!res.ok) {
@@ -2899,9 +3095,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
         if (type === "anime" || type === "manga") {
           const anilistType = type === "manga" ? "MANGA" : "ANIME";
-          const res = await fetch(`/api/anilist/search?q=${encodeURIComponent(title)}&limit=7&type=${anilistType}`, {
-            method: "GET",
-          });
+          const res = await fetch(
+            `/api/anilist/search?q=${encodeURIComponent(title)}&limit=7&type=${anilistType}`,
+            {
+              method: "GET",
+            }
+          );
           const json = (await res.json()) as AnilistSearchResponse;
 
           if (!res.ok) {
@@ -2954,15 +3153,25 @@ async function pickForMe(mode: "best" | "random" = "best") {
         setGhostTitle("");
         setAutofillStatus(`Loading details for: ${s.title}…`);
 
-        if (s.provider === "tmdb" && s.tmdbId && (s.tmdbType === "movie" || s.tmdbType === "tv")) {
+        if (
+          s.provider === "tmdb" &&
+          s.tmdbId &&
+          (s.tmdbType === "movie" || s.tmdbType === "tv")
+        ) {
           const d = await tmdbDetails(s.tmdbId, s.tmdbType);
 
-          const posterUrl = d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : undefined;
+          const posterUrl = d.poster_path
+            ? `https://image.tmdb.org/t/p/w500${d.poster_path}`
+            : undefined;
           const tags = (d.genres ?? []).map((g) => g.name);
 
           let progressTotal: number | undefined;
           if (s.tmdbType === "movie") progressTotal = 1;
-          if (s.tmdbType === "tv" && typeof d.number_of_episodes === "number" && d.number_of_episodes > 0) {
+          if (
+            s.tmdbType === "tv" &&
+            typeof d.number_of_episodes === "number" &&
+            d.number_of_episodes > 0
+          ) {
             progressTotal = d.number_of_episodes;
           }
 
@@ -2979,15 +3188,26 @@ async function pickForMe(mode: "best" | "random" = "best") {
           return;
         }
 
-        if (s.provider === "anilist" && s.anilistId && (s.anilistType === "ANIME" || s.anilistType === "MANGA")) {
+        if (
+          s.provider === "anilist" &&
+          s.anilistId &&
+          (s.anilistType === "ANIME" || s.anilistType === "MANGA")
+        ) {
           const d = await anilistDetails(s.anilistId, s.anilistType);
           const tags = d.genres?.length ? d.genres : s.tags;
 
           let progressTotal: number | undefined;
-          if (s.anilistType === "ANIME" && typeof d.episodes === "number" && d.episodes > 0) progressTotal = d.episodes;
+          if (
+            s.anilistType === "ANIME" &&
+            typeof d.episodes === "number" &&
+            d.episodes > 0
+          )
+            progressTotal = d.episodes;
           if (s.anilistType === "MANGA") {
-            if (typeof d.chapters === "number" && d.chapters > 0) progressTotal = d.chapters;
-            else if (typeof d.volumes === "number" && d.volumes > 0) progressTotal = d.volumes;
+            if (typeof d.chapters === "number" && d.chapters > 0)
+              progressTotal = d.chapters;
+            else if (typeof d.volumes === "number" && d.volumes > 0)
+              progressTotal = d.volumes;
           }
 
           await applySuggestion(
@@ -3032,7 +3252,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
     let lastHover = 0;
 
     const isInteractive = (target: EventTarget | null) =>
-      target instanceof Element && !!target.closest('button,a,[role="button"],select,input,textarea');
+      target instanceof Element &&
+      !!target.closest('button,a,[role="button"],select,input,textarea');
 
     const onMouseOver = (e: MouseEvent) => {
       if (!isInteractive(e.target)) return;
@@ -3084,7 +3305,10 @@ async function pickForMe(mode: "best" | "random" = "best") {
       setDiscoverStatus("Finding titles…");
       setDiscoverResults([]);
 
-      const genreIds = discoverGenreId === "all" ? [] : [Number(discoverGenreId)].filter((n) => Number.isFinite(n));
+      const genreIds =
+        discoverGenreId === "all"
+          ? []
+          : [Number(discoverGenreId)].filter((n) => Number.isFinite(n));
       const results = await tmdbDiscoverByGenres(discoverType, genreIds);
       const genreNameById = new Map(discoverGenres.map((g) => [g.id, g.name]));
 
@@ -3094,10 +3318,16 @@ async function pickForMe(mode: "best" | "random" = "best") {
           id: r.id,
           title,
           type: discoverType,
-          posterUrl: r.poster_path ? `https://image.tmdb.org/t/p/w500${r.poster_path}` : undefined,
-          year: (discoverType === "movie" ? r.release_date : r.first_air_date)?.slice(0, 4) || undefined,
+          posterUrl: r.poster_path
+            ? `https://image.tmdb.org/t/p/w500${r.poster_path}`
+            : undefined,
+          year:
+            (discoverType === "movie" ? r.release_date : r.first_air_date)?.slice(0, 4) ||
+            undefined,
           overview: r.overview,
-          tags: (r.genre_ids ?? []).map((id) => genreNameById.get(id)).filter((x): x is string => !!x),
+          tags: (r.genre_ids ?? [])
+            .map((id) => genreNameById.get(id))
+            .filter((x): x is string => !!x),
         } satisfies DiscoverCard;
       });
 
@@ -3131,22 +3361,25 @@ async function pickForMe(mode: "best" | "random" = "best") {
     setDiscoverStatus(`Added ${card.title} to Planned.`);
   }, []);
 
-  const submitFeedback = useCallback((e: React.SyntheticEvent) => {
-    e.preventDefault();
-    const message = feedbackText.trim();
-    if (!message) return;
+  const submitFeedback = useCallback(
+    (e: React.SyntheticEvent) => {
+      e.preventDefault();
+      const message = feedbackText.trim();
+      if (!message) return;
 
-    const entry: FeedbackEntry = {
-      id: uid(),
-      type: feedbackType,
-      message,
-      createdAt: new Date().toISOString(),
-      status: "new",
-    };
+      const entry: FeedbackEntry = {
+        id: uid(),
+        type: feedbackType,
+        message,
+        createdAt: new Date().toISOString(),
+        status: "new",
+      };
 
-    setFeedbackEntries((prev) => [entry, ...prev]);
-    setFeedbackText("");
-  }, [feedbackText, feedbackType]);
+      setFeedbackEntries((prev) => [entry, ...prev]);
+      setFeedbackText("");
+    },
+    [feedbackText, feedbackType]
+  );
 
   const loadAdminFeedback = useCallback(async () => {
     if (!userId || !STACK_ADMIN_USER_IDS.includes(userId)) return;
@@ -3154,9 +3387,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
     try {
       setAdminFeedbackStatus("Loading all feedback…");
 
-      const { data, error } = await supabase
-        .from("media_items")
-        .select("user_id,data");
+      const { data, error } = await supabase.from("media_items").select("user_id,data");
 
       if (error) {
         console.error(error);
@@ -3168,7 +3399,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
       for (const row of (data ?? []) as Array<{ user_id: string; data: any }>) {
         const rowSettings = normalizeSettings(row?.data?.settings);
-        const userLabel = rowSettings.displayName?.trim() || rowSettings.usernameTag?.trim() || row.user_id;
+        const userLabel =
+          rowSettings.displayName?.trim() || rowSettings.usernameTag?.trim() || row.user_id;
         const entries = parseFeedbackEntries(row?.data?.feedback);
 
         for (const entry of entries) {
@@ -3180,26 +3412,100 @@ async function pickForMe(mode: "best" | "random" = "best") {
         }
       }
 
-      rows.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      rows.sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
       setAdminFeedbackRows(rows);
-      setAdminFeedbackStatus(rows.length ? `Loaded ${rows.length} feedback item${rows.length === 1 ? "" : "s"}.` : "No feedback submitted yet.");
+      setAdminFeedbackStatus(
+        rows.length
+          ? `Loaded ${rows.length} feedback item${rows.length === 1 ? "" : "s"}.`
+          : "No feedback submitted yet."
+      );
     } catch {
       setAdminFeedbackStatus("Admin feedback is unavailable right now.");
     }
   }, [userId]);
 
+  const loadAdminOverview = useCallback(async () => {
+    if (!userId || !STACK_ADMIN_USER_IDS.includes(userId)) return;
+
+    try {
+      setAdminOverviewStatus("Loading member monitoring data…");
+      const { data } = await supabase.auth.getSession();
+      const accessToken = data.session?.access_token;
+
+      if (!accessToken) {
+        setAdminOverviewStatus("Your session expired. Log in again to open the owner dashboard.");
+        return;
+      }
+
+      const response = await fetch("/api/admin/overview", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${accessToken}` },
+        cache: "no-store",
+      });
+
+      const json = (await response.json()) as AdminOverviewResponse & { error?: string };
+      if (!response.ok) throw new Error(json.error || "Could not load owner dashboard.");
+
+      setAdminOverview(json);
+      setAdminOverviewStatus(`Updated ${new Date(json.generatedAt).toLocaleTimeString()}.`);
+      setSelectedAdminMemberId((current) =>
+        current && json.members.some((member) => member.id === current)
+          ? current
+          : json.members[0]?.id ?? null
+      );
+    } catch (error) {
+      console.error(error);
+      setAdminOverviewStatus(
+        error instanceof Error ? error.message : "Could not load owner dashboard."
+      );
+    }
+  }, [userId]);
+
+  const filteredAdminMembers = useMemo(() => {
+    const q = adminMemberQuery.trim().toLowerCase();
+    const members = adminOverview?.members ?? [];
+    if (!q) return members;
+
+    return members.filter((member) => {
+      const normalized = normalizeSettings(member.settings);
+      return [
+        normalized.displayName,
+        normalized.usernameTag,
+        member.profileDisplayName,
+        member.username,
+        member.email,
+        member.id,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(q);
+    });
+  }, [adminOverview, adminMemberQuery]);
+
+  const selectedAdminMember = useMemo(() => {
+    if (!selectedAdminMemberId) return null;
+    return (adminOverview?.members ?? []).find((member) => member.id === selectedAdminMemberId) ?? null;
+  }, [adminOverview, selectedAdminMemberId]);
 
   const filteredAdminFeedbackRows = useMemo(() => {
     return adminFeedbackRows.filter((entry) => {
       if (adminHideDone && entry.status === "done") return false;
       if (adminFeedbackFilter === "all") return true;
-      if (adminFeedbackFilter === "suggestion" || adminFeedbackFilter === "problem") return entry.type === adminFeedbackFilter;
+      if (adminFeedbackFilter === "suggestion" || adminFeedbackFilter === "problem")
+        return entry.type === adminFeedbackFilter;
       return (entry.status ?? "new") === adminFeedbackFilter;
     });
   }, [adminFeedbackRows, adminFeedbackFilter, adminHideDone]);
 
   const updateAdminFeedbackStatus = useCallback(
-    async (targetUserId: string, feedbackId: string, nextStatus: "new" | "reviewed" | "done") => {
+    async (
+      targetUserId: string,
+      feedbackId: string,
+      nextStatus: "new" | "reviewed" | "done"
+    ) => {
       if (!userId || !STACK_ADMIN_USER_IDS.includes(userId)) return;
 
       try {
@@ -3212,23 +3518,27 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
         if (error) throw error;
 
-        const raw = data?.data && typeof data.data === "object" ? (data.data as Record<string, any>) : {};
+        const raw =
+          data?.data && typeof data.data === "object"
+            ? (data.data as Record<string, any>)
+            : {};
         const feedback = parseFeedbackEntries(raw.feedback).map((entry) =>
           entry.id === feedbackId ? { ...entry, status: nextStatus } : entry
         );
 
         const { error: updateError } = await supabase
           .from("media_items")
-          .upsert(
-            [{ user_id: targetUserId, data: { ...raw, feedback } }],
-            { onConflict: "user_id" }
-          );
+          .upsert([{ user_id: targetUserId, data: { ...raw, feedback } }], {
+            onConflict: "user_id",
+          });
 
         if (updateError) throw updateError;
 
         setAdminFeedbackRows((prev) =>
           prev.map((entry) =>
-            entry.userId === targetUserId && entry.id === feedbackId ? { ...entry, status: nextStatus } : entry
+            entry.userId === targetUserId && entry.id === feedbackId
+              ? { ...entry, status: nextStatus }
+              : entry
           )
         );
         setAdminFeedbackStatus("Feedback updated.");
@@ -3243,6 +3553,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
   useEffect(() => {
     if (view === "feedback" && isAdminUser) loadAdminFeedback();
   }, [view, isAdminUser, loadAdminFeedback]);
+
+  useEffect(() => {
+    if (view === "settings" && settingsTab === "admin" && isAdminUser && !adminOverview) {
+      void loadAdminOverview();
+    }
+  }, [view, settingsTab, isAdminUser, adminOverview, loadAdminOverview]);
 
   const loadFriendActivity = useCallback(async () => {
     if (!friendsList.length) {
@@ -3272,6 +3588,35 @@ async function pickForMe(mode: "best" | "random" = "best") {
     }
   }, [friendsList]);
 
+  const refreshFriendsPage = useCallback(async () => {
+    if (!userId || friendsRefreshing) return;
+
+    try {
+      setFriendsRefreshing(true);
+
+      await Promise.all([
+        loadIncomingFriendRequests(userId),
+        loadOutgoingFriendRequests(userId),
+        loadFriends(userId),
+      ]);
+
+      await loadFriendActivity();
+      setFriendStatus("Friends are up to date.");
+    } catch (e) {
+      console.error(e);
+      setFriendStatus("Could not refresh friends right now.");
+    } finally {
+      setFriendsRefreshing(false);
+    }
+  }, [
+    userId,
+    friendsRefreshing,
+    loadIncomingFriendRequests,
+    loadOutgoingFriendRequests,
+    loadFriends,
+    loadFriendActivity,
+  ]);
+
   useEffect(() => {
     if (view === "feed" || view === "friends") loadFriendActivity();
   }, [view, loadFriendActivity]);
@@ -3296,7 +3641,9 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
     for (const row of friendActivityRows) {
       const actorName = friendsNameById.get(row.user_id) ?? row.user_id;
-      const friendItems = Array.isArray(row?.data?.items) ? (row.data.items as MediaItem[]) : [];
+      const friendItems = Array.isArray(row?.data?.items)
+        ? (row.data.items as MediaItem[])
+        : [];
 
       for (const i of friendItems) {
         if (i.isPrivate) continue;
@@ -3317,20 +3664,61 @@ async function pickForMe(mode: "best" | "random" = "best") {
       .filter((e) => e.date)
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
       .slice(0, 50);
-  }, [items, userId, settings.displayName, settings.usernameTag, friendActivityRows, friendsNameById]);
+  }, [
+    items,
+    userId,
+    settings.displayName,
+    settings.usernameTag,
+    friendActivityRows,
+    friendsNameById,
+  ]);
+
+  const friendOnlyActivity = useMemo(() => {
+    const entries: ActivityEntry[] = [];
+
+    for (const row of friendActivityRows) {
+      const actorName = friendsNameById.get(row.user_id) ?? row.user_id;
+      const friendItems = Array.isArray(row?.data?.items)
+        ? (row.data.items as MediaItem[])
+        : [];
+
+      for (const item of friendItems) {
+        if (!item || item.isPrivate) continue;
+        entries.push({
+          id: `friend-only:${row.user_id}:${item.id}`,
+          actorId: row.user_id,
+          actorName,
+          itemTitle: item.title,
+          itemType: item.type,
+          status: item.status,
+          date: item.updatedAt ?? item.createdAt,
+          favorite: item.favorite,
+        });
+      }
+    }
+
+    return entries
+      .filter((entry) => entry.date)
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+      .slice(0, 40);
+  }, [friendActivityRows, friendsNameById]);
 
   const friendLibraryItems = useMemo(() => {
     const rows: Array<MediaItem & { __ownerId: string; __ownerName: string }> = [];
 
     for (const row of friendActivityRows) {
-      if (friendLibraryFriendId !== "all" && row.user_id !== friendLibraryFriendId) continue;
+      if (friendLibraryFriendId !== "all" && row.user_id !== friendLibraryFriendId)
+        continue;
 
       const ownerName = friendsNameById.get(row.user_id) ?? row.user_id;
-      const friendItems = Array.isArray(row?.data?.items) ? (row.data.items as MediaItem[]) : [];
+      const friendItems = Array.isArray(row?.data?.items)
+        ? (row.data.items as MediaItem[])
+        : [];
 
       for (const item of friendItems) {
         if (!item || item.isPrivate) continue;
-        if (friendLibraryStatus !== "all" && item.status !== friendLibraryStatus) continue;
+        if (friendLibraryStatus !== "all" && item.status !== friendLibraryStatus)
+          continue;
 
         rows.push({
           ...item,
@@ -3341,7 +3729,13 @@ async function pickForMe(mode: "best" | "random" = "best") {
     }
 
     return sortMediaItems(rows, friendLibrarySortMode);
-  }, [friendActivityRows, friendLibraryFriendId, friendLibraryStatus, friendLibrarySortMode, friendsNameById]);
+  }, [
+    friendActivityRows,
+    friendLibraryFriendId,
+    friendLibraryStatus,
+    friendLibrarySortMode,
+    friendsNameById,
+  ]);
 
   const selectedFriendProfile = useMemo(() => {
     if (!selectedFriendProfileId) return null;
@@ -3349,7 +3743,9 @@ async function pickForMe(mode: "best" | "random" = "best") {
     const friend = friendsList.find((f) => f.friend_id === selectedFriendProfileId);
     if (!friend) return null;
 
-    const activityRow = friendActivityRows.find((row) => row.user_id === selectedFriendProfileId);
+    const activityRow = friendActivityRows.find(
+      (row) => row.user_id === selectedFriendProfileId
+    );
     const profileSettings = normalizeSettings(activityRow?.data?.settings);
     const display = getFriendDisplay(friend.friend_id, friend.friend);
     const visibleItems = Array.isArray(activityRow?.data?.items)
@@ -3370,7 +3766,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
     let out = selectedFriendProfile.items.slice();
 
-    if (friendProfileView !== "all") out = out.filter((item) => item.status === friendProfileView);
+    if (friendProfileView !== "all")
+      out = out.filter((item) => item.status === friendProfileView);
 
     const q = friendProfileQuery.trim().toLowerCase();
     if (q) {
@@ -3388,7 +3785,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
   }, [selectedFriendProfile, friendProfileView, friendProfileQuery, friendProfileSortMode]);
 
   const friendProfileByStatus = useMemo(() => {
-    const map: Record<Status, MediaItem[]> = { completed: [], in_progress: [], planned: [], dropped: [] };
+    const map: Record<Status, MediaItem[]> = {
+      completed: [],
+      in_progress: [],
+      planned: [],
+      dropped: [],
+    };
     for (const item of friendProfileFilteredItems) map[item.status].push(item);
     return map;
   }, [friendProfileFilteredItems]);
@@ -3397,7 +3799,25 @@ async function pickForMe(mode: "best" | "random" = "best") {
     return computeVisibleProfileStats(selectedFriendProfile?.items ?? []);
   }, [selectedFriendProfile]);
 
-  const ownFriendPreviewItems = useMemo(() => items.filter((item) => item && !item.isPrivate), [items]);
+  const selectedFriendActiveItems = useMemo(() => {
+    if (!selectedFriendProfile) return [];
+
+    return sortMediaItems(
+      selectedFriendProfile.items.filter((item) => item.status === "in_progress"),
+      "updated"
+    ).slice(0, 4);
+  }, [selectedFriendProfile]);
+
+  const selectedFriendRecentItems = useMemo(() => {
+    if (!selectedFriendProfile) return [];
+
+    return sortMediaItems(selectedFriendProfile.items, "updated").slice(0, 4);
+  }, [selectedFriendProfile]);
+
+  const ownFriendPreviewItems = useMemo(
+    () => items.filter((item) => item && !item.isPrivate),
+    [items]
+  );
   const ownFriendPreviewStats = useMemo(
     () => computeVisibleProfileStats(ownFriendPreviewItems),
     [ownFriendPreviewItems]
@@ -3406,20 +3826,43 @@ async function pickForMe(mode: "best" | "random" = "best") {
   const selectedFriendComparison = useMemo(() => {
     const friendItems = selectedFriendProfile?.items ?? [];
     const friendCompletedTitles = new Set(
-      friendItems.filter((item) => item.status === "completed").map((item) => normTitle(item.title)).filter(Boolean)
+      friendItems
+        .filter((item) => item.status === "completed")
+        .map((item) => normTitle(item.title))
+        .filter(Boolean)
     );
     const friendPlannedTitles = new Set(
-      friendItems.filter((item) => item.status === "planned").map((item) => normTitle(item.title)).filter(Boolean)
+      friendItems
+        .filter((item) => item.status === "planned")
+        .map((item) => normTitle(item.title))
+        .filter(Boolean)
     );
     const friendInProgressTitles = new Set(
-      friendItems.filter((item) => item.status === "in_progress").map((item) => normTitle(item.title)).filter(Boolean)
+      friendItems
+        .filter((item) => item.status === "in_progress")
+        .map((item) => normTitle(item.title))
+        .filter(Boolean)
     );
 
-    const bothCompleted = items.filter((item) => item.status === "completed" && friendCompletedTitles.has(normTitle(item.title))).length;
-    const bothPlanned = items.filter((item) => item.status === "planned" && friendPlannedTitles.has(normTitle(item.title))).length;
-    const bothInProgress = items.filter((item) => item.status === "in_progress" && friendInProgressTitles.has(normTitle(item.title))).length;
+    const bothCompleted = items.filter(
+      (item) =>
+        item.status === "completed" && friendCompletedTitles.has(normTitle(item.title))
+    ).length;
+    const bothPlanned = items.filter(
+      (item) => item.status === "planned" && friendPlannedTitles.has(normTitle(item.title))
+    ).length;
+    const bothInProgress = items.filter(
+      (item) =>
+        item.status === "in_progress" &&
+        friendInProgressTitles.has(normTitle(item.title))
+    ).length;
 
-    const myTags = new Set(items.flatMap((item) => item.tags ?? []).map(normTag).filter(Boolean));
+    const myTags = new Set(
+      items
+        .flatMap((item) => item.tags ?? [])
+        .map(normTag)
+        .filter(Boolean)
+    );
     const sharedTagCounts = new Map<string, number>();
     for (const item of friendItems) {
       for (const tag of item.tags ?? []) {
@@ -3435,8 +3878,11 @@ async function pickForMe(mode: "best" | "random" = "best") {
       .map(([tag]) => tag);
 
     const typeCounts = new Map<MediaType, number>();
-    for (const item of friendItems) typeCounts.set(item.type, (typeCounts.get(item.type) ?? 0) + 1);
-    const friendTopType = Array.from(typeCounts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0];
+    for (const item of friendItems)
+      typeCounts.set(item.type, (typeCounts.get(item.type) ?? 0) + 1);
+    const friendTopType = Array.from(typeCounts.entries()).sort(
+      (a, b) => b[1] - a[1]
+    )[0]?.[0];
 
     return {
       bothCompleted,
@@ -3448,6 +3894,7 @@ async function pickForMe(mode: "best" | "random" = "best") {
   }, [items, selectedFriendProfile]);
 
   /* ================= FILTER ================= */
+
   const filteredFriendsList = useMemo(() => {
     const q = friendsQuery.trim().toLowerCase();
 
@@ -3499,6 +3946,31 @@ async function pickForMe(mode: "best" | "random" = "best") {
     });
   }, [incomingRequests, friendsQuery, getFriendDisplay]);
 
+  const filteredOutgoingRequests = useMemo(() => {
+    const q = friendsQuery.trim().toLowerCase();
+
+    if (!q) return outgoingRequests;
+
+    return outgoingRequests.filter((r) => {
+      const display = getFriendDisplay(r.requested_id, r.requested);
+
+      const searchable = [
+        display.primary,
+        display.secondary,
+        display.baseName,
+        display.idTag,
+        r.requested?.username,
+        r.requested?.display_name,
+        r.requested_id,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      return searchable.includes(q);
+    });
+  }, [outgoingRequests, friendsQuery, getFriendDisplay]);
+
   const tagFilterOptions = useMemo(() => {
     const tagSet = new Set<string>();
     for (const item of items) {
@@ -3528,12 +4000,20 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
     if (tagFilter !== "all") {
       const selectedTag = tagFilter.toLowerCase();
-      out = out.filter((i) => (i.tags ?? []).some((tag) => String(tag || "").toLowerCase() === selectedTag));
+      out = out.filter((i) =>
+        (i.tags ?? []).some(
+          (tag) => String(tag || "").toLowerCase() === selectedTag
+        )
+      );
     }
 
     if (query) {
       const q = query.toLowerCase();
-      out = out.filter((i) => [i.title, i.notes, i.tags.join(" ")].some((v) => String(v || "").toLowerCase().includes(q)));
+      out = out.filter((i) =>
+        [i.title, i.notes, i.tags.join(" ")].some((v) =>
+          String(v || "").toLowerCase().includes(q)
+        )
+      );
     }
 
     return sortMediaItems(out, sortMode);
@@ -3552,31 +4032,33 @@ async function pickForMe(mode: "best" | "random" = "best") {
     return Array.from(map.entries()).sort((a, b) => (a[0] < b[0] ? 1 : -1));
   }, [filtered, groupMode]);
 
-    const byStatusFiltered = useMemo(() => {
-      const map: Record<Status, MediaItem[]> = { completed: [], in_progress: [], planned: [], dropped: [] };
-      for (const i of filtered) map[i.status].push(i);
-      return map;
-    }, [filtered]);
-
+  const byStatusFiltered = useMemo(() => {
+    const map: Record<Status, MediaItem[]> = {
+      completed: [],
+      in_progress: [],
+      planned: [],
+      dropped: [],
+    };
+    for (const i of filtered) map[i.status].push(i);
+    return map;
+  }, [filtered]);
 
   /* ================= STATS ================= */
-  // ✅ Month options for stats filter
+
   const statsMonthOptions = useMemo(() => {
-    // build from all items using: dateFinished if set, else createdAt
     const months = new Set<string>();
     for (const i of items) {
       const key = (i.dateFinished ?? i.createdAt ?? "").slice(0, 7);
       if (key) months.add(key);
     }
 
-    const sorted = Array.from(months).sort((a, b) => (a < b ? 1 : -1)); // desc YYYY-MM
+    const sorted = Array.from(months).sort((a, b) => (a < b ? 1 : -1));
     return [
       { value: "all", label: "All time" },
-      ...sorted.map((m) => ({ value: m, label: m })), // label "YYYY-MM" (simple + clean)
+      ...sorted.map((m) => ({ value: m, label: m })),
     ];
   }, [items]);
 
-  // ✅ Stats-filtered view of items
   const statsItems = useMemo(() => {
     if (statsMonth === "all") return items;
 
@@ -3587,11 +4069,15 @@ async function pickForMe(mode: "best" | "random" = "best") {
   }, [items, statsMonth]);
 
   const statusCounts = useMemo(() => {
-    const base: Record<Status, number> = { completed: 0, in_progress: 0, planned: 0, dropped: 0 };
+    const base: Record<Status, number> = {
+      completed: 0,
+      in_progress: 0,
+      planned: 0,
+      dropped: 0,
+    };
     for (const i of statsItems) base[i.status] += 1;
     return base;
   }, [statsItems]);
-
 
   const typeCounts = useMemo(() => {
     const map = new Map<MediaType, number>();
@@ -3600,7 +4086,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
       .map(([type, count]) => ({ type, count }))
       .sort((a, b) => b.count - a.count);
   }, [statsItems]);
-
 
   const avgByType = useMemo(() => {
     const map = new Map<MediaType, { sum: number; count: number }>();
@@ -3612,10 +4097,13 @@ async function pickForMe(mode: "best" | "random" = "best") {
       map.set(i.type, cur);
     }
     return Array.from(map.entries())
-      .map(([type, v]) => ({ type, avg: v.count ? v.sum / v.count : 0, count: v.count }))
+      .map(([type, v]) => ({
+        type,
+        avg: v.count ? v.sum / v.count : 0,
+        count: v.count,
+      }))
       .sort((a, b) => b.avg - a.avg);
   }, [statsItems]);
-
 
   const totalCompleted = useMemo(() => {
     return statsItems.filter((i) => {
@@ -3623,7 +4111,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
       return i.status === "completed";
     }).length;
   }, [statsItems, excludeTypes]);
-
 
   const totalRuntimeMinutesCompleted = useMemo(() => {
     let sum = 0;
@@ -3639,12 +4126,18 @@ async function pickForMe(mode: "best" | "random" = "best") {
       }
 
       if (i.type === "movie") {
-        if (typeof i.runtime === "number" && Number.isFinite(i.runtime) && i.runtime > 0) sum += i.runtime;
+        if (
+          typeof i.runtime === "number" &&
+          Number.isFinite(i.runtime) &&
+          i.runtime > 0
+        )
+          sum += i.runtime;
         continue;
       }
 
       if (i.type === "tv" || i.type === "anime") {
-        const perEp = typeof i.runtime === "number" && i.runtime > 0 ? i.runtime : 0;
+        const perEp =
+          typeof i.runtime === "number" && i.runtime > 0 ? i.runtime : 0;
 
         const cur =
           typeof i.progressCurOverride === "number"
@@ -3660,7 +4153,8 @@ async function pickForMe(mode: "best" | "random" = "best") {
             ? i.progressTotal
             : undefined;
 
-        const episodes = typeof cur === "number" ? cur : typeof total === "number" ? total : 0;
+        const episodes =
+          typeof cur === "number" ? cur : typeof total === "number" ? total : 0;
 
         if (perEp > 0 && episodes > 0) sum += perEp * episodes;
         continue;
@@ -3669,7 +4163,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
     return Math.round(sum);
   }, [statsItems, excludeTypes]);
-
 
   const rewatchTotals = useMemo(() => {
     let rewatches = 0;
@@ -3683,7 +4176,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
     }
     return { itemsRewatched, rewatches };
   }, [statsItems]);
-
 
   const topTags = useMemo(() => {
     const map = new Map<string, number>();
@@ -3721,7 +4213,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
       .slice(0, 8);
   }, [statsItems, excludeTypes]);
 
-
   const monthlyCompleted = useMemo(() => {
     const now = new Date();
     const months: Array<{ key: string; label: string; count: number }> = [];
@@ -3752,7 +4243,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
     return { months, max };
   }, [items, excludeTypes]);
 
-  // ✅ Fun stats
   const bestMonth = useMemo(() => {
     const best = monthlyCompleted.months.reduce(
       (acc, m) => (m.count > acc.count ? m : acc),
@@ -3772,11 +4262,12 @@ async function pickForMe(mode: "best" | "random" = "best") {
       if (day) daysSet.add(day);
     }
 
-    const days = Array.from(daysSet).sort(); // ascending YYYY-MM-DD
+    const days = Array.from(daysSet).sort();
     if (!days.length) return { longest: 0, current: 0 };
 
     const toDate = (s: string) => new Date(s + "T00:00:00");
-    const diffDays = (a: Date, b: Date) => Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24));
+    const diffDays = (a: Date, b: Date) =>
+      Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24));
 
     let longest = 1;
     let run = 1;
@@ -3807,12 +4298,16 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
   const gameHoursStats = useMemo(() => {
     const games = items.filter((i) => i.type === "game" && !excludeTypes.has(i.type));
-    const withHours = games.filter((g) => typeof g.hoursPlayed === "number" && (g.hoursPlayed ?? 0) > 0);
+    const withHours = games.filter(
+      (g) => typeof g.hoursPlayed === "number" && (g.hoursPlayed ?? 0) > 0
+    );
 
     const totalHours = withHours.reduce((a, b) => a + (b.hoursPlayed ?? 0), 0);
     const avgHours = withHours.length ? totalHours / withHours.length : 0;
 
-    const top = withHours.slice().sort((a, b) => (b.hoursPlayed ?? 0) - (a.hoursPlayed ?? 0))[0];
+    const top = withHours
+      .slice()
+      .sort((a, b) => (b.hoursPlayed ?? 0) - (a.hoursPlayed ?? 0))[0];
 
     return {
       totalHours,
@@ -3826,9 +4321,14 @@ async function pickForMe(mode: "best" | "random" = "best") {
     const best = items
       .filter((i) => (Number(i.rewatchCount ?? 0) || 0) > 0)
       .slice()
-      .sort((a, b) => (Number(b.rewatchCount ?? 0) || 0) - (Number(a.rewatchCount ?? 0) || 0))[0];
+      .sort(
+        (a, b) =>
+          (Number(b.rewatchCount ?? 0) || 0) - (Number(a.rewatchCount ?? 0) || 0)
+      )[0];
 
-    return best ? { title: best.title, count: Number(best.rewatchCount ?? 0) || 0 } : { title: "—", count: 0 };
+    return best
+      ? { title: best.title, count: Number(best.rewatchCount ?? 0) || 0 }
+      : { title: "—", count: 0 };
   }, [items]);
 
   const yearGenreCompare = useMemo(() => {
@@ -3865,7 +4365,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
     return { thisYearTop, lastYearTop, year: y };
   }, [items, excludeTypes]);
 
-
   const clearStackFilters = useCallback(() => {
     setQuery("");
     setTagFilter("all");
@@ -3879,7 +4378,6 @@ async function pickForMe(mode: "best" | "random" = "best") {
     try {
       setSaveStatus("Logging out…");
 
-      // Preserve the latest signed-in library backup before ending the session.
       if (items.length > 0) saveLocalBackup(items, userId);
 
       const { error } = await supabase.auth.signOut();
@@ -3915,1279 +4413,2936 @@ async function pickForMe(mode: "best" | "random" = "best") {
 
   const isWideBoard = view === "all" && boardView;
 
-  const currentTheme = STACK_COLOR_THEMES[settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme];
-  const themeStyle = STACK_COLOR_THEME_CSS_VARS[settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme] as React.CSSProperties;
-
-  useLayoutEffect(() => {
-    applyStackThemeToDocument(settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme);
-  }, [settings.colorTheme]);
+  const libraryStyle = settings.libraryStyle ?? DEFAULT_SETTINGS.libraryStyle;
+  const posterSize = settings.posterSize ?? DEFAULT_SETTINGS.posterSize;
+  const surfaceStyle = settings.surfaceStyle ?? DEFAULT_SETTINGS.surfaceStyle;
+  const cornerStyle = settings.cornerStyle ?? DEFAULT_SETTINGS.cornerStyle;
+  const backgroundImageUrl = String(settings.backgroundImageUrl ?? "").trim();
+  const bannerImageUrl = String(settings.bannerImageUrl ?? "").trim();
+  const listDisplayPrefs: ListDisplayPreferences = {
+    showRating: settings.showListRating !== false,
+    showType: settings.showListType !== false,
+    showProgress: settings.showListProgress !== false,
+    showNotes: settings.showListNotes !== false,
+    showTags: settings.showListTags !== false,
+  };
 
   return (
     <>
-    <script suppressHydrationWarning dangerouslySetInnerHTML={{ __html: STACK_THEME_BOOT_SCRIPT }} />
-    <div className={["min-h-screen stack-bg", settings.compactMode ? "stack-compact" : ""].filter(Boolean).join(" ")}>
-      <style>{`
-        :root {
-          --stack-theme-bg: ${STACK_COLOR_THEMES.midnight.bg};
-          --stack-theme-fg: ${STACK_COLOR_THEMES.midnight.fg};
-          --stack-theme-surface: ${STACK_COLOR_THEMES.midnight.surface};
-          --stack-theme-accent: ${STACK_COLOR_THEMES.midnight.accent};
-          --stack-theme-good: ${STACK_COLOR_THEMES.midnight.good};
-          --stack-theme-good-border: ${STACK_COLOR_THEMES.midnight.goodBorder};
-          --stack-theme-bad: ${STACK_COLOR_THEMES.midnight.bad};
-          --stack-theme-bad-border: ${STACK_COLOR_THEMES.midnight.badBorder};
-          --stack-theme-focus: ${STACK_COLOR_THEMES.midnight.focus};
-          --stack-theme-ring: ${STACK_COLOR_THEMES.midnight.ring};
-        }
-
-        .stack-bg {
-          background: var(--stack-theme-bg) !important;
-          color: var(--stack-theme-fg) !important;
-        }
-
-        .stack-surface {
-          background: var(--stack-theme-surface) !important;
-          box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28), 0 0 0 1px var(--stack-theme-ring) inset;
-        }
-
-        .stack-accent {
-          background: var(--stack-theme-accent) !important;
-        }
-
-        .stack-good {
-          background: var(--stack-theme-good) !important;
-          border-color: var(--stack-theme-good-border) !important;
-        }
-
-        .stack-bad {
-          background: var(--stack-theme-bad) !important;
-          border-color: var(--stack-theme-bad-border) !important;
-        }
-
-        .stack-bg input:focus,
-        .stack-bg textarea:focus,
-        .stack-bg select:focus {
-          border-color: var(--stack-theme-focus) !important;
-          box-shadow: 0 0 0 1px color-mix(in srgb, var(--stack-theme-focus) 42%, transparent);
-        }
-
-
-        .stack-compact .p-5 { padding: 0.85rem !important; }
-        .stack-compact .p-4 { padding: 0.75rem !important; }
-        .stack-compact .p-3 { padding: 0.6rem !important; }
-        .stack-compact .space-y-6 > :not([hidden]) ~ :not([hidden]) { margin-top: 1rem !important; }
-        .stack-compact .space-y-4 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.75rem !important; }
-        .stack-compact .space-y-3 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.5rem !important; }
-        .stack-compact .rounded-3xl { border-radius: 1.15rem !important; }
-        .stack-compact .rounded-2xl { border-radius: 0.9rem !important; }
-
-        @media (max-width: 639px) {
-          .stack-bg { min-height: 100dvh; }
-
-          .stack-mobile-item-card {
-            background: rgba(8, 12, 22, 0.86) !important;
-            border-color: rgba(255,255,255,0.14) !important;
-            box-shadow: 0 18px 54px rgba(0,0,0,0.28);
-          }
-
-          .stack-mobile-item-card select,
-          .stack-mobile-item-card button,
-          .stack-mobile-item-card input {
-            min-height: 40px;
-          }
-
-          .stack-mobile-item-card [title="Open details"] {
-            width: 5rem !important;
-            height: 6.5rem !important;
-          }
-
-          .stack-mobile-readable-surface {
-            background: rgba(8, 12, 22, 0.88) !important;
-            border-color: rgba(255,255,255,0.14) !important;
-          }
-
-          .stack-mobile-scroll-panel {
-            max-height: min(82dvh, 780px);
-            overflow-y: auto;
-            -webkit-overflow-scrolling: touch;
-          }
-        }
-      `}</style>
       <div
         className={[
-          isWideBoard ? "max-w-[104rem]" : "max-w-6xl",
-          "mx-auto px-3 sm:px-6 py-5 pb-28 sm:py-6 sm:pb-6 space-y-6 min-w-0 overflow-x-hidden",
-        ].join(" ")}
+          "min-h-screen stack-bg relative overflow-x-hidden",
+          settings.compactMode ? "stack-compact" : "",
+          `stack-library-${libraryStyle}`,
+          `stack-poster-${posterSize}`,
+          `stack-surface-${surfaceStyle}`,
+          `stack-corners-${cornerStyle}`,
+          settings.reduceMotion ? "stack-reduce-motion" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
       >
-        {/* Header */}
-        <header className="space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-2 text-center sm:text-left">
-            <div>
-              <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight">Stack</h1>
-              <p className="text-sm text-neutral-400">Your personal media website</p>
-            </div>
-            <div className="flex flex-col sm:items-end gap-2">
-              <div className="text-xs text-neutral-500 sm:text-right">{saveStatus}</div>
-              {userId ? (
-                <button
-                  type="button"
-                  onClick={handleLogout}
-                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-300"
-                >
-                  Log out
-                </button>
-              ) : null}
-            </div>
-          </div>
-
-          <nav className="space-y-2" aria-label="Stack navigation">
-            <div className="flex justify-center">
-              <div className="inline-flex flex-wrap justify-center gap-[clamp(0.35rem,1.5vw,0.65rem)] rounded-3xl bg-neutral-950/55 ring-1 ring-white/10 shadow-lg shadow-black/20 px-[clamp(0.45rem,1.6vw,0.8rem)] py-[clamp(0.4rem,1.2vw,0.65rem)] max-w-[96vw] backdrop-blur-xl">
-                {navMain.map((n) => (
-                  <Link
-                    key={n.href}
-                    href={n.href}
-                    className={[
-                      "px-[clamp(0.6rem,1.8vw,1rem)] py-[clamp(0.48rem,1.2vw,0.7rem)] rounded-2xl border text-[clamp(0.72rem,1.25vw,0.9rem)] transition whitespace-nowrap",
-                      view === n.key
-                        ? "bg-white/15 border-white/25 shadow-inner text-neutral-50"
-                        : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-300",
-                    ].join(" ")}
-                  >
-                    {n.label}
-                  </Link>
-                ))}
-              </div>
-            </div>
-
-            <div className="flex justify-center">
-              <div className="flex flex-wrap justify-center gap-2 max-w-[96vw]">
-                {navActions.map((n) => (
-                  <Link
-                    key={n.href}
-                    href={n.href}
-                    title={n.label}
-                    aria-label={n.label}
-                    className={[
-                      "h-[clamp(2.35rem,10vw,2.85rem)] min-w-[clamp(2.35rem,10vw,2.85rem)] px-2 grid place-items-center rounded-2xl border transition shadow-sm touch-manipulation",
-                      "bg-neutral-950/50 ring-1 ring-white/5 backdrop-blur-xl",
-                      view === n.key
-                        ? "bg-white/15 border-white/25 text-neutral-50 shadow-inner"
-                        : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-300",
-                    ].join(" ")}
-                  >
-                    {n.icon === "plus" ? (
-                      <span className="text-[clamp(1.0rem,2.4vw,1.35rem)] leading-none">+</span>
-                    ) : n.icon === "pie" ? (
-                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">◔</span>
-                    ) : n.icon === "users" ? (
-                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">👥</span>
-                    ) : n.icon === "feed" ? (
-                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">≡</span>
-                    ) : n.icon === "discover" ? (
-                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">⌕</span>
-                    ) : n.icon === "feedback" ? (
-                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">!</span>
-                    ) : (
-                      <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">⚙</span>
-                    )}
-                  </Link>
-                ))}
-              </div>
-            </div>
-          </nav>
-        </header>
-
-        {/* STATS PAGE */}
-        {view === "stats" ? (
-          <div className="space-y-6 max-w-6xl mx-auto">
-            {/* ✅ Stats filter bar */}
-            <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 text-center sm:text-left">
-              <div>
-                <div className="text-sm text-neutral-200 font-medium">Stats</div>
-                <div className="text-xs text-neutral-500">
-                  Filter:
-                  <span className="text-neutral-300 ml-1">
-                    {statsMonth === "all" ? "All time" : statsMonth}
-                  </span>
-                </div>
-              </div>
-
-              <div className="w-full sm:w-[220px]">
-                <Select
-                  label="Month"
-                  value={statsMonth}
-                  onChange={setStatsMonth}
-                  options={statsMonthOptions}
-                />
-              </div>
-            </div>
-            {/* Top KPIs */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
-              <StatCard title="Total items" value={items.length.toString()} sub={`${statusCounts.completed} completed`} />
-              <StatCard title="Completed" value={totalCompleted.toString()} sub="(after excludes)" />
-              <StatCard
-                title="Time watched"
-                value={`${(totalRuntimeMinutesCompleted / 60).toFixed(1)}h`}
-                sub={`${totalRuntimeMinutesCompleted} min`}
-              />
-              <StatCard title="Rewatches" value={`${rewatchTotals.rewatches}`} sub={`${rewatchTotals.itemsRewatched} items`} />
-              <StatCard
-                title="Friends"
-                value={friendsList.length.toString()}
-                sub={`Following ${friendsList.length} • Pending ${outgoingRequests.length}`}
-              />
-            </div>
-
-            {/* Highlights */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              <Panel title="Highlights" right={<span className="text-xs text-neutral-500">Quick stats</span>}>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <MiniStat label="Best month" value={`${bestMonth.label}`} sub={`${bestMonth.count} completed`} />
-                  <MiniStat label="Current streak" value={`${completionStreak.current} days`} sub={`Longest: ${completionStreak.longest}`} />
-                  <MiniStat label="Top game" value={gameHoursStats.topGameTitle} sub={`${gameHoursStats.topGameHours.toFixed(1)}h`} />
-                  <MiniStat label="Avg game hours" value={`${gameHoursStats.avgHours.toFixed(1)}h`} sub={`Total: ${gameHoursStats.totalHours.toFixed(1)}h`} />
-                </div>
-
-                <div className="mt-4 grid grid-cols-1 gap-2">
-                  <MiniStat
-                    label={`Top genre this year (${yearGenreCompare.year})`}
-                    value={yearGenreCompare.thisYearTop.tag}
-                    sub={`${yearGenreCompare.thisYearTop.count}`}
-                  />
-                  <MiniStat
-                    label={`Top genre last year (${yearGenreCompare.year - 1})`}
-                    value={yearGenreCompare.lastYearTop.tag}
-                    sub={`${yearGenreCompare.lastYearTop.count}`}
-                  />
-                  <MiniStat label="Most rewatched" value={mostRewatchedItem.title} sub={`${mostRewatchedItem.count}`} />
-                </div>
-              </Panel>
-
-              <Panel
-                title="Monthly completions"
-                right={<span className="text-xs text-neutral-500">Last 12 months</span>}
-                className="lg:col-span-2 flex flex-col"
-              >
-                <div className="flex-1 flex items-end">
-                  <div className="flex items-end gap-2 w-full">
-                    {monthlyCompleted.months.map((m) => {
-                      const h = Math.round((m.count / monthlyCompleted.max) * 96);
-                      return (
-                        <div key={m.key} className="flex-1 min-w-[18px] text-center">
-                          <div
-                            className="rounded-lg bg-white/10 border border-white/10 mx-auto"
-                            style={{ height: `${Math.max(6, h)}px` }}
-                            title={`${m.key}: ${m.count}`}
-                          />
-                          <div className="text-[10px] text-neutral-500 mt-2">{m.label}</div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-                <div className="text-xs text-neutral-500 mt-3">
-                  Uses <span className="text-neutral-400">date watched</span> if set; otherwise{" "}
-                  <span className="text-neutral-400">created date</span>.
-                </div>
-              </Panel>
-            </div>
-
-            {/* Breakdown + Genres */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              <Panel title="Status breakdown" right={<span className="text-xs text-neutral-500">{items.length} total</span>}>
-                <div className="space-y-2 text-sm">
-                  <BarRow label="Completed" value={statusCounts.completed} total={items.length || 1} />
-                  <BarRow label="In Progress" value={statusCounts.in_progress} total={items.length || 1} />
-                  <BarRow label="Planned" value={statusCounts.planned} total={items.length || 1} />
-                  <BarRow label="Dropped" value={statusCounts.dropped} total={items.length || 1} />
-                </div>
-
-                <details className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
-                  <summary className="cursor-pointer select-none text-xs text-neutral-300">
-                    Exclude types (affects all stats)
-                    <span className="text-neutral-500"> — click to expand</span>
-                  </summary>
-
-                  <div className="text-xs text-neutral-400 mt-3">Toggle types:</div>
-                  <div className="flex flex-wrap gap-2 mt-2">
-                    {(["movie", "tv", "anime", "manga", "book", "game"] as MediaType[]).map((t) => (
-                      <button
-                        key={t}
-                        type="button"
-                        onClick={() => toggleExclude(t)}
-                        className={`px-3 py-1 rounded-xl border text-xs ${
-                          excludeTypes.has(t) ? "bg-red-500/15 border-red-500/20" : "bg-white/5 border-white/10 hover:bg-white/10"
-                        }`}
-                      >
-                        {excludeTypes.has(t) ? `Excluded: ${TYPE_LABEL[t]}` : TYPE_LABEL[t]}
-                      </button>
-                    ))}
-                  </div>
-                </details>
-              </Panel>
-
-              <Panel title="Genres (completed)" className="lg:col-span-2">
-                {genreCounts.length ? (
-                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-center gap-6">
-                    <PieChartSimple data={genreCounts} />
-                    <div className="space-y-2 text-sm w-full">
-                      {genreCounts.map((g, idx) => (
-                        <div key={g.label} className="flex items-center justify-between gap-6">
-                          <div className="min-w-0 flex items-center gap-2">
-                            <span
-                              className="h-3 w-3 rounded-full shrink-0 ring-1 ring-white/10"
-                              style={{ backgroundColor: PIE_COLORS[idx % PIE_COLORS.length] }}
-                              aria-hidden="true"
-                            />
-                            <div className="text-neutral-300 truncate">{g.label}</div>
-                          </div>
-                          <div className="text-neutral-400 tabular-nums">{g.value}</div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="text-xs text-neutral-400">No genres yet.</div>
-                )}
-
-                <details className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
-                  <summary className="cursor-pointer select-none text-xs text-neutral-300">
-                    Top tags (completed)
-                    <span className="text-neutral-500"> — click to expand</span>
-                  </summary>
-
-                  <div className="mt-3">
-                    {topTags.length ? (
-                      <div className="flex flex-wrap gap-2">
-                        {topTags.map((t) => (
-                          <div
-                            key={t.tag}
-                            className="px-3 py-1 rounded-xl bg-neutral-950 border border-neutral-800 text-xs text-neutral-200"
-                            title={`${t.count} items`}
-                          >
-                            {t.tag} <span className="text-neutral-500">({t.count})</span>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="text-xs text-neutral-400">No tags yet.</div>
-                    )}
-                  </div>
-                </details>
-              </Panel>
-            </div>
-
-            {/* “Deep dive” section (collapsible, removes repetition by default) */}
-            <Panel title="Details" right={<span className="text-xs text-neutral-500">Less clutter by default</span>}>
-              <details className="rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
-                <summary className="cursor-pointer select-none text-xs text-neutral-300">
-                  Type totals
-                  <span className="text-neutral-500"> — click to expand</span>
-                </summary>
-
-                <div className="mt-3 space-y-2">
-                  {typeCounts.length ? (
-                    typeCounts.map((x) => (
-                      <div
-                        key={x.type}
-                        className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2"
-                      >
-                        <div className="text-sm text-neutral-200">{TYPE_LABEL[x.type]}</div>
-                        <div className="text-sm text-neutral-300 tabular-nums">{x.count}</div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="text-xs text-neutral-400">No items yet.</div>
-                  )}
-                </div>
-              </details>
-
-              <details className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
-                <summary className="cursor-pointer select-none text-xs text-neutral-300">
-                  Average rating (by type)
-                  <span className="text-neutral-500"> — click to expand</span>
-                </summary>
-
-                <div className="mt-3 grid sm:grid-cols-2 gap-2 text-sm text-neutral-300">
-                  {avgByType.length ? (
-                    avgByType.map((x) => (
-                      <div key={x.type} className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-center">
-                        <div className="text-xs text-neutral-400">{TYPE_LABEL[x.type]}</div>
-                        <div>
-                          {formatRatingValue(x.avg, settings.ratingFormat)} <span className="text-xs text-neutral-500">({x.count} rated)</span>
-                        </div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="text-xs text-neutral-400">Rate some items to see averages.</div>
-                  )}
-                </div>
-              </details>
-            </Panel>
-          </div>
+        {backgroundImageUrl ? (
+          <div
+            aria-hidden="true"
+            className="stack-custom-background"
+            style={{
+              backgroundImage: `linear-gradient(rgba(3, 6, 14, 0.76), rgba(3, 6, 14, 0.90)), url(${JSON.stringify(backgroundImageUrl)})`,
+            }}
+          />
         ) : null}
+        <style>{`
+          :root {
+            --stack-theme-bg: ${STACK_COLOR_THEMES.midnight.bg};
+            --stack-theme-fg: ${STACK_COLOR_THEMES.midnight.fg};
+            --stack-theme-surface: ${STACK_COLOR_THEMES.midnight.surface};
+            --stack-theme-accent: ${STACK_COLOR_THEMES.midnight.accent};
+            --stack-theme-good: ${STACK_COLOR_THEMES.midnight.good};
+            --stack-theme-good-border: ${STACK_COLOR_THEMES.midnight.goodBorder};
+            --stack-theme-bad: ${STACK_COLOR_THEMES.midnight.bad};
+            --stack-theme-bad-border: ${STACK_COLOR_THEMES.midnight.badBorder};
+            --stack-theme-focus: ${STACK_COLOR_THEMES.midnight.focus};
+            --stack-theme-ring: ${STACK_COLOR_THEMES.midnight.ring};
+          }
 
+          .stack-bg {
+            background: var(--stack-theme-bg) !important;
+            color: var(--stack-theme-fg) !important;
+          }
 
-        {/* ADD PAGE */}
-        {view === "add" ? (
-          <div className="rounded-3xl stack-accent ring-1 ring-white/10">
-            {/* center content */}
-            <div className="px-4 sm:px-6 py-6 md:px-10 md:py-10 mx-auto max-w-3xl space-y-4">
-              <div className="text-center">
-                <div className="text-2xl font-semibold tracking-tight">Add to Stack</div>
-                <div className="text-sm text-neutral-200/70 mt-1">
-                  Auto-fill: Movie/TV (TMDB) • Game (IGDB) • Anime/Manga (AniList). Everything else manual.
-                </div>
-              </div>
+          .stack-custom-background {
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            background-position: center;
+            background-size: cover;
+            background-repeat: no-repeat;
+            filter: saturate(0.92) contrast(1.02);
+            pointer-events: none;
+          }
 
-              <form onSubmit={addItem} className="bg-neutral-950/55 backdrop-blur-sm p-5 sm:p-7 rounded-2xl ring-1 ring-neutral-800/80 shadow-lg space-y-5">
-                <div className="space-y-2">
-                  <div className="relative">
-                    {ghostTitle && normTitle(ghostTitle).startsWith(normTitle(String(form.title || ""))) ? (
-                      <div className="absolute inset-0 pointer-events-none flex items-center px-3 py-2">
-                        <span className="text-transparent select-none">{String(form.title || "")}</span>
-                        <span className="text-neutral-500/60 select-none">{ghostTitle.slice(String(form.title || "").length)}</span>
-                      </div>
-                    ) : null}
+          .stack-surface-glass .stack-surface {
+            backdrop-filter: blur(22px) saturate(1.16);
+            -webkit-backdrop-filter: blur(22px) saturate(1.16);
+          }
 
-                    <input
-                      value={form.title || ""}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setForm({ ...form, title: v });
-                        setShowSuggest(true);
-                      }}
-                      onFocus={() => setShowSuggest(true)}
-                      onBlur={() => {
-                        window.setTimeout(() => setShowSuggest(false), 120);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Tab" && ghostTitle) {
-                          e.preventDefault();
-                          setForm((f) => ({ ...f, title: ghostTitle }));
-                          setGhostTitle("");
-                          setShowSuggest(false);
-                          setSuggestions([]); // ✅ clear old list
-                          return;
-                        }
+          .stack-surface-solid .stack-surface {
+            backdrop-filter: none !important;
+            -webkit-backdrop-filter: none !important;
+            background: color-mix(in srgb, var(--stack-theme-surface) 92%, #05070d 8%) !important;
+          }
 
+          .stack-corners-square .rounded-3xl,
+          .stack-corners-square .rounded-2xl,
+          .stack-corners-square .rounded-xl,
+          .stack-corners-square .rounded-\[2rem\] { border-radius: 0.35rem !important; }
 
-                        if (showSuggest && suggestions.length) {
-                          if (e.key === "ArrowDown") {
-                            e.preventDefault();
-                            setActiveSuggestIdx((i) => Math.min(suggestions.length - 1, i + 1));
-                            return;
-                          }
-                          if (e.key === "ArrowUp") {
-                            e.preventDefault();
-                            setActiveSuggestIdx((i) => Math.max(0, i - 1));
-                            return;
-                          }
-                          if (e.key === "Enter") {
-                            if (activeSuggestIdx >= 0 && activeSuggestIdx < suggestions.length) {
-                              const s = suggestions[activeSuggestIdx];
-                              if (s) {
-                                e.preventDefault();
-                                selectSuggestion(s);
-                              }
-                            }
-                            return;
-                          }
-                          if (e.key === "Escape") {
-                            setShowSuggest(false);
-                            return;
-                          }
-                        }
-                      }}
+          .stack-corners-soft .rounded-3xl,
+          .stack-corners-soft .rounded-\[2rem\] { border-radius: 1rem !important; }
+          .stack-corners-soft .rounded-2xl { border-radius: 0.8rem !important; }
 
-                      placeholder="Title"
-                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
-                    />
+          .stack-reduce-motion *,
+          .stack-reduce-motion *::before,
+          .stack-reduce-motion *::after {
+            scroll-behavior: auto !important;
+            transition-duration: 0.001ms !important;
+            animation-duration: 0.001ms !important;
+            animation-iteration-count: 1 !important;
+          }
 
-                    {showSuggest && suggestions.length ? (
-                      <div className="absolute z-30 mt-2 w-full rounded-2xl border border-neutral-800 bg-neutral-950 shadow-xl overflow-hidden">
-                        <div className="px-3 py-2 text-[11px] text-neutral-500 border-b border-neutral-800">
-                          Suggestions (↑/↓ + Enter) • Tab accepts ghost preview
-                        </div>
-                        <div className="max-h-64 overflow-auto">
-                          {suggestions.map((s, idx) => (
-                            <button
-                              type="button"
-                              key={s.key}
-                              onMouseDown={(ev) => ev.preventDefault()}
-                              onClick={() => selectSuggestion(s)}
-                              className={[
-                                "w-full text-left px-3 py-2 flex items-center gap-3 border-b border-neutral-900/60",
-                                idx === activeSuggestIdx ? "bg-white/10" : "hover:bg-white/5",
-                              ].join(" ")}
-                            >
-                              <div className="w-8 h-10 rounded-lg bg-neutral-900 border border-neutral-800 overflow-hidden shrink-0">
-                                {s.posterUrl ? (
-                                  // eslint-disable-next-line @next/next/no-img-element
-                                  <img src={s.posterUrl} alt="" className="w-full h-full object-cover" />
-                                ) : (
-                                  <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">—</div>
-                                )}
-                              </div>
-                              <div className="min-w-0 flex-1">
-                                <div className="text-sm text-neutral-200 truncate">{s.title}</div>
-                                <div className="text-[11px] text-neutral-500">
-                                  {s.provider.toUpperCase()}
-                                  {s.subtitle ? ` • ${s.subtitle}` : ""}
-                                </div>
-                              </div>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    ) : null}
+          .stack-poster-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 1rem;
+          }
+
+          .stack-poster-small .stack-poster-grid {
+            grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+            gap: 0.75rem;
+          }
+
+          .stack-poster-large .stack-poster-grid {
+            grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+            gap: 1.15rem;
+          }
+
+          .stack-poster-card {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.10);
+            background: rgba(7,10,18,0.78);
+            box-shadow: 0 18px 52px rgba(0,0,0,0.26);
+            transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+          }
+
+          .stack-poster-card:hover {
+            transform: translateY(-4px);
+            border-color: rgba(255,255,255,0.20);
+            box-shadow: 0 24px 64px rgba(0,0,0,0.34);
+          }
+
+          .stack-classic-row {
+            border-radius: 0.75rem !important;
+            background: rgba(5,7,13,0.82) !important;
+          }
+
+          .stack-library-classic .stack-mobile-item-card {
+            border-radius: 0.75rem !important;
+            box-shadow: none !important;
+          }
+
+          .stack-section-kicker {
+            letter-spacing: .18em;
+            text-transform: uppercase;
+            font-size: 10px;
+            color: rgba(163,163,163,.76);
+          }
+
+          .stack-settings-tabs {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: .5rem;
+          }
+
+          .stack-admin-grid {
+            display: grid;
+            grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.7fr);
+            gap: 1rem;
+          }
+
+          @media (max-width: 900px) {
+            .stack-admin-grid { grid-template-columns: 1fr; }
+            .stack-settings-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+          }
+
+          @media (max-width: 639px) {
+            .stack-poster-grid,
+            .stack-poster-small .stack-poster-grid,
+            .stack-poster-large .stack-poster-grid {
+              grid-template-columns: repeat(2, minmax(0, 1fr));
+              gap: .75rem;
+            }
+          }
+
+          .stack-surface {
+            background: var(--stack-theme-surface) !important;
+            box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28), 0 0 0 1px var(--stack-theme-ring) inset;
+          }
+
+          .stack-accent {
+            background: var(--stack-theme-accent) !important;
+          }
+
+          .stack-good {
+            background: var(--stack-theme-good) !important;
+            border-color: var(--stack-theme-good-border) !important;
+          }
+
+          .stack-bad {
+            background: var(--stack-theme-bad) !important;
+            border-color: var(--stack-theme-bad-border) !important;
+          }
+
+          .stack-bg input:focus,
+          .stack-bg textarea:focus,
+          .stack-bg select:focus {
+            border-color: var(--stack-theme-focus) !important;
+            box-shadow: 0 0 0 1px color-mix(in srgb, var(--stack-theme-focus) 42%, transparent);
+          }
+
+          .stack-compact .p-5 { padding: 0.85rem !important; }
+          .stack-compact .p-4 { padding: 0.75rem !important; }
+          .stack-compact .p-3 { padding: 0.6rem !important; }
+          .stack-compact .space-y-6 > :not([hidden]) ~ :not([hidden]) { margin-top: 1rem !important; }
+          .stack-compact .space-y-4 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.75rem !important; }
+          .stack-compact .space-y-3 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.5rem !important; }
+          .stack-compact .rounded-3xl { border-radius: 1.15rem !important; }
+          .stack-compact .rounded-2xl { border-radius: 0.9rem !important; }
+
+          @media (max-width: 639px) {
+            .stack-bg { min-height: 100dvh; }
+
+            .stack-mobile-item-card {
+              background: rgba(8, 12, 22, 0.86) !important;
+              border-color: rgba(255,255,255,0.14) !important;
+              box-shadow: 0 18px 54px rgba(0,0,0,0.28);
+            }
+
+            .stack-mobile-item-card select,
+            .stack-mobile-item-card button,
+            .stack-mobile-item-card input {
+              min-height: 40px;
+            }
+
+            .stack-mobile-item-card [title="Open details"] {
+              width: 5rem !important;
+              height: 6.5rem !important;
+            }
+
+            .stack-mobile-readable-surface {
+              background: rgba(8, 12, 22, 0.88) !important;
+              border-color: rgba(255,255,255,0.14) !important;
+            }
+
+            .stack-mobile-scroll-panel {
+              max-height: min(82dvh, 780px);
+              overflow-y: auto;
+              -webkit-overflow-scrolling: touch;
+            }
+          }
+        `}</style>
+
+        <div
+          className={[
+            isWideBoard ? "max-w-[104rem]" : "max-w-6xl",
+            "relative z-10 mx-auto px-3 sm:px-6 py-5 pb-28 sm:py-6 sm:pb-6 space-y-6 min-w-0 overflow-x-hidden",
+          ].join(" ")}
+        >
+          {/* Header */}
+          <header className="space-y-4">
+            <div className="relative overflow-hidden rounded-[2rem] stack-surface border border-white/10 shadow-2xl shadow-black/20">
+              {bannerImageUrl ? (
+                <div
+                  aria-hidden="true"
+                  className="absolute inset-0 bg-cover bg-center opacity-35"
+                  style={{ backgroundImage: `url(${JSON.stringify(bannerImageUrl)})` }}
+                />
+              ) : null}
+              <div className="absolute inset-0 bg-gradient-to-r from-black/72 via-black/38 to-transparent pointer-events-none" />
+              <div className="relative p-4 sm:p-6 flex flex-col lg:flex-row lg:items-end lg:justify-between gap-5">
+                <div className="min-w-0">
+                  <div className="stack-section-kicker">Personal media tracker</div>
+                  <h1 className="text-3xl sm:text-5xl font-semibold tracking-tight mt-1">Stack</h1>
+                  <p className="text-sm text-neutral-300/80 mt-1">Your movies, shows, anime, manga, books, and games in one place.</p>
+
+                  <div className="flex flex-wrap gap-2 mt-4">
+                    <span className="px-3 py-1.5 rounded-xl bg-black/25 border border-white/10 text-xs text-neutral-200">{items.length} items</span>
+                    <span className="px-3 py-1.5 rounded-xl bg-black/25 border border-white/10 text-xs text-neutral-200">{items.filter((item) => item.status === "completed").length} completed</span>
+                    <span className="px-3 py-1.5 rounded-xl bg-black/25 border border-white/10 text-xs text-neutral-200">{friendsList.length} friends</span>
                   </div>
-
-                  {autofillStatus ? <div className="text-xs text-neutral-300">{autofillStatus}</div> : null}
-                  <div className="h-px bg-white/10" />
-                  <div className="text-xs text-neutral-400 font-medium">Basics</div>
                 </div>
 
-                {((form.posterOverrideUrl || "").trim() || (form.posterUrl || "").trim()) ? (
-                  <div className="flex items-center gap-3 rounded-2xl bg-neutral-950 border border-neutral-800 p-3">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={((form.posterOverrideUrl || "").trim() || (form.posterUrl || "").trim()) as string}
-                      alt="Poster"
-                      className="w-12 h-16 rounded-lg object-cover bg-neutral-900"
-                    />
-                    <div className="text-xs text-neutral-400">Cover loaded • Tags: {displayCombinedTags.slice(0, 4).join(", ") || "—"}</div>
-                    <div className="flex-1" />
+                <div className="flex flex-row lg:flex-col items-center lg:items-end justify-between lg:justify-end gap-2">
+                  <div className="text-xs text-neutral-400 lg:text-right">{saveStatus}</div>
+                  {userId ? (
                     <button
                       type="button"
-                      onClick={() =>
-                        setForm((f) => ({
-                          ...f,
-                          posterUrl: "",
-                          posterOverrideUrl: "",
-                        }))
-                      }
-                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                      onClick={handleLogout}
+                      className="text-xs px-3 py-2 rounded-xl bg-black/25 border border-white/10 hover:bg-white/10 text-neutral-300"
                     >
-                      Remove cover
+                      Log out
                     </button>
-                  </div>
-                ) : null}
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-                  <Select
-                    label="Type"
-                    value={form.type || "movie"}
-                    onChange={(v) => {
-                      setSuggestions([]);
-                      setGhostTitle("");
-                      setActiveSuggestIdx(0);
-
-                      setForm({
-                        ...form,
-                        type: v as MediaType,
-                        tmdbId: undefined,
-                        tmdbType: undefined,
-                        igdbId: undefined,
-                        anilistId: undefined,
-                        anilistType: undefined,
-                        posterUrl: "",
-                        runtime: undefined,
-                      });
-
-                      setAutoTags([]);
-                      setAutofillStatus("");
-
-                      setProgressTotalText((prev) => {
-                        const nextType = v as MediaType;
-                        if (nextType === "movie") return prev.trim() === "" ? "1" : prev;
-                        return prev;
-                      });
-                    }}
-                    options={[
-                      { value: "movie", label: "Movie" },
-                      { value: "tv", label: "TV" },
-                      { value: "anime", label: "Anime" },
-                      { value: "manga", label: "Manga" },
-                      { value: "book", label: "Book" },
-                      { value: "game", label: "Game" },
-                    ]}
-                  />
-
-                  <Select
-                    label="Status"
-                    value={form.status || "planned"}
-                    onChange={(v) => setForm({ ...form, status: v as Status })}
-                    options={[
-                      { value: "completed", label: "Completed" },
-                      { value: "in_progress", label: "In Progress" },
-                      { value: "planned", label: "Planned" },
-                      { value: "dropped", label: "Dropped" },
-                    ]}
-                  />
-
-                  <TextNumberInput
-                    label={`Rating (${ratingFormatLabel(settings.ratingFormat)})`}
-                    value={ratingText}
-                    onChange={setRatingText}
-                    placeholder="—"
-                    pattern={/^\d{0,2}(\.\d{0,1})?$/}
-                    helper="Rate the show."
-                  />
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <TextNumberInput
-                    label="Progress current (optional)"
-                    value={progressCurText}
-                    onChange={setProgressCurText}
-                    placeholder="—"
-                    pattern={/^\d{0,6}$/}
-                  />
-
-                  <TextNumberInput
-                    label="Progress total (optional)"
-                    value={progressTotalText}
-                    onChange={setProgressTotalText}
-                    placeholder={form.type === "movie" ? "1" : "—"}
-                    pattern={/^\d{0,6}$/}
-                    helper={
-                      form.type === "movie"
-                        ? "Movies default to 1 total if left blank."
-                        : form.type === "tv"
-                        ? "Auto-fill tries to set episode count."
-                        : form.type === "anime"
-                        ? "Auto-fill tries to set episodes."
-                        : form.type === "manga"
-                        ? "Auto-fill tries chapters (or volumes)."
-                        : undefined
-                    }
-                  />
-                </div>
-                
-                <div className="h-px bg-white/10 mt-2" />
-                <div className="text-xs text-neutral-400 font-medium">Details</div>
-                <div className="h-px bg-white/10 mt-2" />
-                <div className="text-xs text-neutral-400 font-medium">Progress</div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <Text
-                    label="Date watched (optional)"
-                    type="date"
-                    value={String(form.dateFinished || "")}
-                    onChange={(v) => setForm({ ...form, dateFinished: v })}
-                    helper="If blank: Completed auto-sets to today."
-                  />
-
-                  {String(form.title || "").trim().length > 0 ? (
-                    <Text
-                      label="Cover image URL (optional)"
-                      value={String(form.posterOverrideUrl || "")}
-                      onChange={(v) => setForm({ ...form, posterOverrideUrl: v })}
-                      helper="Overrides auto-filled cover."
-                    />
                   ) : null}
                 </div>
+              </div>
+            </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <TextNumberInput
-                    label="Count"
-                    value={rewatchText}
-                    onChange={(v) => {
-                      if (!isRewatch) return;
+            <nav className="space-y-2" aria-label="Stack navigation">
+              <div className="flex justify-center">
+                <div className="inline-flex flex-wrap justify-center gap-[clamp(0.35rem,1.5vw,0.65rem)] rounded-3xl bg-neutral-950/55 ring-1 ring-white/10 shadow-lg shadow-black/20 px-[clamp(0.45rem,1.6vw,0.8rem)] py-[clamp(0.4rem,1.2vw,0.65rem)] max-w-[96vw] backdrop-blur-xl">
+                  {navMain.map((n) => (
+                    <Link
+                      key={n.href}
+                      href={n.href}
+                      className={[
+                        "px-[clamp(0.6rem,1.8vw,1rem)] py-[clamp(0.48rem,1.2vw,0.7rem)] rounded-2xl border text-[clamp(0.72rem,1.25vw,0.9rem)] transition whitespace-nowrap",
+                        view === n.key
+                          ? "bg-white/15 border-white/25 shadow-inner text-neutral-50"
+                          : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-300",
+                      ].join(" ")}
+                    >
+                      {n.label}
+                    </Link>
+                  ))}
+                </div>
+              </div>
 
-                      if (v.trim() === "") {
-                        setRewatchText("");
-                        return;
-                      }
+              <div className="flex justify-center">
+                <div className="flex flex-wrap justify-center gap-2 max-w-[96vw]">
+                  {navActions.map((n) => (
+                    <Link
+                      key={n.href}
+                      href={n.href}
+                      title={n.label}
+                      aria-label={n.label}
+                      className={[
+                        "h-[clamp(2.35rem,10vw,2.85rem)] min-w-[clamp(2.35rem,10vw,2.85rem)] px-2 grid place-items-center rounded-2xl border transition shadow-sm touch-manipulation",
+                        "bg-neutral-950/50 ring-1 ring-white/5 backdrop-blur-xl",
+                        view === n.key
+                          ? "bg-white/15 border-white/25 text-neutral-50 shadow-inner"
+                          : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-300",
+                      ].join(" ")}
+                    >
+                      {n.icon === "plus" ? (
+                        <span className="text-[clamp(1.0rem,2.4vw,1.35rem)] leading-none">+</span>
+                      ) : n.icon === "pie" ? (
+                        <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">◔</span>
+                      ) : n.icon === "users" ? (
+                        <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">👥</span>
+                      ) : n.icon === "feed" ? (
+                        <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">≡</span>
+                      ) : n.icon === "discover" ? (
+                        <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">⌕</span>
+                      ) : n.icon === "feedback" ? (
+                        <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">!</span>
+                      ) : (
+                        <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">⚙</span>
+                      )}
+                    </Link>
+                  ))}
+                </div>
+              </div>
+            </nav>
+          </header>
 
-                      const n = Math.floor(Number(v));
-                      if (!Number.isFinite(n)) return;
-
-                      const clamped = Math.max(1, Math.min(999, n));
-                      setRewatchText(String(clamped));
-                      lastRewatchOnRef.current = String(clamped);
-                    }}
-                    placeholder="1"
-                    pattern={/^\d{0,3}$/}
-                    disabled={!isRewatch}
-                    helper={isRewatch ? "Rewatch count (min 1)." : "Enable Rewatch to edit."}
-                  />
-
-                  <label className="block">
-                    <div className="text-xs text-neutral-400 mb-1">Rewatch</div>
-                    <Toggle
-                      label="Rewatch"
-                      checked={isRewatch}
-                      onChange={(nextOn) => {
-                        setIsRewatch(nextOn);
-
-                        if (nextOn) {
-                          setRewatchText((prev) => {
-                            const restored = (lastRewatchOnRef.current || "1").trim();
-                            if (prev.trim() === "" || Number(prev) === 0) return restored;
-                            return prev;
-                          });
-                        } else {
-                          const n = Math.floor(Number(rewatchText));
-                          if (Number.isFinite(n) && n > 0) lastRewatchOnRef.current = String(n);
-                          setRewatchText("0");
-                        }
-                      }}
-                    />
-                  </label>
+          {/* STATS PAGE */}
+          {view === "stats" ? (
+            <div className="space-y-6 max-w-6xl mx-auto">
+              <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 text-center sm:text-left">
+                <div>
+                  <div className="text-sm text-neutral-200 font-medium">Stats</div>
+                  <div className="text-xs text-neutral-500">
+                    Filter:
+                    <span className="text-neutral-300 ml-1">
+                      {statsMonth === "all" ? "All time" : statsMonth}
+                    </span>
+                  </div>
                 </div>
 
-                <TagEditor
-                  autoTags={autoTags}
-                  manualTags={manualTags}
-                  onChangeManual={setManualTags}
-                  helper="Auto-filled genres show below; add your own tags too."
-                />
+                <div className="w-full sm:w-[220px]">
+                  <Select
+                    label="Month"
+                    value={statsMonth}
+                    onChange={setStatsMonth}
+                    options={statsMonthOptions}
+                  />
+                </div>
+              </div>
 
-                {friendsList.length ? (
-                  <div className="space-y-2">
-                    <div className="text-xs text-neutral-400">With friends (optional)</div>
-                    <div className="flex flex-wrap gap-2">
-                      {friendsList.map((f) => {
-                        const selected = selectedFriendIds.includes(f.friend_id);
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+                <StatCard
+                  title="Total items"
+                  value={items.length.toString()}
+                  sub={`${statusCounts.completed} completed`}
+                />
+                <StatCard
+                  title="Completed"
+                  value={totalCompleted.toString()}
+                  sub="(after excludes)"
+                />
+                <StatCard
+                  title="Time watched"
+                  value={`${(totalRuntimeMinutesCompleted / 60).toFixed(1)}h`}
+                  sub={`${totalRuntimeMinutesCompleted} min`}
+                />
+                <StatCard
+                  title="Rewatches"
+                  value={`${rewatchTotals.rewatches}`}
+                  sub={`${rewatchTotals.itemsRewatched} items`}
+                />
+                <StatCard
+                  title="Friends"
+                  value={friendsList.length.toString()}
+                  sub={`Following ${friendsList.length} • Pending ${outgoingRequests.length}`}
+                />
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <Panel
+                  title="Highlights"
+                  right={<span className="text-xs text-neutral-500">Quick stats</span>}
+                >
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <MiniStat
+                      label="Best month"
+                      value={`${bestMonth.label}`}
+                      sub={`${bestMonth.count} completed`}
+                    />
+                    <MiniStat
+                      label="Current streak"
+                      value={`${completionStreak.current} days`}
+                      sub={`Longest: ${completionStreak.longest}`}
+                    />
+                    <MiniStat
+                      label="Top game"
+                      value={gameHoursStats.topGameTitle}
+                      sub={`${gameHoursStats.topGameHours.toFixed(1)}h`}
+                    />
+                    <MiniStat
+                      label="Avg game hours"
+                      value={`${gameHoursStats.avgHours.toFixed(1)}h`}
+                      sub={`Total: ${gameHoursStats.totalHours.toFixed(1)}h`}
+                    />
+                  </div>
+
+                  <div className="mt-4 grid grid-cols-1 gap-2">
+                    <MiniStat
+                      label={`Top genre this year (${yearGenreCompare.year})`}
+                      value={yearGenreCompare.thisYearTop.tag}
+                      sub={`${yearGenreCompare.thisYearTop.count}`}
+                    />
+                    <MiniStat
+                      label={`Top genre last year (${yearGenreCompare.year - 1})`}
+                      value={yearGenreCompare.lastYearTop.tag}
+                      sub={`${yearGenreCompare.lastYearTop.count}`}
+                    />
+                    <MiniStat
+                      label="Most rewatched"
+                      value={mostRewatchedItem.title}
+                      sub={`${mostRewatchedItem.count}`}
+                    />
+                  </div>
+                </Panel>
+
+                <Panel
+                  title="Monthly completions"
+                  right={<span className="text-xs text-neutral-500">Last 12 months</span>}
+                  className="lg:col-span-2 flex flex-col"
+                >
+                  <div className="flex-1 flex items-end">
+                    <div className="flex items-end gap-2 w-full">
+                      {monthlyCompleted.months.map((m) => {
+                        const h = Math.round((m.count / monthlyCompleted.max) * 96);
                         return (
-                          <button
-                            key={f.friend_id}
-                            type="button"
-                            onClick={() => toggleSelectedFriend(f.friend_id)}
-                            className={[
-                              "px-3 py-2 rounded-xl border text-xs transition touch-manipulation",
-                              selected
-                                ? "bg-emerald-500/15 border-emerald-500/25 text-neutral-100"
-                                : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-300",
-                            ].join(" ")}
-                            aria-pressed={selected}
-                          >
-                            {selected ? "Added: " : "Add: "}
-                            {friendsNameById.get(f.friend_id) ?? f.friend?.username ?? f.friend_id}
-                          </button>
+                          <div key={m.key} className="flex-1 min-w-[18px] text-center">
+                            <div
+                              className="rounded-lg bg-white/10 border border-white/10 mx-auto"
+                              style={{ height: `${Math.max(6, h)}px` }}
+                              title={`${m.key}: ${m.count}`}
+                            />
+                            <div className="text-[10px] text-neutral-500 mt-2">{m.label}</div>
+                          </div>
                         );
                       })}
                     </div>
-                    <div className="text-[11px] text-neutral-500">This saves with the item in your existing media JSON.</div>
                   </div>
-                ) : null}
+                  <div className="text-xs text-neutral-500 mt-3">
+                    Uses <span className="text-neutral-400">date watched</span> if set;
+                    otherwise <span className="text-neutral-400">created date</span>.
+                  </div>
+                </Panel>
+              </div>
 
-                <TextArea
-                  label="Notes"
-                  value={String(form.notes || "")}
-                  onChange={(v) => setForm({ ...form, notes: v })}
-                  placeholder="Anything you want to remember"
-                />
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <Panel
+                  title="Status breakdown"
+                  right={<span className="text-xs text-neutral-500">{items.length} total</span>}
+                >
+                  <div className="space-y-2 text-sm">
+                    <BarRow
+                      label="Completed"
+                      value={statusCounts.completed}
+                      total={items.length || 1}
+                    />
+                    <BarRow
+                      label="In Progress"
+                      value={statusCounts.in_progress}
+                      total={items.length || 1}
+                    />
+                    <BarRow
+                      label="Planned"
+                      value={statusCounts.planned}
+                      total={items.length || 1}
+                    />
+                    <BarRow
+                      label="Dropped"
+                      value={statusCounts.dropped}
+                      total={items.length || 1}
+                    />
+                  </div>
 
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <button
-                    type="submit"
-                    className="px-4 py-2 rounded-xl stack-good hover:opacity-95"
-                  >
+                  <details className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
+                    <summary className="cursor-pointer select-none text-xs text-neutral-300">
+                      Exclude types (affects all stats)
+                      <span className="text-neutral-500"> — click to expand</span>
+                    </summary>
+
+                    <div className="text-xs text-neutral-400 mt-3">Toggle types:</div>
+                    <div className="flex flex-wrap gap-2 mt-2">
+                      {(
+                        ["movie", "tv", "anime", "manga", "book", "game"] as MediaType[]
+                      ).map((t) => (
+                        <button
+                          key={t}
+                          type="button"
+                          onClick={() => toggleExclude(t)}
+                          className={`px-3 py-1 rounded-xl border text-xs ${
+                            excludeTypes.has(t)
+                              ? "bg-red-500/15 border-red-500/20"
+                              : "bg-white/5 border-white/10 hover:bg-white/10"
+                          }`}
+                        >
+                          {excludeTypes.has(t)
+                            ? `Excluded: ${TYPE_LABEL[t]}`
+                            : TYPE_LABEL[t]}
+                        </button>
+                      ))}
+                    </div>
+                  </details>
+                </Panel>
+
+                <Panel title="Genres (completed)" className="lg:col-span-2">
+                  {genreCounts.length ? (
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-center gap-6">
+                      <PieChartSimple data={genreCounts} />
+                      <div className="space-y-2 text-sm w-full">
+                        {genreCounts.map((g, idx) => (
+                          <div
+                            key={g.label}
+                            className="flex items-center justify-between gap-6"
+                          >
+                            <div className="min-w-0 flex items-center gap-2">
+                              <span
+                                className="h-3 w-3 rounded-full shrink-0 ring-1 ring-white/10"
+                                style={{
+                                  backgroundColor:
+                                    PIE_COLORS[idx % PIE_COLORS.length],
+                                }}
+                                aria-hidden="true"
+                              />
+                              <div className="text-neutral-300 truncate">{g.label}</div>
+                            </div>
+                            <div className="text-neutral-400 tabular-nums">
+                              {g.value}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-neutral-400">No genres yet.</div>
+                  )}
+
+                  <details className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
+                    <summary className="cursor-pointer select-none text-xs text-neutral-300">
+                      Top tags (completed)
+                      <span className="text-neutral-500"> — click to expand</span>
+                    </summary>
+
+                    <div className="mt-3">
+                      {topTags.length ? (
+                        <div className="flex flex-wrap gap-2">
+                          {topTags.map((t) => (
+                            <div
+                              key={t.tag}
+                              className="px-3 py-1 rounded-xl bg-neutral-950 border border-neutral-800 text-xs text-neutral-200"
+                              title={`${t.count} items`}
+                            >
+                              {t.tag}{" "}
+                              <span className="text-neutral-500">({t.count})</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="text-xs text-neutral-400">No tags yet.</div>
+                      )}
+                    </div>
+                  </details>
+                </Panel>
+              </div>
+
+              <Panel
+                title="Details"
+                right={<span className="text-xs text-neutral-500">Less clutter by default</span>}
+              >
+                <details className="rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
+                  <summary className="cursor-pointer select-none text-xs text-neutral-300">
+                    Type totals
+                    <span className="text-neutral-500"> — click to expand</span>
+                  </summary>
+
+                  <div className="mt-3 space-y-2">
+                    {typeCounts.length ? (
+                      typeCounts.map((x) => (
+                        <div
+                          key={x.type}
+                          className="flex items-center justify-between rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2"
+                        >
+                          <div className="text-sm text-neutral-200">
+                            {TYPE_LABEL[x.type]}
+                          </div>
+                          <div className="text-sm text-neutral-300 tabular-nums">
+                            {x.count}
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="text-xs text-neutral-400">No items yet.</div>
+                    )}
+                  </div>
+                </details>
+
+                <details className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950/40 px-3 py-2">
+                  <summary className="cursor-pointer select-none text-xs text-neutral-300">
+                    Average rating (by type)
+                    <span className="text-neutral-500"> — click to expand</span>
+                  </summary>
+
+                  <div className="mt-3 grid sm:grid-cols-2 gap-2 text-sm text-neutral-300">
+                    {avgByType.length ? (
+                      avgByType.map((x) => (
+                        <div
+                          key={x.type}
+                          className="rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-center"
+                        >
+                          <div className="text-xs text-neutral-400">
+                            {TYPE_LABEL[x.type]}
+                          </div>
+                          <div>
+                            {formatRatingValue(x.avg, settings.ratingFormat)}{" "}
+                            <span className="text-xs text-neutral-500">
+                              ({x.count} rated)
+                            </span>
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="text-xs text-neutral-400">
+                        Rate some items to see averages.
+                      </div>
+                    )}
+                  </div>
+                </details>
+              </Panel>
+            </div>
+          ) : null}
+
+          {/* ADD PAGE */}
+          {view === "add" ? (
+            <div className="rounded-3xl stack-accent ring-1 ring-white/10">
+              <div className="px-4 sm:px-6 py-6 md:px-10 md:py-10 mx-auto max-w-3xl space-y-4">
+                <div className="text-center">
+                  <div className="text-2xl font-semibold tracking-tight">
                     Add to Stack
+                  </div>
+                  <div className="text-sm text-neutral-200/70 mt-1">
+                    Auto-fill: Movie/TV (TMDB) • Game (IGDB) • Anime/Manga (AniList).
+                    Everything else manual.
+                  </div>
+                </div>
+
+                <form
+                  onSubmit={addItem}
+                  className="bg-neutral-950/55 backdrop-blur-sm p-5 sm:p-7 rounded-2xl ring-1 ring-neutral-800/80 shadow-lg space-y-5"
+                >
+                  <div className="space-y-2">
+                    <div className="relative">
+                      {ghostTitle &&
+                      normTitle(ghostTitle).startsWith(
+                        normTitle(String(form.title || ""))
+                      ) ? (
+                        <div className="absolute inset-0 pointer-events-none flex items-center px-3 py-2">
+                          <span className="text-transparent select-none">
+                            {String(form.title || "")}
+                          </span>
+                          <span className="text-neutral-500/60 select-none">
+                            {ghostTitle.slice(String(form.title || "").length)}
+                          </span>
+                        </div>
+                      ) : null}
+
+                      <input
+                        value={form.title || ""}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setForm({ ...form, title: v });
+                          setShowSuggest(true);
+                        }}
+                        onFocus={() => setShowSuggest(true)}
+                        onBlur={() => {
+                          window.setTimeout(() => setShowSuggest(false), 120);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Tab" && ghostTitle) {
+                            e.preventDefault();
+                            setForm((f) => ({ ...f, title: ghostTitle }));
+                            setGhostTitle("");
+                            setShowSuggest(false);
+                            setSuggestions([]);
+                            return;
+                          }
+
+                          if (showSuggest && suggestions.length) {
+                            if (e.key === "ArrowDown") {
+                              e.preventDefault();
+                              setActiveSuggestIdx((i) =>
+                                Math.min(suggestions.length - 1, i + 1)
+                              );
+                              return;
+                            }
+                            if (e.key === "ArrowUp") {
+                              e.preventDefault();
+                              setActiveSuggestIdx((i) => Math.max(0, i - 1));
+                              return;
+                            }
+                            if (e.key === "Enter") {
+                              if (
+                                activeSuggestIdx >= 0 &&
+                                activeSuggestIdx < suggestions.length
+                              ) {
+                                const s = suggestions[activeSuggestIdx];
+                                if (s) {
+                                  e.preventDefault();
+                                  selectSuggestion(s);
+                                }
+                              }
+                              return;
+                            }
+                            if (e.key === "Escape") {
+                              setShowSuggest(false);
+                              return;
+                            }
+                          }
+                        }}
+                        placeholder="Title"
+                        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
+                      />
+
+                      {showSuggest && suggestions.length ? (
+                        <div className="absolute z-30 mt-2 w-full rounded-2xl border border-neutral-800 bg-neutral-950 shadow-xl overflow-hidden">
+                          <div className="px-3 py-2 text-[11px] text-neutral-500 border-b border-neutral-800">
+                            Suggestions (↑/↓ + Enter) • Tab accepts ghost preview
+                          </div>
+                          <div className="max-h-64 overflow-auto">
+                            {suggestions.map((s, idx) => (
+                              <button
+                                type="button"
+                                key={s.key}
+                                onMouseDown={(ev) => ev.preventDefault()}
+                                onClick={() => selectSuggestion(s)}
+                                className={[
+                                  "w-full text-left px-3 py-2 flex items-center gap-3 border-b border-neutral-900/60",
+                                  idx === activeSuggestIdx
+                                    ? "bg-white/10"
+                                    : "hover:bg-white/5",
+                                ].join(" ")}
+                              >
+                                <div className="w-8 h-10 rounded-lg bg-neutral-900 border border-neutral-800 overflow-hidden shrink-0">
+                                  {s.posterUrl ? (
+                                    // eslint-disable-next-line @next/next/no-img-element
+                                    <img
+                                      src={s.posterUrl}
+                                      alt=""
+                                      className="w-full h-full object-cover"
+                                    />
+                                  ) : (
+                                    <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">
+                                      —
+                                    </div>
+                                  )}
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                  <div className="text-sm text-neutral-200 truncate">
+                                    {s.title}
+                                  </div>
+                                  <div className="text-[11px] text-neutral-500">
+                                    {s.provider.toUpperCase()}
+                                    {s.subtitle ? ` • ${s.subtitle}` : ""}
+                                  </div>
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    {autofillStatus ? (
+                      <div className="text-xs text-neutral-300">{autofillStatus}</div>
+                    ) : null}
+                    <div className="h-px bg-white/10" />
+                    <div className="text-xs text-neutral-400 font-medium">Basics</div>
+                  </div>
+
+                  {(form.posterOverrideUrl || "").trim() ||
+                  (form.posterUrl || "").trim() ? (
+                    <div className="flex items-center gap-3 rounded-2xl bg-neutral-950 border border-neutral-800 p-3">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={
+                          ((form.posterOverrideUrl || "").trim() ||
+                            (form.posterUrl || "").trim()) as string
+                        }
+                        alt="Poster"
+                        className="w-12 h-16 rounded-lg object-cover bg-neutral-900"
+                      />
+                      <div className="text-xs text-neutral-400">
+                        Cover loaded • Tags:{" "}
+                        {displayCombinedTags.slice(0, 4).join(", ") || "—"}
+                      </div>
+                      <div className="flex-1" />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setForm((f) => ({
+                            ...f,
+                            posterUrl: "",
+                            posterOverrideUrl: "",
+                          }))
+                        }
+                        className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                      >
+                        Remove cover
+                      </button>
+                    </div>
+                  ) : null}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                    <Select
+                      label="Type"
+                      value={form.type || "movie"}
+                      onChange={(v) => {
+                        setSuggestions([]);
+                        setGhostTitle("");
+                        setActiveSuggestIdx(0);
+
+                        setForm({
+                          ...form,
+                          type: v as MediaType,
+                          tmdbId: undefined,
+                          tmdbType: undefined,
+                          igdbId: undefined,
+                          anilistId: undefined,
+                          anilistType: undefined,
+                          posterUrl: "",
+                          runtime: undefined,
+                        });
+
+                        setAutoTags([]);
+                        setAutofillStatus("");
+
+                        setProgressTotalText((prev) => {
+                          const nextType = v as MediaType;
+                          if (nextType === "movie")
+                            return prev.trim() === "" ? "1" : prev;
+                          return prev;
+                        });
+                      }}
+                      options={[
+                        { value: "movie", label: "Movie" },
+                        { value: "tv", label: "TV" },
+                        { value: "anime", label: "Anime" },
+                        { value: "manga", label: "Manga" },
+                        { value: "book", label: "Book" },
+                        { value: "game", label: "Game" },
+                      ]}
+                    />
+
+                    <Select
+                      label="Status"
+                      value={form.status || "planned"}
+                      onChange={(v) => setForm({ ...form, status: v as Status })}
+                      options={[
+                        { value: "completed", label: "Completed" },
+                        { value: "in_progress", label: "In Progress" },
+                        { value: "planned", label: "Planned" },
+                        { value: "dropped", label: "Dropped" },
+                      ]}
+                    />
+
+                    <TextNumberInput
+                      label={`Rating (${ratingFormatLabel(settings.ratingFormat)})`}
+                      value={ratingText}
+                      onChange={setRatingText}
+                      placeholder="—"
+                      pattern={/^\d{0,2}(\.\d{0,1})?$/}
+                      helper="Rate the show."
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <TextNumberInput
+                      label="Progress current (optional)"
+                      value={progressCurText}
+                      onChange={setProgressCurText}
+                      placeholder="—"
+                      pattern={/^\d{0,6}$/}
+                    />
+
+                    <TextNumberInput
+                      label="Progress total (optional)"
+                      value={progressTotalText}
+                      onChange={setProgressTotalText}
+                      placeholder={form.type === "movie" ? "1" : "—"}
+                      pattern={/^\d{0,6}$/}
+                      helper={
+                        form.type === "movie"
+                          ? "Movies default to 1 total if left blank."
+                          : form.type === "tv"
+                          ? "Auto-fill tries to set episode count."
+                          : form.type === "anime"
+                          ? "Auto-fill tries to set episodes."
+                          : form.type === "manga"
+                          ? "Auto-fill tries chapters (or volumes)."
+                          : undefined
+                      }
+                    />
+                  </div>
+
+                  <div className="h-px bg-white/10 mt-2" />
+                  <div className="text-xs text-neutral-400 font-medium">Details</div>
+                  <div className="h-px bg-white/10 mt-2" />
+                  <div className="text-xs text-neutral-400 font-medium">Progress</div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <Text
+                      label="Date watched (optional)"
+                      type="date"
+                      value={String(form.dateFinished || "")}
+                      onChange={(v) => setForm({ ...form, dateFinished: v })}
+                      helper="If blank: Completed auto-sets to today."
+                    />
+
+                    {String(form.title || "").trim().length > 0 ? (
+                      <Text
+                        label="Cover image URL (optional)"
+                        value={String(form.posterOverrideUrl || "")}
+                        onChange={(v) => setForm({ ...form, posterOverrideUrl: v })}
+                        helper="Overrides auto-filled cover."
+                      />
+                    ) : null}
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <TextNumberInput
+                      label="Count"
+                      value={rewatchText}
+                      onChange={(v) => {
+                        if (!isRewatch) return;
+
+                        if (v.trim() === "") {
+                          setRewatchText("");
+                          return;
+                        }
+
+                        const n = Math.floor(Number(v));
+                        if (!Number.isFinite(n)) return;
+
+                        const clamped = Math.max(1, Math.min(999, n));
+                        setRewatchText(String(clamped));
+                        lastRewatchOnRef.current = String(clamped);
+                      }}
+                      placeholder="1"
+                      pattern={/^\d{0,3}$/}
+                      disabled={!isRewatch}
+                      helper={isRewatch ? "Rewatch count (min 1)." : "Enable Rewatch to edit."}
+                    />
+
+                    <label className="block">
+                      <div className="text-xs text-neutral-400 mb-1">Rewatch</div>
+                      <Toggle
+                        label="Rewatch"
+                        checked={isRewatch}
+                        onChange={(nextOn) => {
+                          setIsRewatch(nextOn);
+
+                          if (nextOn) {
+                            setRewatchText((prev) => {
+                              const restored = (lastRewatchOnRef.current || "1").trim();
+                              if (prev.trim() === "" || Number(prev) === 0)
+                                return restored;
+                              return prev;
+                            });
+                          } else {
+                            const n = Math.floor(Number(rewatchText));
+                            if (Number.isFinite(n) && n > 0)
+                              lastRewatchOnRef.current = String(n);
+                            setRewatchText("0");
+                          }
+                        }}
+                      />
+                    </label>
+                  </div>
+
+                  <TagEditor
+                    autoTags={autoTags}
+                    manualTags={manualTags}
+                    onChangeManual={setManualTags}
+                    helper="Auto-filled genres show below; add your own tags too."
+                  />
+
+                  {friendsList.length ? (
+                    <div className="space-y-2">
+                      <div className="text-xs text-neutral-400">
+                        With friends (optional)
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {friendsList.map((f) => {
+                          const selected = selectedFriendIds.includes(f.friend_id);
+                          return (
+                            <button
+                              key={f.friend_id}
+                              type="button"
+                              onClick={() => toggleSelectedFriend(f.friend_id)}
+                              className={[
+                                "px-3 py-2 rounded-xl border text-xs transition touch-manipulation",
+                                selected
+                                  ? "bg-emerald-500/15 border-emerald-500/25 text-neutral-100"
+                                  : "bg-white/5 border-white/10 hover:bg-white/10 text-neutral-300",
+                              ].join(" ")}
+                              aria-pressed={selected}
+                            >
+                              {selected ? "Added: " : "Add: "}
+                              {friendsNameById.get(f.friend_id) ??
+                                f.friend?.username ??
+                                f.friend_id}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="text-[11px] text-neutral-500">
+                        This saves with the item in your existing media JSON.
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <TextArea
+                    label="Notes"
+                    value={String(form.notes || "")}
+                    onChange={(v) => setForm({ ...form, notes: v })}
+                    placeholder="Anything you want to remember"
+                  />
+
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <button
+                      type="submit"
+                      className="px-4 py-2 rounded-xl stack-good hover:opacity-95"
+                    >
+                      Add to Stack
+                    </button>
+
+                    <div className="flex gap-3 flex-wrap">
+                      <Toggle
+                        label="Auto-fill as you type"
+                        checked={autoAutofill}
+                        onChange={setAutoAutofill}
+                      />
+                    </div>
+                  </div>
+                </form>
+
+                <div className="bg-neutral-950/40 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-3">
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => pickForMe("best")}
+                        className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+                      >
+                        Pick something for me
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => pickForMe("random")}
+                        title="Random"
+                        aria-label="Random"
+                        className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+                      >
+                        🎲
+                      </button>
+                    </div>
+
+                    <div className="text-xs text-neutral-400">{pickStatus}</div>
+                  </div>
+
+                  {picks.length ? (
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      {picks.map((p) => (
+                        <div
+                          key={
+                            p.provider === "tmdb"
+                              ? `tmdb:${p.tmdbType}:${p.tmdbId}`
+                              : p.provider === "anilist"
+                              ? `anilist:${p.anilistType}:${p.anilistId}`
+                              : `igdb:${p.igdbId}`
+                          }
+                        >
+                          <div className="aspect-[2/3] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
+                            {p.posterUrl ? (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img
+                                src={p.posterUrl}
+                                alt={p.title}
+                                className="w-full h-full object-cover"
+                              />
+                            ) : (
+                              <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">
+                                No cover
+                              </div>
+                            )}
+                          </div>
+                          <div className="text-xs text-neutral-200 line-clamp-2">
+                            {p.title}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {/* FRIENDS PAGE */}
+          {view === "friends" ? (
+            <div className="space-y-5 max-w-6xl mx-auto">
+              {selectedFriendProfile ? (
+                <div className="space-y-5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedFriendProfileId(null);
+                      setFriendProfileQuery("");
+                      setFriendProfileView("all");
+                      setFriendProfileMobileTab("profile");
+                    }}
+                    className="inline-flex items-center gap-2 text-sm px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-300"
+                  >
+                    <span aria-hidden="true">←</span>
+                    Back to friends
                   </button>
 
-                  <div className="flex gap-3 flex-wrap">
-                    <Toggle label="Auto-fill as you type" checked={autoAutofill} onChange={setAutoAutofill} />
-                  </div>
-                </div>
-              </form>
+                  <div className="relative overflow-hidden rounded-[2rem] stack-accent border border-white/10 shadow-2xl shadow-black/20">
+                    <div className="absolute inset-0 bg-gradient-to-br from-white/[0.07] via-transparent to-black/20 pointer-events-none" />
 
-              {/* PICK SECTION */}
-              <div className="bg-neutral-950/40 p-4 sm:p-6 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm space-y-3">
-                <div className="flex items-center justify-between gap-3 flex-wrap">
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => pickForMe("best")}
-                      className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-                    >
-                      Pick something for me
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => pickForMe("random")}
-                      title="Random"
-                      aria-label="Random"
-                      className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-                    >
-                      🎲
-                    </button>
-                  </div>
-
-                  <div className="text-xs text-neutral-400">{pickStatus}</div>
-                </div>
-
-                {picks.length ? (
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                    {picks.map((p) => (
-                      <div
-                        key={
-                          p.provider === "tmdb"
-                            ? `tmdb:${p.tmdbType}:${p.tmdbId}`
-                            : p.provider === "anilist"
-                            ? `anilist:${p.anilistType}:${p.anilistId}`
-                            : `igdb:${p.igdbId}`
-                        }
-                      >
-                        <div className="aspect-[2/3] rounded-xl overflow-hidden bg-neutral-950 border border-neutral-800">
-                          {p.posterUrl ? (
-                            // eslint-disable-next-line @next/next/no-img-element
-                            <img src={p.posterUrl} alt={p.title} className="w-full h-full object-cover" />
-                          ) : (
-                            <div className="w-full h-full grid place-items-center text-[10px] text-neutral-600">No cover</div>
+                    <div className="relative p-5 sm:p-8">
+                      <div className="flex flex-col md:flex-row md:items-center gap-5">
+                        <div className="h-20 w-20 sm:h-24 sm:w-24 rounded-[1.75rem] stack-surface border border-white/15 grid place-items-center text-2xl sm:text-3xl font-semibold text-neutral-100 shrink-0 shadow-xl">
+                          {friendInitials(
+                            selectedFriendProfile.settings.displayName?.trim() ||
+                              selectedFriendProfile.display.primary
                           )}
                         </div>
-                        <div className="text-xs text-neutral-200 line-clamp-2">{p.title}</div>
+
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs uppercase tracking-[0.18em] text-neutral-400">
+                            Friend profile
+                          </div>
+
+                          <h2 className="text-2xl sm:text-3xl font-semibold text-neutral-50 mt-1 truncate">
+                            {selectedFriendProfile.settings.displayName?.trim() ||
+                              selectedFriendProfile.display.baseName}
+                          </h2>
+
+                          <div className="text-sm text-neutral-400 mt-1 truncate">
+                            {selectedFriendProfile.display.idTag ||
+                              (selectedFriendProfile.friend.friend?.username
+                                ? `@${selectedFriendProfile.friend.friend.username}`
+                                : selectedFriendProfile.id)}
+                          </div>
+
+                          <div className="flex flex-wrap gap-2 mt-4">
+                            <span className="px-3 py-1.5 rounded-xl bg-black/20 border border-white/10 text-xs text-neutral-200">
+                              {selectedFriendProfileStats.total} visible
+                            </span>
+
+                            <span className="px-3 py-1.5 rounded-xl bg-black/20 border border-white/10 text-xs text-neutral-200">
+                              {selectedFriendProfileStats.completed} completed
+                            </span>
+
+                            <span className="px-3 py-1.5 rounded-xl bg-black/20 border border-white/10 text-xs text-neutral-200">
+                              {selectedFriendProfileStats.inProgress} active
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="w-full md:w-64 space-y-2">
+                          <label className="block">
+                            <div className="text-[11px] text-neutral-400 mb-1">
+                              Your nickname for this friend
+                            </div>
+
+                            <input
+                              value={
+                                settings.friendNicknames?.[
+                                  selectedFriendProfile.id
+                                ] ?? ""
+                              }
+                              onChange={(e) =>
+                                updateFriendNickname(
+                                  selectedFriendProfile.id,
+                                  e.target.value
+                                )
+                              }
+                              placeholder="Optional nickname"
+                              className="w-full rounded-xl bg-black/20 border border-white/10 px-3 py-2 text-sm outline-none focus:border-neutral-500"
+                            />
+                          </label>
+
+                          <button
+                            type="button"
+                            onClick={() => removeFriend(selectedFriendProfile.id)}
+                            className="w-full text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 text-neutral-200"
+                          >
+                            Remove friend
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2 rounded-2xl stack-surface border border-white/10 p-2">
+                    {[
+                      { id: "profile" as const, label: "Overview" },
+                      { id: "library" as const, label: "Library" },
+                      { id: "stats" as const, label: "Compare" },
+                    ].map((tab) => (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        onClick={() => setFriendProfileMobileTab(tab.id)}
+                        className={[
+                          "min-h-[44px] px-3 py-2 rounded-xl border text-xs sm:text-sm transition",
+                          friendProfileMobileTab === tab.id
+                            ? "bg-white/15 border-white/25 text-neutral-50 shadow-inner"
+                            : "bg-white/[0.035] border-white/10 text-neutral-400 hover:bg-white/10 hover:text-neutral-200",
+                        ].join(" ")}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {friendProfileMobileTab === "profile" ? (
+                    <div className="space-y-5">
+                      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+                        <MiniStat
+                          label="Visible"
+                          value={String(selectedFriendProfileStats.total)}
+                          sub="public items"
+                        />
+
+                        <MiniStat
+                          label="Completed"
+                          value={String(selectedFriendProfileStats.completed)}
+                          sub="finished"
+                        />
+
+                        <MiniStat
+                          label="In progress"
+                          value={String(selectedFriendProfileStats.inProgress)}
+                          sub="active"
+                        />
+
+                        <MiniStat
+                          label="Average"
+                          value={
+                            selectedFriendProfile.settings.showRatingsToFriends ===
+                            false
+                              ? "Hidden"
+                              : formatRatingValue(
+                                  selectedFriendProfileStats.avgRating,
+                                  settings.ratingFormat
+                                )
+                          }
+                          sub="rating"
+                        />
+
+                        <MiniStat
+                          label="Top genre"
+                          value={
+                            selectedFriendProfile.settings.showTagsToFriends ===
+                            false
+                              ? "Hidden"
+                              : selectedFriendProfileStats.topGenre
+                          }
+                          sub={
+                            selectedFriendProfile.settings.showTagsToFriends ===
+                            false
+                              ? "private"
+                              : `${selectedFriendProfileStats.topGenreCount} items`
+                          }
+                        />
+                      </div>
+
+                      <Panel title="About">
+                        <div className="text-sm text-neutral-300 whitespace-pre-wrap leading-relaxed">
+                          {selectedFriendProfile.settings
+                            .showProfileBioToFriends === false
+                            ? "This friend keeps their profile bio private."
+                            : selectedFriendProfile.settings.profileBio?.trim() ||
+                              "No profile bio yet."}
+                        </div>
+                      </Panel>
+
+                      <Panel
+                        title="In progress"
+                        right={
+                          <span className="text-xs text-neutral-500">
+                            {selectedFriendActiveItems.length
+                              ? `${selectedFriendActiveItems.length} shown`
+                              : "Nothing active"}
+                          </span>
+                        }
+                      >
+                        {selectedFriendActiveItems.length ? (
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            {selectedFriendActiveItems.map((item) => (
+                              <FriendReadOnlyCard
+                                key={`active:${item.id}`}
+                                item={item}
+                                ratingFormat={settings.ratingFormat ?? "ten"}
+                                privacy={profilePrivacyFromSettings(
+                                  selectedFriendProfile.settings
+                                )}
+                              />
+                            ))}
+                          </div>
+                        ) : (
+                          <EmptyState
+                            title="Nothing in progress"
+                            message="This friend does not currently have any visible media marked In Progress."
+                          />
+                        )}
+                      </Panel>
+
+                      <Panel title="Recently updated">
+                        {selectedFriendRecentItems.length ? (
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            {selectedFriendRecentItems.map((item) => (
+                              <FriendReadOnlyCard
+                                key={`recent:${item.id}`}
+                                item={item}
+                                ratingFormat={settings.ratingFormat ?? "ten"}
+                                privacy={profilePrivacyFromSettings(
+                                  selectedFriendProfile.settings
+                                )}
+                              />
+                            ))}
+                          </div>
+                        ) : (
+                          <EmptyState
+                            title="No visible activity yet"
+                            message="When this friend adds public media, it will appear here."
+                          />
+                        )}
+                      </Panel>
+                    </div>
+                  ) : null}
+
+                  {friendProfileMobileTab === "library" ? (
+                    <div className="space-y-4">
+                      <Panel title="Library">
+                        <div className="flex gap-2 overflow-x-auto pb-1 -mx-1 px-1">
+                          <button
+                            type="button"
+                            onClick={() => setFriendProfileView("all")}
+                            className={[
+                              "shrink-0 px-3 py-2 rounded-xl border text-xs transition",
+                              friendProfileView === "all"
+                                ? "bg-white/15 border-white/25"
+                                : "bg-white/5 border-white/10 hover:bg-white/10",
+                            ].join(" ")}
+                          >
+                            All
+                          </button>
+
+                          {STATUSES.map((status) => (
+                            <button
+                              key={status.id}
+                              type="button"
+                              onClick={() => setFriendProfileView(status.id)}
+                              className={[
+                                "shrink-0 px-3 py-2 rounded-xl border text-xs transition",
+                                friendProfileView === status.id
+                                  ? "bg-white/15 border-white/25"
+                                  : "bg-white/5 border-white/10 hover:bg-white/10",
+                              ].join(" ")}
+                            >
+                              {status.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_220px] lg:grid-cols-[minmax(0,1fr)_220px_auto] gap-3 items-end mt-4">
+                          <label className="block">
+                            <div className="text-xs text-neutral-400 mb-1">
+                              Search this library
+                            </div>
+
+                            <input
+                              value={friendProfileQuery}
+                              onChange={(e) =>
+                                setFriendProfileQuery(e.target.value)
+                              }
+                              placeholder="Search titles, visible notes, or tags..."
+                              className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
+                            />
+                          </label>
+
+                          <Select
+                            label="Sort"
+                            value={friendProfileSortMode}
+                            onChange={(v) =>
+                              setFriendProfileSortMode(v as SortMode)
+                            }
+                            options={[
+                              { value: "updated", label: "Last updated" },
+                              { value: "newest", label: "Newest first" },
+                              { value: "oldest", label: "Oldest first" },
+                              { value: "title", label: "Title (A–Z)" },
+                              {
+                                value: "rating_high",
+                                label: "Rating (high → low)",
+                              },
+                              {
+                                value: "rating_low",
+                                label: "Rating (low → high)",
+                              },
+                              {
+                                value: "favorites",
+                                label: "Favorites first",
+                              },
+                            ]}
+                          />
+
+                          <Toggle
+                            label="Board"
+                            checked={friendProfileBoardView}
+                            onChange={setFriendProfileBoardView}
+                          />
+                        </div>
+                      </Panel>
+
+                      {friendProfileFilteredItems.length ? (
+                        friendProfileBoardView && friendProfileView === "all" ? (
+                          <FriendReadOnlyBoardView
+                            items={friendProfileFilteredItems}
+                            ratingFormat={settings.ratingFormat ?? "ten"}
+                            privacy={profilePrivacyFromSettings(
+                              selectedFriendProfile.settings
+                            )}
+                          />
+                        ) : (
+                          <div className="space-y-6">
+                            {(friendProfileView === "all"
+                              ? STATUSES.map((status) => ({
+                                  ...status,
+                                  items: friendProfileByStatus[status.id],
+                                }))
+                              : [
+                                  {
+                                    id: friendProfileView,
+                                    label:
+                                      STATUSES.find(
+                                        (status) =>
+                                          status.id === friendProfileView
+                                      )?.label ?? "Items",
+                                    items: friendProfileFilteredItems,
+                                  },
+                                ]
+                            ).map((section) =>
+                              section.items.length ? (
+                                <section
+                                  key={section.id}
+                                  className="space-y-3"
+                                >
+                                  <div className="flex items-center justify-between gap-3">
+                                    <h3 className="text-sm font-medium text-neutral-300">
+                                      {section.label}
+                                    </h3>
+
+                                    <span className="text-xs text-neutral-600">
+                                      {section.items.length}
+                                    </span>
+                                  </div>
+
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                    {section.items.map((item) => (
+                                      <FriendReadOnlyCard
+                                        key={item.id}
+                                        item={item}
+                                        ratingFormat={
+                                          settings.ratingFormat ?? "ten"
+                                        }
+                                        privacy={profilePrivacyFromSettings(
+                                          selectedFriendProfile.settings
+                                        )}
+                                      />
+                                    ))}
+                                  </div>
+                                </section>
+                              ) : null
+                            )}
+                          </div>
+                        )
+                      ) : (
+                        <EmptyState
+                          title="Nothing matches"
+                          message="Try another search or status. Private media always remains hidden."
+                        />
+                      )}
+                    </div>
+                  ) : null}
+
+                  {friendProfileMobileTab === "stats" ? (
+                    <div className="space-y-5">
+                      <Panel
+                        title="Your overlap"
+                        right={
+                          <span className="text-xs text-neutral-500">
+                            Visible media only
+                          </span>
+                        }
+                      >
+                        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+                          <MiniStat
+                            label="Both completed"
+                            value={String(
+                              selectedFriendComparison.bothCompleted
+                            )}
+                            sub="same titles"
+                          />
+
+                          <MiniStat
+                            label="Both planned"
+                            value={String(
+                              selectedFriendComparison.bothPlanned
+                            )}
+                            sub="same titles"
+                          />
+
+                          <MiniStat
+                            label="Both active"
+                            value={String(
+                              selectedFriendComparison.bothInProgress
+                            )}
+                            sub="in progress"
+                          />
+
+                          <MiniStat
+                            label="Shared genres"
+                            value={selectedFriendComparison.sharedTopTags}
+                            sub="top overlap"
+                          />
+
+                          <MiniStat
+                            label="Their top type"
+                            value={selectedFriendComparison.friendTopType}
+                            sub="visible library"
+                          />
+                        </div>
+                      </Panel>
+
+                      <Panel title="Their Stack">
+                        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                          <MiniStat
+                            label="Completed"
+                            value={String(
+                              selectedFriendProfileStats.completed
+                            )}
+                          />
+
+                          <MiniStat
+                            label="In progress"
+                            value={String(
+                              selectedFriendProfileStats.inProgress
+                            )}
+                          />
+
+                          <MiniStat
+                            label="Planned"
+                            value={String(
+                              selectedFriendProfileStats.planned
+                            )}
+                          />
+
+                          <MiniStat
+                            label="Dropped"
+                            value={String(
+                              selectedFriendProfileStats.dropped
+                            )}
+                          />
+                        </div>
+
+                        <div className="text-xs text-neutral-500 mt-4">
+                          Comparisons respect that friend&apos;s privacy settings and
+                          only use media you are allowed to see.
+                        </div>
+                      </Panel>
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <>
+                  <div className="relative overflow-hidden rounded-[2rem] stack-accent border border-white/10 shadow-2xl shadow-black/20">
+                    <div className="absolute inset-0 bg-gradient-to-br from-white/[0.07] via-transparent to-black/20 pointer-events-none" />
+
+                    <div className="relative p-5 sm:p-8">
+                      <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-5">
+                        <div>
+                          <div className="text-xs uppercase tracking-[0.2em] text-neutral-400">
+                            Your circle
+                          </div>
+
+                          <h2 className="text-3xl sm:text-4xl font-semibold tracking-tight text-neutral-50 mt-1">
+                            Friends
+                          </h2>
+
+                          <p className="text-sm text-neutral-400 mt-2 max-w-xl">
+                            Find people, keep up with their Stack, and discover
+                            what you have in common.
+                          </p>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={refreshFriendsPage}
+                          disabled={friendsRefreshing}
+                          className={[
+                            "self-start md:self-auto text-xs px-4 py-2.5 rounded-xl border transition",
+                            friendsRefreshing
+                              ? "bg-white/5 border-white/10 text-neutral-500 cursor-wait"
+                              : "bg-white/10 border-white/15 hover:bg-white/15 text-neutral-200",
+                          ].join(" ")}
+                        >
+                          {friendsRefreshing ? "Refreshing…" : "↻ Refresh"}
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-2 sm:gap-3 mt-6">
+                        <div className="rounded-2xl bg-black/20 border border-white/10 px-3 py-3 sm:px-4 sm:py-4">
+                          <div className="text-xl sm:text-2xl font-semibold text-neutral-100">
+                            {friendsList.length}
+                          </div>
+                          <div className="text-[10px] sm:text-xs text-neutral-500 mt-1">
+                            Friends
+                          </div>
+                        </div>
+
+                        <div className="rounded-2xl bg-black/20 border border-white/10 px-3 py-3 sm:px-4 sm:py-4">
+                          <div className="text-xl sm:text-2xl font-semibold text-neutral-100">
+                            {incomingRequests.length}
+                          </div>
+                          <div className="text-[10px] sm:text-xs text-neutral-500 mt-1">
+                            Incoming
+                          </div>
+                        </div>
+
+                        <div className="rounded-2xl bg-black/20 border border-white/10 px-3 py-3 sm:px-4 sm:py-4">
+                          <div className="text-xl sm:text-2xl font-semibold text-neutral-100">
+                            {outgoingRequests.length}
+                          </div>
+                          <div className="text-[10px] sm:text-xs text-neutral-500 mt-1">
+                            Sent
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="stack-surface rounded-3xl border border-white/10 p-4 sm:p-6">
+                    <div className="grid grid-cols-1 lg:grid-cols-[260px_minmax(0,1fr)] gap-4 lg:items-end">
+                      <div>
+                        <div className="text-sm font-medium text-neutral-100">
+                          Find someone
+                        </div>
+
+                        <div className="text-xs text-neutral-500 mt-1">
+                          Search by their Stack username or display name.
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col sm:flex-row gap-2">
+                        <input
+                          value={inputUsername}
+                          onChange={(e) => setInputUsername(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              void sendFriendRequest();
+                            }
+                          }}
+                          placeholder="Username or display name"
+                          className="flex-1 min-h-[44px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
+                        />
+
+                        <button
+                          type="button"
+                          onClick={sendFriendRequest}
+                          disabled={!inputUsername.trim()}
+                          className={[
+                            "min-h-[44px] px-5 rounded-xl border text-sm transition",
+                            inputUsername.trim()
+                              ? "stack-good hover:opacity-95 text-neutral-100"
+                              : "bg-white/5 border-white/10 text-neutral-600 cursor-not-allowed",
+                          ].join(" ")}
+                        >
+                          Send request
+                        </button>
+                      </div>
+                    </div>
+
+                    {friendStatus ? (
+                      <div className="mt-3 rounded-xl bg-white/[0.035] border border-white/10 px-3 py-2 text-xs text-neutral-300">
+                        {friendStatus}
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2 rounded-2xl stack-surface border border-white/10 p-2">
+                    <button
+                      type="button"
+                      onClick={() => setFriendsTab("friends")}
+                      className={[
+                        "min-h-[44px] rounded-xl border text-sm transition",
+                        friendsTab === "friends"
+                          ? "bg-white/15 border-white/25 text-neutral-50"
+                          : "bg-white/[0.035] border-white/10 text-neutral-400 hover:bg-white/10",
+                      ].join(" ")}
+                    >
+                      Friends
+                      <span className="ml-2 text-xs text-neutral-500">
+                        {friendsList.length}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setFriendsTab("requests")}
+                      className={[
+                        "min-h-[44px] rounded-xl border text-sm transition",
+                        friendsTab === "requests"
+                          ? "bg-white/15 border-white/25 text-neutral-50"
+                          : "bg-white/[0.035] border-white/10 text-neutral-400 hover:bg-white/10",
+                      ].join(" ")}
+                    >
+                      Requests
+                      <span className="ml-2 text-xs text-neutral-500">
+                        {incomingRequests.length + outgoingRequests.length}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setFriendsTab("activity")}
+                      className={[
+                        "min-h-[44px] rounded-xl border text-sm transition",
+                        friendsTab === "activity"
+                          ? "bg-white/15 border-white/25 text-neutral-50"
+                          : "bg-white/[0.035] border-white/10 text-neutral-400 hover:bg-white/10",
+                      ].join(" ")}
+                    >
+                      Activity
+                      <span className="ml-2 text-xs text-neutral-500">
+                        {friendOnlyActivity.length}
+                      </span>
+                    </button>
+                  </div>
+
+                  {friendsTab === "friends" ? (
+                    <div className="space-y-4">
+                      <label className="block">
+                        <div className="text-xs text-neutral-400 mb-1">
+                          Search your friends
+                        </div>
+
+                        <input
+                          value={friendsQuery}
+                          onChange={(e) => setFriendsQuery(e.target.value)}
+                          placeholder="Search by name or username..."
+                          className="w-full h-[44px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
+                        />
+                      </label>
+
+                      {filteredFriendsList.length ? (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {filteredFriendsList.map((f) => {
+                            const display = getFriendDisplay(
+                              f.friend_id,
+                              f.friend
+                            );
+
+                            const summary = friendSummaryById.get(f.friend_id);
+
+                            return (
+                              <div
+                                key={f.friend_id}
+                                className="group stack-surface rounded-3xl border border-white/10 p-4 sm:p-5 transition hover:border-white/20 hover:-translate-y-0.5"
+                              >
+                                <div className="flex items-start gap-4">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedFriendProfileId(f.friend_id);
+                                      setFriendProfileView("all");
+                                      setFriendProfileQuery("");
+                                      setFriendProfileMobileTab("profile");
+                                    }}
+                                    className="h-14 w-14 rounded-2xl stack-accent border border-white/10 grid place-items-center text-lg font-semibold text-neutral-100 shrink-0"
+                                    aria-label={`Open ${display.primary}'s profile`}
+                                  >
+                                    {friendInitials(display.primary)}
+                                  </button>
+
+                                  <div className="min-w-0 flex-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setSelectedFriendProfileId(f.friend_id);
+                                        setFriendProfileView("all");
+                                        setFriendProfileQuery("");
+                                        setFriendProfileMobileTab("profile");
+                                      }}
+                                      className="block max-w-full text-left"
+                                    >
+                                      <div className="text-base font-semibold text-neutral-100 truncate group-hover:text-white">
+                                        {display.primary}
+                                      </div>
+
+                                      <div className="text-xs text-neutral-500 mt-0.5 truncate">
+                                        {display.idTag ||
+                                          (f.friend?.username
+                                            ? `@${f.friend.username}`
+                                            : display.secondary)}
+                                      </div>
+                                    </button>
+
+                                    {settings.friendNicknames?.[f.friend_id] ? (
+                                      <div className="text-[10px] text-emerald-300/70 mt-1">
+                                        Custom nickname
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                </div>
+
+                                <div className="grid grid-cols-3 gap-2 mt-4">
+                                  <div className="rounded-xl bg-black/20 border border-white/10 px-2 py-2 text-center">
+                                    <div className="text-sm font-medium text-neutral-200">
+                                      {summary?.visible ?? 0}
+                                    </div>
+                                    <div className="text-[10px] text-neutral-600">
+                                      Visible
+                                    </div>
+                                  </div>
+
+                                  <div className="rounded-xl bg-black/20 border border-white/10 px-2 py-2 text-center">
+                                    <div className="text-sm font-medium text-neutral-200">
+                                      {summary?.completed ?? 0}
+                                    </div>
+                                    <div className="text-[10px] text-neutral-600">
+                                      Finished
+                                    </div>
+                                  </div>
+
+                                  <div className="rounded-xl bg-black/20 border border-white/10 px-2 py-2 text-center">
+                                    <div className="text-sm font-medium text-neutral-200">
+                                      {summary?.active ?? 0}
+                                    </div>
+                                    <div className="text-[10px] text-neutral-600">
+                                      Active
+                                    </div>
+                                  </div>
+                                </div>
+
+                                <div className="mt-4 min-h-[40px]">
+                                  {summary?.latest ? (
+                                    <>
+                                      <div className="text-[10px] uppercase tracking-wide text-neutral-600">
+                                        Latest update
+                                      </div>
+
+                                      <div className="text-xs text-neutral-300 mt-1 truncate">
+                                        {summary.latest.title}
+                                        <span className="text-neutral-600">
+                                          {" "}
+                                          • {TYPE_LABEL[summary.latest.type]}
+                                        </span>
+                                      </div>
+                                    </>
+                                  ) : (
+                                    <div className="text-xs text-neutral-600">
+                                      No visible activity yet.
+                                    </div>
+                                  )}
+                                </div>
+
+                                <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2 mt-4">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedFriendProfileId(f.friend_id);
+                                      setFriendProfileView("all");
+                                      setFriendProfileQuery("");
+                                      setFriendProfileMobileTab("profile");
+                                    }}
+                                    className="text-xs px-3 py-2.5 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-neutral-100"
+                                  >
+                                    View profile
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    onClick={() => removeFriend(f.friend_id)}
+                                    className="text-xs px-3 py-2.5 rounded-xl bg-red-500/[0.08] border border-red-500/15 hover:bg-red-500/15 text-neutral-400 hover:text-neutral-200"
+                                    aria-label={`Remove ${display.primary}`}
+                                    title="Remove friend"
+                                  >
+                                    Remove
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : friendsList.length ? (
+                        <EmptyState
+                          title="No friends match that search"
+                          message="Try a different name or clear the search."
+                        />
+                      ) : (
+                        <EmptyState
+                          title="Your circle is empty"
+                          message="Search for someone above and send your first friend request."
+                        />
+                      )}
+                    </div>
+                  ) : null}
+
+                  {friendsTab === "requests" ? (
+                    <div className="space-y-5">
+                      <label className="block">
+                        <div className="text-xs text-neutral-400 mb-1">
+                          Search requests
+                        </div>
+
+                        <input
+                          value={friendsQuery}
+                          onChange={(e) => setFriendsQuery(e.target.value)}
+                          placeholder="Search incoming or sent requests..."
+                          className="w-full h-[44px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
+                        />
+                      </label>
+
+                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                        <Panel
+                          title="Incoming"
+                          right={
+                            <span className="text-xs text-neutral-500">
+                              {filteredIncomingRequests.length}
+                            </span>
+                          }
+                        >
+                          <div className="space-y-3">
+                            {filteredIncomingRequests.length ? (
+                              filteredIncomingRequests.map((r) => {
+                                const display = getFriendDisplay(
+                                  r.requester_id,
+                                  r.requester
+                                );
+
+                                return (
+                                  <div
+                                    key={r.id}
+                                    className="rounded-2xl bg-neutral-950/70 border border-white/10 p-3"
+                                  >
+                                    <div className="flex items-center gap-3">
+                                      <div className="h-11 w-11 rounded-xl stack-accent border border-white/10 grid place-items-center text-sm font-semibold text-neutral-100 shrink-0">
+                                        {friendInitials(display.primary)}
+                                      </div>
+
+                                      <div className="min-w-0 flex-1">
+                                        <div className="text-sm font-medium text-neutral-200 truncate">
+                                          {display.primary}
+                                        </div>
+
+                                        <div className="text-[11px] text-neutral-600 truncate">
+                                          {r.requester?.username
+                                            ? `@${r.requester.username}`
+                                            : display.secondary}
+                                        </div>
+
+                                        {r.created_at ? (
+                                          <div className="text-[10px] text-neutral-600 mt-1">
+                                            Sent {safeDateLabel(r.created_at)}
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-2 gap-2 mt-3">
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          acceptFriendRequest(
+                                            r.id,
+                                            r.requester_id
+                                          )
+                                        }
+                                        className="text-xs px-3 py-2.5 rounded-xl stack-good hover:opacity-95"
+                                      >
+                                        Accept
+                                      </button>
+
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          declineFriendRequest(r.id)
+                                        }
+                                        className="text-xs px-3 py-2.5 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                                      >
+                                        Decline
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })
+                            ) : (
+                              <div className="py-8 text-center">
+                                <div className="text-sm text-neutral-300">
+                                  No incoming requests
+                                </div>
+                                <div className="text-xs text-neutral-600 mt-1">
+                                  New requests will appear here.
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </Panel>
+
+                        <Panel
+                          title="Sent"
+                          right={
+                            <span className="text-xs text-neutral-500">
+                              {filteredOutgoingRequests.length}
+                            </span>
+                          }
+                        >
+                          <div className="space-y-3">
+                            {filteredOutgoingRequests.length ? (
+                              filteredOutgoingRequests.map((r) => {
+                                const display = getFriendDisplay(
+                                  r.requested_id,
+                                  r.requested
+                                );
+
+                                return (
+                                  <div
+                                    key={r.id}
+                                    className="rounded-2xl bg-neutral-950/70 border border-white/10 p-3"
+                                  >
+                                    <div className="flex items-center gap-3">
+                                      <div className="h-11 w-11 rounded-xl stack-accent border border-white/10 grid place-items-center text-sm font-semibold text-neutral-100 shrink-0">
+                                        {friendInitials(display.primary)}
+                                      </div>
+
+                                      <div className="min-w-0 flex-1">
+                                        <div className="text-sm font-medium text-neutral-200 truncate">
+                                          {display.primary}
+                                        </div>
+
+                                        <div className="text-[11px] text-neutral-600 truncate">
+                                          {r.requested?.username
+                                            ? `@${r.requested.username}`
+                                            : display.secondary}
+                                        </div>
+
+                                        <div className="flex items-center gap-2 mt-1">
+                                          <span className="inline-flex px-2 py-0.5 rounded-lg bg-amber-400/10 border border-amber-400/15 text-[10px] text-amber-100/70">
+                                            Pending
+                                          </span>
+
+                                          {r.created_at ? (
+                                            <span className="text-[10px] text-neutral-600">
+                                              {safeDateLabel(r.created_at)}
+                                            </span>
+                                          ) : null}
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        cancelOutgoingFriendRequest(r.id)
+                                      }
+                                      className="w-full mt-3 text-xs px-3 py-2.5 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-300"
+                                    >
+                                      Cancel request
+                                    </button>
+                                  </div>
+                                );
+                              })
+                            ) : (
+                              <div className="py-8 text-center">
+                                <div className="text-sm text-neutral-300">
+                                  No sent requests
+                                </div>
+                                <div className="text-xs text-neutral-600 mt-1">
+                                  Requests you send will appear here until accepted.
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </Panel>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {friendsTab === "activity" ? (
+                    <div className="space-y-4">
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                        <MiniStat label="Visible updates" value={String(friendOnlyActivity.length)} sub="latest 40" />
+                        <MiniStat label="Friends" value={String(friendsList.length)} sub="in your circle" />
+                        <MiniStat label="Active now" value={String(Array.from(friendSummaryById.values()).filter((summary) => summary.active > 0).length)} sub="with media in progress" />
+                      </div>
+
+                      <Panel title="Friend activity" right={<span className="text-xs text-neutral-500">{friendActivityStatus}</span>}>
+                        <div className="space-y-2">
+                          {friendOnlyActivity.length ? (
+                            friendOnlyActivity.map((entry) => (
+                              <div key={entry.id} className="rounded-2xl bg-neutral-950/75 border border-white/10 p-3 sm:p-4">
+                                <div className="flex items-start justify-between gap-3">
+                                  <div className="min-w-0 flex-1">
+                                    <div className="text-sm text-neutral-200">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setSelectedFriendProfileId(entry.actorId);
+                                          setFriendProfileView("all");
+                                          setFriendProfileQuery("");
+                                          setFriendProfileMobileTab("profile");
+                                        }}
+                                        className="font-semibold hover:text-white"
+                                      >
+                                        {entry.actorName}
+                                      </button>{" "}
+                                      <span className="text-neutral-400">
+                                        {entry.status === "completed"
+                                          ? "completed"
+                                          : entry.status === "in_progress"
+                                          ? "updated"
+                                          : entry.status === "planned"
+                                          ? "planned"
+                                          : "dropped"}
+                                      </span>{" "}
+                                      <span className="font-medium">{entry.itemTitle}</span>
+                                    </div>
+                                    <div className="text-[11px] text-neutral-500 mt-1">
+                                      {TYPE_LABEL[entry.itemType]} • {new Date(entry.date).toLocaleString()}{entry.favorite ? " • Favorite" : ""}
+                                    </div>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedFriendProfileId(entry.actorId);
+                                      setFriendProfileView("all");
+                                      setFriendProfileQuery("");
+                                      setFriendProfileMobileTab("library");
+                                    }}
+                                    className="shrink-0 text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                                  >
+                                    Library
+                                  </button>
+                                </div>
+                              </div>
+                            ))
+                          ) : (
+                            <EmptyState title="No visible friend activity yet" message="Public updates from your friends will appear here." />
+                          )}
+                        </div>
+                      </Panel>
+                    </div>
+                  ) : null}
+                </>
+              )}
+            </div>
+          ) : null}
+
+          {/* FEED PAGE */}
+          {view === "feed" ? (
+            <div className="space-y-4 max-w-5xl mx-auto">
+              <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 text-center sm:text-left">
+                <div>
+                  <div className="text-lg font-semibold text-neutral-200">Activity Feed</div>
+                  <div className="text-sm text-neutral-500">
+                    Latest activity from you and any friends your current RLS rules allow you to view.
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={loadFriendActivity}
+                  className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+                >
+                  Refresh feed
+                </button>
+              </div>
+
+              <Panel title="Latest activity" right={<span className="text-xs text-neutral-500">{friendActivityStatus}</span>}>
+                <div className="space-y-2">
+                  {activityFeed.length ? (
+                    activityFeed.map((a) => (
+                      <div key={a.id} className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="text-sm text-neutral-200 truncate">
+                              <span className="font-medium">{a.actorName}</span>{" "}
+                              {a.status === "completed"
+                                ? "completed"
+                                : a.status === "in_progress"
+                                ? "started / updated"
+                                : a.status === "planned"
+                                ? "planned"
+                                : "dropped"}{" "}
+                              <span className="font-medium">{a.itemTitle}</span>
+                            </div>
+                            <div className="text-[11px] text-neutral-500 mt-1">
+                              {TYPE_LABEL[a.itemType]} • {new Date(a.date).toLocaleString()}
+                              {a.favorite ? " • Favorite" : ""}
+                            </div>
+                          </div>
+                          <div className="text-xs text-neutral-500 capitalize">{a.status.replace("_", " ")}</div>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-sm text-neutral-500">No activity yet.</div>
+                  )}
+                </div>
+              </Panel>
+            </div>
+          ) : null}
+
+          {/* DISCOVER PAGE */}
+          {view === "discover" ? (
+            <div className="space-y-4 max-w-5xl mx-auto">
+              <div className="text-center sm:text-left">
+                <div className="text-lg font-semibold text-neutral-200">Discover</div>
+                <div className="text-sm text-neutral-500">
+                  Browse movies and TV by genre, then add anything directly to Planned.
+                </div>
+              </div>
+
+              <Panel title="Browse TMDB">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <Select
+                    label="Type"
+                    value={discoverType}
+                    onChange={(v) => {
+                      setDiscoverType(v as "movie" | "tv");
+                      setDiscoverGenreId("all");
+                      setDiscoverResults([]);
+                    }}
+                    options={[
+                      { value: "movie", label: "Movies" },
+                      { value: "tv", label: "TV" },
+                    ]}
+                  />
+
+                  <Select
+                    label="Genre"
+                    value={discoverGenreId}
+                    onChange={setDiscoverGenreId}
+                    options={[
+                      { value: "all", label: "All genres" },
+                      ...discoverGenres.map((g) => ({ value: String(g.id), label: g.name })),
+                    ]}
+                  />
+
+                  <label className="block">
+                    <div className="text-xs text-neutral-400 mb-1">Search</div>
+                    <button
+                      type="button"
+                      onClick={browseDiscover}
+                      className="w-full h-[42px] px-4 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
+                    >
+                      Browse
+                    </button>
+                  </label>
+                </div>
+
+                {discoverStatus ? <div className="text-xs text-neutral-400 mt-3">{discoverStatus}</div> : null}
+
+                {discoverResults.length ? (
+                  <div className="mt-5 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+                    {discoverResults.map((card) => (
+                      <div key={`${card.type}:${card.id}`} className="rounded-2xl bg-neutral-950 border border-neutral-800 overflow-hidden">
+                        <div className="aspect-[2/3] bg-neutral-900">
+                          {card.posterUrl ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img src={card.posterUrl} alt={card.title} className="w-full h-full object-cover" />
+                          ) : (
+                            <div className="w-full h-full grid place-items-center text-xs text-neutral-600">No cover</div>
+                          )}
+                        </div>
+                        <div className="p-3 space-y-2">
+                          <div className="text-sm font-medium text-neutral-200 line-clamp-2">{card.title}</div>
+                          <div className="text-[11px] text-neutral-500">
+                            {TYPE_LABEL[card.type]}{card.year ? ` • ${card.year}` : ""}
+                          </div>
+                          {card.tags?.length ? <div className="text-[11px] text-neutral-500 line-clamp-1">{card.tags.join(" • ")}</div> : null}
+                          <button
+                            type="button"
+                            onClick={() => addDiscoverItem(card)}
+                            className="w-full text-xs px-3 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/25 hover:bg-emerald-500/20"
+                          >
+                            Add planned
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
                 ) : null}
-              </div>
+              </Panel>
             </div>
-          </div>
-        ) : null}
+          ) : null}
 
-        {/* FRIENDS PAGE */}
-        {view === "friends" ? (
-          <div className="space-y-4 max-w-5xl mx-auto">
-            {/* Top bar (matches main pages vibe) */}
-            <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 text-center sm:text-left">
-              <div>
-                <div className="text-lg font-semibold text-neutral-200">Friends</div>
+          {/* FEEDBACK PAGE */}
+          {view === "feedback" ? (
+            <div className="space-y-4 max-w-5xl mx-auto">
+              <div className="text-center sm:text-left">
+                <div className="text-lg font-semibold text-neutral-200">Suggestions / Problems</div>
                 <div className="text-sm text-neutral-500">
-                  Add friends, customize their names, and browse what they are watching.
+                  Save feedback the moment you notice it. This uses your existing media_items.data JSON.
                 </div>
               </div>
 
-              <button
-                type="button"
-                onClick={() => {
-                  loadIncomingFriendRequests(undefined, { autoAccept: true });
-                  loadFriends();
-                  loadFriendActivity();
-                }}
-                className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-              >
-                Refresh
-              </button>
-            </div>
+              <Panel title="Submit feedback">
+                <form onSubmit={submitFeedback} className="space-y-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-[180px_minmax(0,1fr)] gap-3">
+                    <Select
+                      label="Type"
+                      value={feedbackType}
+                      onChange={(v) => setFeedbackType(v as "suggestion" | "problem")}
+                      options={[
+                        { value: "suggestion", label: "Suggestion" },
+                        { value: "problem", label: "Problem" },
+                      ]}
+                    />
+                    <TextArea
+                      label="What did you notice?"
+                      value={feedbackText}
+                      onChange={setFeedbackText}
+                      placeholder="Write the idea, bug, or problem here..."
+                    />
+                  </div>
 
-            {/* Search + Tabs (same control style as main) */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
-              <input
-                value={friendsQuery}
-                onChange={(e) => setFriendsQuery(e.target.value)}
-                placeholder="Search friends, display names, tags, or requests..."
-                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
-              />
+                  <button type="submit" className="px-4 py-2 rounded-xl stack-good hover:opacity-95">
+                    Save feedback
+                  </button>
+                </form>
+              </Panel>
 
-              <div className="flex items-center gap-2 justify-center sm:justify-end">
-                <button
-                  type="button"
-                  onClick={() => setFriendsTab("friends")}
-                  className={[
-                    "px-3 py-2 rounded-xl border text-sm transition",
-                    friendsTab === "friends"
-                      ? "bg-white/15 border-white/20"
-                      : "bg-white/5 border-white/10 hover:bg-white/10",
-                  ].join(" ")}
-                >
-                  Friends <span className="text-xs text-neutral-500 ml-1">({friendsList.length})</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setFriendsTab("requests")}
-                  className={[
-                    "px-3 py-2 rounded-xl border text-sm transition",
-                    friendsTab === "requests"
-                      ? "bg-white/15 border-white/20"
-                      : "bg-white/5 border-white/10 hover:bg-white/10",
-                  ].join(" ")}
-                >
-                  Requests <span className="text-xs text-neutral-500 ml-1">({incomingRequests.length})</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Send request panel (same surface look) */}
-            <div className="rounded-3xl bg-neutral-950/68 ring-1 ring-white/10 shadow-xl shadow-black/10 backdrop-blur-xl p-4 sm:p-6">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-medium text-neutral-200">Add a friend</div>
-                  <div className="text-xs text-neutral-500">Enter their Stack username or display name</div>
-                </div>
-              </div>
-
-              <div className="mt-3 flex flex-col sm:flex-row gap-2">
-                <input
-                  value={inputUsername}
-                  onChange={(e) => setInputUsername(e.target.value)}
-                  placeholder="Enter username or display name (e.g., OGChump or Norey)"
-                  className="flex-1 rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
-                />
-                <button
-                  type="button"
-                  onClick={sendFriendRequest}
-                  className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-                >
-                  Send request
-                </button>
-              </div>
-
-              {friendStatus ? <div className="mt-3 text-sm text-neutral-300">{friendStatus}</div> : null}
-            </div>
-
-            {/* List panel (table header row like main pages) */}
-            <div className="rounded-3xl bg-neutral-950/68 ring-1 ring-white/10 shadow-xl shadow-black/10 backdrop-blur-xl p-4 sm:p-6">
-              <div className="flex items-center justify-between gap-3">
-                <div className="text-sm font-medium text-neutral-200">
-                  {friendsTab === "friends" ? "Your friends" : "Incoming requests"}
-                </div>
-                <div className="text-xs text-neutral-500">
-                  {friendsTab === "friends" ? filteredFriendsList.length : filteredIncomingRequests.length}
-                </div>
-              </div>
-
-              <div className="mt-3 hidden sm:grid grid-cols-[minmax(0,1fr)_minmax(180px,240px)] gap-3 px-3 py-2 rounded-xl bg-neutral-950/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
-                <div>{friendsTab === "friends" ? "Friend" : "Requester"}</div>
-                <div className="text-right">Actions</div>
-              </div>
-
-              <div className="mt-2 space-y-2">
-                {friendsTab === "friends" ? (
-                  filteredFriendsList.length ? (
-                    filteredFriendsList.map((f) => {
-                      const display = getFriendDisplay(f.friend_id, f.friend);
-
-                      return (
-                        <div
-                          key={f.friend_id}
-                          className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm"
-                        >
-                          <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(220px,280px)] gap-3 items-center">
-                            <div className="min-w-0">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setSelectedFriendProfileId(f.friend_id);
-                                  setFriendProfileView("all");
-                                  setFriendProfileQuery("");
-                                  setFriendProfileMobileTab("profile");
-                                }}
-                                className="text-sm text-neutral-200 hover:text-neutral-50 truncate text-left max-w-full"
-                              >
-                                {display.primary}
-                              </button>
-                              <div className="text-[11px] text-neutral-600 truncate">{display.secondary}</div>
-                              {display.hasCustomTag ? (
-                                <div className="text-[11px] text-emerald-300/80 mt-1">Showing your nickname first</div>
-                              ) : null}
+              <Panel title="Saved feedback" right={<span className="text-xs text-neutral-500">{feedbackEntries.length}</span>}>
+                <div className="space-y-2">
+                  {feedbackEntries.length ? (
+                    feedbackEntries.map((f) => (
+                      <div key={f.id} className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs text-neutral-500 mb-1">
+                              {f.type === "problem" ? "Problem" : "Suggestion"} • {new Date(f.createdAt).toLocaleString()}
                             </div>
-
-                            <div className="sm:justify-self-end w-full sm:w-[260px] space-y-2">
-                              <label className="block">
-                                <div className="text-[11px] text-neutral-500 mb-1">Custom friend tag</div>
-                                <input
-                                  value={settings.friendNicknames?.[f.friend_id] ?? ""}
-                                  onChange={(e) => updateFriendNickname(f.friend_id, e.target.value)}
-                                  placeholder="Nickname / ID tag"
-                                  className="w-full rounded-lg bg-neutral-900 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
-                                />
-                              </label>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setSelectedFriendProfileId(f.friend_id);
-                                  setFriendProfileView("all");
-                                  setFriendProfileQuery("");
-                                  setFriendProfileMobileTab("profile");
-                                }}
-                                className="w-full text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-200"
-                              >
-                                View profile
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => removeFriend(f.friend_id)}
-                                className="w-full text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 text-neutral-200"
-                              >
-                                Remove friend
-                              </button>
-                            </div>
+                            <div className="text-sm text-neutral-200 whitespace-pre-wrap">{f.message}</div>
                           </div>
-                        </div>
-                      );
-                    })
-                  ) : (
-                    <div className="text-xs text-neutral-500 mt-2">No friends yet.</div>
-                  )
-                ) : filteredIncomingRequests.length ? (
-                  filteredIncomingRequests.map((r) => (
-                    <div
-                      key={r.id}
-                      className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm"
-                    >
-                      <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(180px,240px)] gap-3 items-center">
-                        <div className="min-w-0">
-                          <div className="text-sm text-neutral-200 truncate">
-                            {r.requester?.username ?? r.requester_id}
-                          </div>
-                          <div className="text-[11px] text-neutral-600 truncate">{r.requester_id}</div>
-                        </div>
-
-                        <div className="flex items-center gap-2 sm:justify-end">
                           <button
                             type="button"
-                            onClick={() => acceptFriendRequest(r.id, r.requester_id)}
-                            className="text-xs px-3 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 hover:bg-emerald-500/25"
-                          >
-                            Accept
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => declineFriendRequest(r.id)}
+                            onClick={() => setFeedbackEntries((prev) => prev.filter((x) => x.id !== f.id))}
                             className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
                           >
-                            Decline
+                            Remove
                           </button>
                         </div>
                       </div>
-                    </div>
-                  ))
-                ) : (
-                  <div className="text-xs text-neutral-500 mt-2">No incoming requests.</div>
-                )}
-              </div>
-            </div>
-
-            {selectedFriendProfile ? (
-              <Panel
-                title={`${selectedFriendProfile.display.primary}'s profile`}
-                right={
-                  <button
-                    type="button"
-                    onClick={() => setSelectedFriendProfileId(null)}
-                    className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                  >
-                    Close profile
-                  </button>
-                }
-              >
-                <div className="sm:hidden grid grid-cols-3 gap-2 mb-4 rounded-2xl stack-mobile-readable-surface border border-white/10 p-2">
-                  {(["profile", "library", "stats"] as const).map((tab) => (
-                    <button
-                      key={tab}
-                      type="button"
-                      onClick={() => setFriendProfileMobileTab(tab)}
-                      className={[
-                        "px-3 py-2 rounded-xl border text-xs capitalize transition",
-                        friendProfileMobileTab === tab
-                          ? "bg-white/15 border-white/25 text-neutral-50"
-                          : "bg-white/5 border-white/10 text-neutral-300",
-                      ].join(" ")}
-                    >
-                      {tab}
-                    </button>
-                  ))}
-                </div>
-
-                <div className={["rounded-2xl bg-neutral-950/60 border border-white/10 p-4 mb-4", friendProfileMobileTab === "library" ? "hidden sm:block" : ""].join(" ")}>
-                  <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="text-xl font-semibold text-neutral-100 truncate">
-                        {selectedFriendProfile.settings.displayName?.trim() || selectedFriendProfile.display.baseName}
-                      </div>
-                      <div className="text-xs text-neutral-500 mt-1 truncate">
-                        {selectedFriendProfile.display.idTag || selectedFriendProfile.friend.friend?.username || selectedFriendProfile.id}
-                      </div>
-                    </div>
-                    <div className="text-xs text-neutral-500 sm:text-right">
-                      {selectedFriendProfile.items.length} visible item{selectedFriendProfile.items.length === 1 ? "" : "s"}
-                    </div>
-                  </div>
-
-                  <div className="mt-3 text-sm text-neutral-300 whitespace-pre-wrap">
-                    {selectedFriendProfile.settings.showProfileBioToFriends === false
-                      ? "Profile description hidden by this user."
-                      : selectedFriendProfile.settings.profileBio?.trim() || "No profile description yet."}
-                  </div>
-
-                  <div className="grid grid-cols-2 lg:grid-cols-5 gap-2 mt-4">
-                    <MiniStat label="Visible" value={String(selectedFriendProfileStats.total)} sub="items" />
-                    <MiniStat label="Completed" value={String(selectedFriendProfileStats.completed)} sub="finished" />
-                    <MiniStat label="In progress" value={String(selectedFriendProfileStats.inProgress)} sub="active" />
-                    <MiniStat
-                      label="Average"
-                      value={selectedFriendProfile.settings.showRatingsToFriends === false ? "Hidden" : formatRatingValue(selectedFriendProfileStats.avgRating, settings.ratingFormat)}
-                      sub="rating"
-                    />
-                    <MiniStat
-                      label="Top genre"
-                      value={selectedFriendProfile.settings.showTagsToFriends === false ? "Hidden" : selectedFriendProfileStats.topGenre}
-                      sub={selectedFriendProfile.settings.showTagsToFriends === false ? "tags" : `${selectedFriendProfileStats.topGenreCount}`}
-                    />
-                  </div>
-                </div>
-
-                <div className={["rounded-2xl bg-neutral-950/60 border border-white/10 p-4 mb-4", friendProfileMobileTab === "stats" ? "" : "hidden sm:block"].join(" ")}>
-                  <div className="flex items-center justify-between gap-3 mb-3">
-                    <div>
-                      <div className="text-sm font-medium text-neutral-200">Comparison with your Stack</div>
-                      <div className="text-xs text-neutral-500">Based only on visible public titles and tags.</div>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
-                    <MiniStat label="Both completed" value={String(selectedFriendComparison.bothCompleted)} sub="same titles" />
-                    <MiniStat label="Both planned" value={String(selectedFriendComparison.bothPlanned)} sub="same titles" />
-                    <MiniStat label="Both active" value={String(selectedFriendComparison.bothInProgress)} sub="in progress" />
-                    <MiniStat label="Shared genres" value={selectedFriendComparison.sharedTopTags} sub="top overlap" />
-                    <MiniStat label="Friend top type" value={selectedFriendComparison.friendTopType} sub="visible library" />
-                  </div>
-                </div>
-
-                <div className={["space-y-4", friendProfileMobileTab === "library" ? "" : "hidden sm:block"].join(" ")}>
-                <div className="flex flex-wrap gap-2 mb-4">
-                  <button
-                    type="button"
-                    onClick={() => setFriendProfileView("all")}
-                    className={[
-                      "px-3 py-2 rounded-xl border text-xs transition",
-                      friendProfileView === "all" ? "bg-white/15 border-white/25" : "bg-white/5 border-white/10 hover:bg-white/10",
-                    ].join(" ")}
-                  >
-                    All
-                  </button>
-                  {STATUSES.map((status) => (
-                    <button
-                      key={status.id}
-                      type="button"
-                      onClick={() => setFriendProfileView(status.id)}
-                      className={[
-                        "px-3 py-2 rounded-xl border text-xs transition",
-                        friendProfileView === status.id ? "bg-white/15 border-white/25" : "bg-white/5 border-white/10 hover:bg-white/10",
-                      ].join(" ")}
-                    >
-                      {status.label}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(180px,240px)_auto] gap-3 items-end mb-4">
-                  <label className="block">
-                    <div className="text-xs text-neutral-400 mb-1">Search</div>
-                    <input
-                      value={friendProfileQuery}
-                      onChange={(e) => setFriendProfileQuery(e.target.value)}
-                      placeholder="Search this friend's titles, notes, or tags..."
-                      className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
-                    />
-                  </label>
-
-                  <Select
-                    label="Sort"
-                    value={friendProfileSortMode}
-                    onChange={(v) => setFriendProfileSortMode(v as SortMode)}
-                    options={[
-                      { value: "newest", label: "Newest first" },
-                      { value: "oldest", label: "Oldest first" },
-                      { value: "title", label: "Title (A–Z)" },
-                      { value: "rating_high", label: "Rating (high → low)" },
-                      { value: "rating_low", label: "Rating (low → high)" },
-                      { value: "updated", label: "Last updated" },
-                      { value: "favorites", label: "Favorites first" },
-                    ]}
-                  />
-
-                  <div className="sm:pb-0">
-                    <Toggle label="Board view" checked={friendProfileBoardView} onChange={setFriendProfileBoardView} />
-                  </div>
-                </div>
-
-                {friendProfileFilteredItems.length ? (
-                  friendProfileBoardView && friendProfileView === "all" ? (
-                    <FriendReadOnlyBoardView
-                      items={friendProfileFilteredItems}
-                      ratingFormat={settings.ratingFormat ?? "ten"}
-                      privacy={profilePrivacyFromSettings(selectedFriendProfile.settings)}
-                    />
+                    ))
                   ) : (
-                    <div className="space-y-5">
-                      {(friendProfileView === "all"
-                        ? STATUSES.map((status) => ({ ...status, items: friendProfileByStatus[status.id] }))
-                        : [
-                            {
-                              id: friendProfileView,
-                              label: STATUSES.find((status) => status.id === friendProfileView)?.label ?? "Items",
-                              items: friendProfileFilteredItems,
-                            },
-                          ]
-                      ).map((section) =>
-                        section.items.length ? (
-                          <section key={section.id} className="space-y-2">
-                            <div className="text-sm text-neutral-300">{section.label}</div>
-                            <div className="space-y-3">
-                              {section.items.map((item) => (
-                                <FriendReadOnlyRow
-                                  key={item.id}
-                                  item={item}
-                                  ratingFormat={settings.ratingFormat ?? "ten"}
-                                  privacy={profilePrivacyFromSettings(selectedFriendProfile.settings)}
-                                />
-                              ))}
-                            </div>
-                          </section>
-                        ) : null
-                      )}
-                    </div>
-                  )
-                ) : (
-                  <div className="text-sm text-neutral-500">No visible items match this profile filter. Private items stay hidden.</div>
-                )}
+                    <div className="text-sm text-neutral-500">No feedback saved yet.</div>
+                  )}
                 </div>
               </Panel>
-            ) : null}
 
-            <Panel
-              title="Friend media library"
-              right={<span className="text-xs text-neutral-500">{friendActivityStatus}</span>}
-            >
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <Select
-                  label="Friend"
-                  value={friendLibraryFriendId}
-                  onChange={setFriendLibraryFriendId}
-                  options={[
-                    { value: "all", label: "All friends" },
-                    ...friendsList.map((f) => {
-                      const display = getFriendDisplay(f.friend_id, f.friend);
-                      return { value: f.friend_id, label: display.primary };
-                    }),
-                  ]}
-                />
+              {isAdminUser ? (
+                <Panel
+                  title="Admin feedback inbox"
+                  right={
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-neutral-500">{adminFeedbackStatus}</span>
+                      <button
+                        type="button"
+                        onClick={loadAdminFeedback}
+                        className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                      >
+                        Refresh
+                      </button>
+                    </div>
+                  }
+                >
+                  <div className="text-xs text-neutral-500 mb-3">
+                    Only the admin account shows this section. It gathers saved Suggestions / Problems from visible Stack data.
+                  </div>
 
-                <Select
-                  label="Status"
-                  value={friendLibraryStatus}
-                  onChange={(v) => setFriendLibraryStatus(v as FriendLibraryStatusFilter)}
-                  options={[
-                    { value: "all", label: "All statuses" },
-                    { value: "completed", label: "Completed" },
-                    { value: "in_progress", label: "In Progress" },
-                    { value: "planned", label: "Planned" },
-                    { value: "dropped", label: "Dropped" },
-                  ]}
+                  <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,220px)_auto] gap-3 items-end mb-4">
+                    <Select
+                      label="Admin filter"
+                      value={adminFeedbackFilter}
+                      onChange={(v) => setAdminFeedbackFilter(v as typeof adminFeedbackFilter)}
+                      options={[
+                        { value: "all", label: "All feedback" },
+                        { value: "suggestion", label: "Suggestions only" },
+                        { value: "problem", label: "Problems only" },
+                        { value: "new", label: "New" },
+                        { value: "reviewed", label: "Reviewed" },
+                        { value: "done", label: "Done" },
+                      ]}
+                    />
+                    <Toggle label="Hide done" checked={adminHideDone} onChange={setAdminHideDone} />
+                  </div>
+
+                  <div className="space-y-2">
+                    {filteredAdminFeedbackRows.length ? (
+                      filteredAdminFeedbackRows.map((f) => (
+                        <div key={`${f.userId}:${f.id}`} className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div className="min-w-0 flex-1">
+                              <div className="text-xs text-neutral-500 mb-1">
+                                {f.type === "problem" ? "Problem" : "Suggestion"} • {(f.status ?? "new").toUpperCase()} • {new Date(f.createdAt).toLocaleString()}
+                              </div>
+                              <div className="text-[11px] text-neutral-600 mb-2 truncate">
+                                From: {f.userLabel} • {f.userId}
+                              </div>
+                              <div className="text-sm text-neutral-200 whitespace-pre-wrap">{f.message}</div>
+                            </div>
+                            <div className="flex flex-wrap gap-2 sm:justify-end">
+                              <button
+                                type="button"
+                                onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "new")}
+                                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                              >
+                                New
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "reviewed")}
+                                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                              >
+                                Reviewed
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "done")}
+                                className="text-xs px-3 py-2 rounded-xl stack-good hover:opacity-95"
+                              >
+                                Done
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="text-sm text-neutral-500">No submitted feedback matches this filter yet.</div>
+                    )}
+                  </div>
+                </Panel>
+              ) : null}
+            </div>
+          ) : null}
+
+          {/* SETTINGS PAGE */}
+          {view === "settings" ? (
+            <div className="space-y-5 max-w-6xl mx-auto">
+              <div className="relative overflow-hidden rounded-[2rem] stack-accent border border-white/10 shadow-2xl shadow-black/20">
+                {bannerImageUrl ? (
+                  <div
+                    aria-hidden="true"
+                    className="absolute inset-0 bg-cover bg-center opacity-45"
+                    style={{ backgroundImage: `url(${JSON.stringify(bannerImageUrl)})` }}
+                  />
+                ) : null}
+                <div className="absolute inset-0 bg-gradient-to-r from-black/65 via-black/35 to-transparent pointer-events-none" />
+                <div className="relative p-5 sm:p-8">
+                  <div className="stack-section-kicker">Personal control center</div>
+                  <h2 className="text-3xl sm:text-4xl font-semibold tracking-tight text-neutral-50 mt-1">Settings</h2>
+                  <p className="text-sm text-neutral-300/80 mt-2 max-w-2xl">
+                    Personalize how Stack looks and behaves without changing the production database schema.
+                  </p>
+                </div>
+              </div>
+
+              <div
+                className="stack-settings-tabs rounded-2xl stack-surface border border-white/10 p-2 overflow-x-auto"
+                style={{ gridTemplateColumns: `repeat(${isAdminUser ? 5 : 4}, minmax(120px, 1fr))` }}
+              >
+                {[
+                  { id: "profile" as const, label: "Profile" },
+                  { id: "appearance" as const, label: "Appearance" },
+                  { id: "privacy" as const, label: "Privacy" },
+                  { id: "behavior" as const, label: "Behavior" },
+                  ...(isAdminUser ? [{ id: "admin" as const, label: "Owner" }] : []),
+                ].map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setSettingsTab(tab.id)}
+                    className={[
+                      "min-h-[44px] px-3 py-2 rounded-xl border text-xs sm:text-sm transition whitespace-nowrap",
+                      settingsTab === tab.id
+                        ? "bg-white/15 border-white/25 text-neutral-50 shadow-inner"
+                        : "bg-white/[0.035] border-white/10 text-neutral-400 hover:bg-white/10 hover:text-neutral-200",
+                    ].join(" ")}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
+              {settingsTab === "profile" ? (
+                <div className="space-y-4">
+                  <Panel title="Profile / personal info">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <Text
+                        label="Display name"
+                        value={settings.displayName ?? ""}
+                        onChange={(v) => updateSettings({ displayName: v })}
+                        helper="Used across your Stack profile and activity feed."
+                      />
+                      <Text
+                        label="Custom ID tag"
+                        value={settings.usernameTag ?? ""}
+                        onChange={(v) => updateSettings({ usernameTag: v })}
+                        helper="A Stack display tag. It does not rename profiles.username in Supabase."
+                      />
+                    </div>
+
+                    <div className="mt-3">
+                      <TextArea
+                        label="Profile bio"
+                        value={settings.profileBio ?? ""}
+                        onChange={(v) => updateSettings({ profileBio: v })}
+                        placeholder="What are you watching, reading, playing, or collecting?"
+                      />
+                    </div>
+                  </Panel>
+
+                  <Panel title="Profile banner">
+                    <Text
+                      label="Banner image URL"
+                      value={settings.bannerImageUrl ?? ""}
+                      onChange={(v) => updateSettings({ bannerImageUrl: v })}
+                      helper="Used as a decorative banner in Settings and future profile surfaces."
+                    />
+                    <div className="mt-4 overflow-hidden rounded-3xl border border-white/10 min-h-[170px] relative stack-accent">
+                      {bannerImageUrl ? (
+                        <div
+                          className="absolute inset-0 bg-cover bg-center"
+                          style={{ backgroundImage: `url(${JSON.stringify(bannerImageUrl)})` }}
+                        />
+                      ) : null}
+                      <div className="absolute inset-0 bg-gradient-to-r from-black/75 via-black/35 to-transparent" />
+                      <div className="relative p-5 sm:p-7 flex items-end min-h-[170px]">
+                        <div>
+                          <div className="stack-section-kicker">Stack profile</div>
+                          <div className="text-2xl font-semibold text-white mt-1">
+                            {settings.displayName?.trim() || settings.usernameTag?.trim() || "Your profile"}
+                          </div>
+                          <div className="text-sm text-neutral-300 mt-1 max-w-xl line-clamp-2">
+                            {settings.profileBio?.trim() || "Your bio preview will appear here."}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </Panel>
+                </div>
+              ) : null}
+
+              {settingsTab === "appearance" ? (
+                <div className="space-y-4">
+                  <Panel title="Theme studio" right={<span className="text-xs text-neutral-500">MAL-inspired customization, Stack style</span>}>
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                      <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4">
+                        <Select
+                          label="Color theme"
+                          value={settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme}
+                          onChange={(v) => updateSettings({ colorTheme: v as StackColorTheme })}
+                          options={STACK_COLOR_THEME_OPTIONS.map((t) => ({ value: t.value, label: t.label }))}
+                        />
+                        <div className="mt-3 grid grid-cols-6 gap-1.5">
+                          {STACK_COLOR_THEME_OPTIONS.map((t) => {
+                            const theme = STACK_COLOR_THEMES[t.value];
+                            return (
+                              <button
+                                key={t.value}
+                                type="button"
+                                onClick={() => updateSettings({ colorTheme: t.value })}
+                                className={[
+                                  "h-9 rounded-xl border transition",
+                                  (settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme) === t.value
+                                    ? "border-white/50 ring-2 ring-white/20"
+                                    : "border-white/10 hover:border-white/25",
+                                ].join(" ")}
+                                style={{ background: theme.accent }}
+                                title={t.label}
+                              />
+                            );
+                          })}
+                        </div>
+                        <div className="text-[11px] text-neutral-500 mt-3">
+                          {STACK_COLOR_THEME_OPTIONS.find((t) => t.value === (settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme))?.description}
+                        </div>
+                      </div>
+
+                      <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 space-y-3">
+                        <Select
+                          label="Library layout"
+                          value={settings.libraryStyle ?? DEFAULT_SETTINGS.libraryStyle}
+                          onChange={(v) => updateSettings({ libraryStyle: v as StackLibraryStyle })}
+                          options={[
+                            { value: "detailed", label: "Detailed list" },
+                            { value: "poster", label: "Poster grid" },
+                            { value: "classic", label: "Classic compact list" },
+                          ]}
+                        />
+                        <Select
+                          label="Poster size"
+                          value={settings.posterSize ?? DEFAULT_SETTINGS.posterSize}
+                          onChange={(v) => updateSettings({ posterSize: v as StackPosterSize })}
+                          options={[
+                            { value: "small", label: "Small" },
+                            { value: "medium", label: "Medium" },
+                            { value: "large", label: "Large" },
+                          ]}
+                        />
+                      </div>
+
+                      <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 space-y-3">
+                        <Select
+                          label="Surface style"
+                          value={settings.surfaceStyle ?? DEFAULT_SETTINGS.surfaceStyle}
+                          onChange={(v) => updateSettings({ surfaceStyle: v as StackSurfaceStyle })}
+                          options={[
+                            { value: "glass", label: "Glass" },
+                            { value: "solid", label: "Solid" },
+                          ]}
+                        />
+                        <Select
+                          label="Corner style"
+                          value={settings.cornerStyle ?? DEFAULT_SETTINGS.cornerStyle}
+                          onChange={(v) => updateSettings({ cornerStyle: v as StackCornerStyle })}
+                          options={[
+                            { value: "rounded", label: "Rounded" },
+                            { value: "soft", label: "Soft" },
+                            { value: "square", label: "Square" },
+                          ]}
+                        />
+                      </div>
+
+                      <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 space-y-3">
+                        <Toggle label="Compact spacing" checked={!!settings.compactMode} onChange={(v) => updateSettings({ compactMode: v })} />
+                        <Toggle label="Reduce motion" checked={!!settings.reduceMotion} onChange={(v) => updateSettings({ reduceMotion: v })} />
+                      </div>
+                    </div>
+                  </Panel>
+
+                  <Panel title="Custom background">
+                    <Text
+                      label="Background image URL"
+                      value={settings.backgroundImageUrl ?? ""}
+                      onChange={(v) => updateSettings({ backgroundImageUrl: v })}
+                      helper="A dark readability layer is always placed over the image so text remains usable."
+                    />
+                    {backgroundImageUrl ? (
+                      <div
+                        className="mt-4 min-h-[180px] rounded-3xl border border-white/10 bg-cover bg-center relative overflow-hidden"
+                        style={{ backgroundImage: `url(${JSON.stringify(backgroundImageUrl)})` }}
+                      >
+                        <div className="absolute inset-0 bg-black/55" />
+                        <div className="relative p-5 text-sm text-neutral-100">Background preview</div>
+                      </div>
+                    ) : null}
+                  </Panel>
+
+                  <Panel title="List information">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                      <Toggle label="Rating" checked={settings.showListRating !== false} onChange={(v) => updateSettings({ showListRating: v })} />
+                      <Toggle label="Type" checked={settings.showListType !== false} onChange={(v) => updateSettings({ showListType: v })} />
+                      <Toggle label="Progress" checked={settings.showListProgress !== false} onChange={(v) => updateSettings({ showListProgress: v })} />
+                      <Toggle label="Notes" checked={settings.showListNotes !== false} onChange={(v) => updateSettings({ showListNotes: v })} />
+                      <Toggle label="Tags" checked={settings.showListTags !== false} onChange={(v) => updateSettings({ showListTags: v })} />
+                    </div>
+                    <div className="text-[11px] text-neutral-500 mt-3">
+                      These are display preferences only. Hidden information stays saved in your Stack.
+                    </div>
+                  </Panel>
+                </div>
+              ) : null}
+
+              {settingsTab === "privacy" ? (
+                <div className="space-y-4">
+                  <Panel title="Friend profile privacy">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                      <Toggle
+                        label="Show bio to friends"
+                        checked={settings.showProfileBioToFriends !== false}
+                        onChange={(v) => updateSettings({ showProfileBioToFriends: v })}
+                      />
+                      <Toggle
+                        label="Show ratings to friends"
+                        checked={settings.showRatingsToFriends !== false}
+                        onChange={(v) => updateSettings({ showRatingsToFriends: v })}
+                      />
+                      <Toggle
+                        label="Show notes to friends"
+                        checked={settings.showNotesToFriends !== false}
+                        onChange={(v) => updateSettings({ showNotesToFriends: v })}
+                      />
+                      <Toggle
+                        label="Show tags to friends"
+                        checked={settings.showTagsToFriends !== false}
+                        onChange={(v) => updateSettings({ showTagsToFriends: v })}
+                      />
+                    </div>
+                    <div className="text-[11px] text-neutral-500 mt-3">
+                      Private items are always hidden from friends. These controls decide what details friends see on public items.
+                    </div>
+                  </Panel>
+
+                  <Panel
+                    title="Preview what friends can see"
+                    right={
+                      <button
+                        type="button"
+                        onClick={() => setOwnFriendPreviewOpen((prev) => !prev)}
+                        className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                      >
+                        {ownFriendPreviewOpen ? "Hide preview" : "Show preview"}
+                      </button>
+                    }
+                  >
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
+                      <MiniStat label="Visible" value={String(ownFriendPreviewStats.total)} sub="items" />
+                      <MiniStat label="Completed" value={String(ownFriendPreviewStats.completed)} sub="finished" />
+                      <MiniStat label="In progress" value={String(ownFriendPreviewStats.inProgress)} sub="active" />
+                      <MiniStat
+                        label="Average"
+                        value={settings.showRatingsToFriends === false ? "Hidden" : formatRatingValue(ownFriendPreviewStats.avgRating, settings.ratingFormat)}
+                        sub="rating"
+                      />
+                      <MiniStat
+                        label="Top genre"
+                        value={settings.showTagsToFriends === false ? "Hidden" : ownFriendPreviewStats.topGenre}
+                        sub={settings.showTagsToFriends === false ? "tags" : `${ownFriendPreviewStats.topGenreCount}`}
+                      />
+                    </div>
+
+                    {ownFriendPreviewOpen ? (
+                      <div className="mt-4 space-y-3">
+                        <div className="rounded-2xl bg-neutral-950/70 border border-white/10 px-3 py-3 text-sm text-neutral-300 whitespace-pre-wrap">
+                          {settings.showProfileBioToFriends === false
+                            ? "Profile description hidden."
+                            : settings.profileBio?.trim() || "No profile description yet."}
+                        </div>
+
+                        {ownFriendPreviewItems.length ? (
+                          ownFriendPreviewItems.slice(0, 5).map((item) => (
+                            <FriendReadOnlyRow
+                              key={`preview:${item.id}`}
+                              item={item}
+                              ratingFormat={settings.ratingFormat ?? "ten"}
+                              privacy={profilePrivacyFromSettings(settings)}
+                            />
+                          ))
+                        ) : (
+                          <div className="text-sm text-neutral-500">
+                            Friends would not see any items yet because your items are private or your Stack is empty.
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-neutral-500 mt-3">Open this to see your Stack the way a friend would see it.</div>
+                    )}
+                  </Panel>
+                </div>
+              ) : null}
+
+              {settingsTab === "behavior" ? (
+                <Panel title="Site preferences">
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
+                    <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px]">
+                      <Select
+                        label="Rating display"
+                        value={settings.ratingFormat ?? "ten"}
+                        onChange={(v) => updateSettings({ ratingFormat: v as RatingFormat })}
+                        options={[
+                          { value: "ten", label: "10-point scale" },
+                          { value: "five", label: "5-point scale" },
+                          { value: "stars", label: "Stars" },
+                          { value: "percent", label: "Percent" },
+                        ]}
+                      />
+                      <div className="text-[11px] text-neutral-500 mt-3">
+                        Ratings are still saved as 0–10 internally. Current display: {ratingFormatLabel(settings.ratingFormat)}.
+                      </div>
+                    </div>
+
+                    <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
+                      <Select
+                        label="Default add status"
+                        value={settings.defaultAddStatus ?? DEFAULT_SETTINGS.defaultAddStatus}
+                        onChange={(v) => {
+                          const nextStatus = v as Status;
+                          updateSettings({ defaultAddStatus: nextStatus });
+                          if (!String(form.title || "").trim()) setForm((prev) => ({ ...prev, status: nextStatus }));
+                        }}
+                        options={[
+                          { value: "completed", label: "Completed" },
+                          { value: "in_progress", label: "In Progress" },
+                          { value: "planned", label: "Planned" },
+                          { value: "dropped", label: "Dropped" },
+                        ]}
+                      />
+                      <div className="text-[11px] text-neutral-500">New items start with this status unless you change it.</div>
+                    </div>
+
+                    <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
+                      <Select
+                        label="Default All page view"
+                        value={settings.defaultBoardView ?? DEFAULT_SETTINGS.defaultBoardView}
+                        onChange={(v) => {
+                          const nextView = v as "board" | "list";
+                          updateSettings({ defaultBoardView: nextView });
+                          setBoardView(nextView === "board");
+                        }}
+                        options={[
+                          { value: "board", label: "Board view" },
+                          { value: "list", label: "Library view" },
+                        ]}
+                      />
+                    </div>
+
+                    <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
+                      <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3 items-end">
+                        <div>
+                          <div className="text-xs text-neutral-400 mb-1">Sound effects</div>
+                          <Toggle
+                            label="Hover/click sounds"
+                            checked={!!settings.soundEffects}
+                            onChange={(v) => updateSettings({ soundEffects: v })}
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => playStackSoundEffect("click", settings.soundVolume ?? 1)}
+                          className="h-[42px] px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm"
+                        >
+                          Test sound
+                        </button>
+                      </div>
+
+                      <label className="block">
+                        <div className="flex items-center justify-between gap-3 text-xs text-neutral-400 mb-1">
+                          <span>Sound volume</span>
+                          <span className="text-neutral-500">{Math.round((settings.soundVolume ?? 1) * 100)}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0.25"
+                          max="3"
+                          step="0.05"
+                          value={settings.soundVolume ?? 1}
+                          onChange={(e) => updateSettings({ soundVolume: Number(e.target.value) })}
+                          className="w-full accent-emerald-500"
+                        />
+                      </label>
+                    </div>
+                  </div>
+                </Panel>
+              ) : null}
+
+              {settingsTab === "admin" && isAdminUser ? (
+                <OwnerAdminDashboard
+                  overview={adminOverview}
+                  status={adminOverviewStatus}
+                  members={filteredAdminMembers}
+                  selectedMember={selectedAdminMember}
+                  query={adminMemberQuery}
+                  onQueryChange={setAdminMemberQuery}
+                  onSelectMember={setSelectedAdminMemberId}
+                  onRefresh={loadAdminOverview}
+                  ratingFormat={settings.ratingFormat ?? "ten"}
                 />
+              ) : null}
+            </div>
+          ) : null}
+
+          {/* LIST PAGES */}
+          {view !== "stats" && view !== "add" && view !== "friends" && view !== "feed" && view !== "discover" && view !== "feedback" && view !== "settings" ? (
+            <div className={view === "all" && boardView ? "space-y-4" : "space-y-4 max-w-5xl mx-auto"}>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
+                <label className="block">
+                  <div className="text-xs text-neutral-400 mb-1">Search</div>
+                  <input
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search title, notes, tags..."
+                    className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
+                  />
+                </label>
 
                 <Select
                   label="Sort"
-                  value={friendLibrarySortMode}
-                  onChange={(v) => setFriendLibrarySortMode(v as SortMode)}
+                  value={sortMode}
+                  onChange={(v) => setSortMode(v as SortMode)}
                   options={[
                     { value: "newest", label: "Newest first" },
                     { value: "oldest", label: "Oldest first" },
@@ -5200,710 +7355,80 @@ async function pickForMe(mode: "best" | "random" = "best") {
                 />
               </div>
 
-              <div className="mt-4 space-y-2">
-                {friendLibraryItems.length ? (
-                  friendLibraryItems.map((item) => (
-                    <div
-                      key={`${item.__ownerId}:${item.id}`}
-                      className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm"
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div className="min-w-0 flex-1">
-                          <div className="text-sm text-neutral-200 truncate">
-                            <span className="font-medium">{item.title}</span>
-                          </div>
-                          <div className="text-[11px] text-neutral-500 mt-1">
-                            {item.__ownerName} • {TYPE_LABEL[item.type]} • {item.status.replace("_", " ")}
-                            {friendSettingsById.get(item.__ownerId)?.showRatingsToFriends === false
-                              ? ""
-                              : item.rating !== undefined
-                              ? ` • ${formatRatingValue(item.rating, settings.ratingFormat)}`
-                              : ""}
-                            {item.favorite ? " • Favorite" : ""}
-                          </div>
-                          {friendSettingsById.get(item.__ownerId)?.showTagsToFriends !== false && item.tags?.length ? (
-                            <div className="text-[11px] text-neutral-600 mt-1 truncate">{item.tags.join(" • ")}</div>
-                          ) : null}
-                        </div>
-
-                        <div className="text-[11px] text-neutral-600 whitespace-nowrap">
-                          Updated {new Date(item.updatedAt ?? item.createdAt).toLocaleDateString()}
-                        </div>
-                      </div>
-                    </div>
-                  ))
-                ) : (
-                  <div className="text-sm text-neutral-500">
-                    No visible friend items match this filter yet. Private items stay hidden.
-                  </div>
-                )}
-              </div>
-            </Panel>
-          </div>
-        ) : null}
-
-        {/* FEED PAGE */}
-        {view === "feed" ? (
-          <div className="space-y-4 max-w-5xl mx-auto">
-            <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 text-center sm:text-left">
-              <div>
-                <div className="text-lg font-semibold text-neutral-200">Activity Feed</div>
-                <div className="text-sm text-neutral-500">Latest activity from you and any friends your current RLS rules allow you to view.</div>
-              </div>
-
-              <button
-                type="button"
-                onClick={loadFriendActivity}
-                className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-              >
-                Refresh feed
-              </button>
-            </div>
-
-            <Panel title="Latest activity" right={<span className="text-xs text-neutral-500">{friendActivityStatus}</span>}>
-              <div className="space-y-2">
-                {activityFeed.length ? (
-                  activityFeed.map((a) => (
-                    <div key={a.id} className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm">
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="text-sm text-neutral-200 truncate">
-                            <span className="font-medium">{a.actorName}</span> {a.status === "completed" ? "completed" : a.status === "in_progress" ? "started / updated" : a.status === "planned" ? "planned" : "dropped"} <span className="font-medium">{a.itemTitle}</span>
-                          </div>
-                          <div className="text-[11px] text-neutral-500 mt-1">
-                            {TYPE_LABEL[a.itemType]} • {new Date(a.date).toLocaleString()}
-                            {a.favorite ? " • Favorite" : ""}
-                          </div>
-                        </div>
-                        <div className="text-xs text-neutral-500 capitalize">{a.status.replace("_", " ")}</div>
-                      </div>
-                    </div>
-                  ))
-                ) : (
-                  <div className="text-sm text-neutral-500">No activity yet.</div>
-                )}
-              </div>
-            </Panel>
-          </div>
-        ) : null}
-
-        {/* DISCOVER PAGE */}
-        {view === "discover" ? (
-          <div className="space-y-4 max-w-5xl mx-auto">
-            <div className="text-center sm:text-left">
-              <div className="text-lg font-semibold text-neutral-200">Discover</div>
-              <div className="text-sm text-neutral-500">Browse movies and TV by genre, then add anything directly to Planned.</div>
-            </div>
-
-            <Panel title="Browse TMDB">
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <Select
-                  label="Type"
-                  value={discoverType}
-                  onChange={(v) => {
-                    setDiscoverType(v as "movie" | "tv");
-                    setDiscoverGenreId("all");
-                    setDiscoverResults([]);
-                  }}
-                  options={[
-                    { value: "movie", label: "Movies" },
-                    { value: "tv", label: "TV" },
-                  ]}
-                />
-
-                <Select
-                  label="Genre"
-                  value={discoverGenreId}
-                  onChange={setDiscoverGenreId}
-                  options={[
-                    { value: "all", label: "All genres" },
-                    ...discoverGenres.map((g) => ({ value: String(g.id), label: g.name })),
-                  ]}
-                />
-
-                <label className="block">
-                  <div className="text-xs text-neutral-400 mb-1">Search</div>
-                  <button
-                    type="button"
-                    onClick={browseDiscover}
-                    className="w-full h-[42px] px-4 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
-                  >
-                    Browse
-                  </button>
-                </label>
-              </div>
-
-              {discoverStatus ? <div className="text-xs text-neutral-400 mt-3">{discoverStatus}</div> : null}
-
-              {discoverResults.length ? (
-                <div className="mt-5 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
-                  {discoverResults.map((card) => (
-                    <div key={`${card.type}:${card.id}`} className="rounded-2xl bg-neutral-950 border border-neutral-800 overflow-hidden">
-                      <div className="aspect-[2/3] bg-neutral-900">
-                        {card.posterUrl ? (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img src={card.posterUrl} alt={card.title} className="w-full h-full object-cover" />
-                        ) : (
-                          <div className="w-full h-full grid place-items-center text-xs text-neutral-600">No cover</div>
-                        )}
-                      </div>
-                      <div className="p-3 space-y-2">
-                        <div className="text-sm font-medium text-neutral-200 line-clamp-2">{card.title}</div>
-                        <div className="text-[11px] text-neutral-500">{TYPE_LABEL[card.type]}{card.year ? ` • ${card.year}` : ""}</div>
-                        {card.tags?.length ? <div className="text-[11px] text-neutral-500 line-clamp-1">{card.tags.join(" • ")}</div> : null}
-                        <button
-                          type="button"
-                          onClick={() => addDiscoverItem(card)}
-                          className="w-full text-xs px-3 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/25 hover:bg-emerald-500/20"
-                        >
-                          Add planned
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-            </Panel>
-          </div>
-        ) : null}
-
-        {/* FEEDBACK PAGE */}
-        {view === "feedback" ? (
-          <div className="space-y-4 max-w-5xl mx-auto">
-            <div className="text-center sm:text-left">
-              <div className="text-lg font-semibold text-neutral-200">Suggestions / Problems</div>
-              <div className="text-sm text-neutral-500">Save feedback the moment you notice it. This uses your existing media_items.data JSON.</div>
-            </div>
-
-            <Panel title="Submit feedback">
-              <form onSubmit={submitFeedback} className="space-y-3">
-                <div className="grid grid-cols-1 sm:grid-cols-[180px_minmax(0,1fr)] gap-3">
-                  <Select
-                    label="Type"
-                    value={feedbackType}
-                    onChange={(v) => setFeedbackType(v as "suggestion" | "problem")}
-                    options={[
-                      { value: "suggestion", label: "Suggestion" },
-                      { value: "problem", label: "Problem" },
-                    ]}
-                  />
-                  <TextArea
-                    label="What did you notice?"
-                    value={feedbackText}
-                    onChange={setFeedbackText}
-                    placeholder="Write the idea, bug, or problem here..."
-                  />
-                </div>
-
-                <button type="submit" className="px-4 py-2 rounded-xl stack-good hover:opacity-95">
-                  Save feedback
-                </button>
-              </form>
-            </Panel>
-
-            <Panel title="Saved feedback" right={<span className="text-xs text-neutral-500">{feedbackEntries.length}</span>}>
-              <div className="space-y-2">
-                {feedbackEntries.length ? (
-                  feedbackEntries.map((f) => (
-                    <div key={f.id} className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm">
-                      <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div className="min-w-0 flex-1">
-                          <div className="text-xs text-neutral-500 mb-1">
-                            {f.type === "problem" ? "Problem" : "Suggestion"} • {new Date(f.createdAt).toLocaleString()}
-                          </div>
-                          <div className="text-sm text-neutral-200 whitespace-pre-wrap">{f.message}</div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setFeedbackEntries((prev) => prev.filter((x) => x.id !== f.id))}
-                          className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                        >
-                          Remove
-                        </button>
-                      </div>
-                    </div>
-                  ))
-                ) : (
-                  <div className="text-sm text-neutral-500">No feedback saved yet.</div>
-                )}
-              </div>
-            </Panel>
-            {isAdminUser ? (
-              <Panel
-                title="Admin feedback inbox"
-                right={
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-neutral-500">{adminFeedbackStatus}</span>
-                    <button
-                      type="button"
-                      onClick={loadAdminFeedback}
-                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                    >
-                      Refresh
-                    </button>
-                  </div>
-                }
-              >
-                <div className="text-xs text-neutral-500 mb-3">
-                  Only the admin account shows this section. It gathers saved Suggestions / Problems from visible Stack data.
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,220px)_auto] gap-3 items-end mb-4">
-                  <Select
-                    label="Admin filter"
-                    value={adminFeedbackFilter}
-                    onChange={(v) => setAdminFeedbackFilter(v as typeof adminFeedbackFilter)}
-                    options={[
-                      { value: "all", label: "All feedback" },
-                      { value: "suggestion", label: "Suggestions only" },
-                      { value: "problem", label: "Problems only" },
-                      { value: "new", label: "New" },
-                      { value: "reviewed", label: "Reviewed" },
-                      { value: "done", label: "Done" },
-                    ]}
-                  />
-                  <Toggle label="Hide done" checked={adminHideDone} onChange={setAdminHideDone} />
-                </div>
-
-                <div className="space-y-2">
-                  {filteredAdminFeedbackRows.length ? (
-                    filteredAdminFeedbackRows.map((f) => (
-                      <div key={`${f.userId}:${f.id}`} className="rounded-2xl bg-neutral-950/80 border border-white/10 px-3 py-3 shadow-sm">
-                        <div className="flex flex-wrap items-start justify-between gap-3">
-                          <div className="min-w-0 flex-1">
-                            <div className="text-xs text-neutral-500 mb-1">
-                              {f.type === "problem" ? "Problem" : "Suggestion"} • {(f.status ?? "new").toUpperCase()} • {new Date(f.createdAt).toLocaleString()}
-                            </div>
-                            <div className="text-[11px] text-neutral-600 mb-2 truncate">
-                              From: {f.userLabel} • {f.userId}
-                            </div>
-                            <div className="text-sm text-neutral-200 whitespace-pre-wrap">{f.message}</div>
-                          </div>
-                          <div className="flex flex-wrap gap-2 sm:justify-end">
-                            <button
-                              type="button"
-                              onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "new")}
-                              className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                            >
-                              New
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "reviewed")}
-                              className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                            >
-                              Reviewed
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "done")}
-                              className="text-xs px-3 py-2 rounded-xl stack-good hover:opacity-95"
-                            >
-                              Done
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="text-sm text-neutral-500">No submitted feedback matches this filter yet.</div>
-                  )}
-                </div>
-              </Panel>
-            ) : null}
-          </div>
-        ) : null}
-
-        {/* SETTINGS PAGE */}
-        {view === "settings" ? (
-          <div className="space-y-4 max-w-5xl mx-auto">
-            <div className="text-center sm:text-left">
-              <div className="text-lg font-semibold text-neutral-200">Settings</div>
-              <div className="text-sm text-neutral-500">Personalize your Stack without changing the production database schema.</div>
-            </div>
-
-            <Panel title="Profile / personal info">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <Text
-                  label="Display name"
-                  value={settings.displayName ?? ""}
-                  onChange={(v) => updateSettings({ displayName: v })}
-                  helper="Used in your local activity feed display."
-                />
-                <Text
-                  label="Custom ID tag"
-                  value={settings.usernameTag ?? ""}
-                  onChange={(v) => updateSettings({ usernameTag: v })}
-                  helper="This is a Stack display tag. It does not rename profiles.username in Supabase."
-                />
-              </div>
-
-              <div className="mt-3">
-                <TextArea
-                  label="Profile bio"
-                  value={settings.profileBio ?? ""}
-                  onChange={(v) => updateSettings({ profileBio: v })}
-                  placeholder="Anything you want shown on your Stack profile later..."
-                />
-              </div>
-            </Panel>
-
-            <Panel title="Friend profile privacy">
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-                <Toggle
-                  label="Show bio to friends"
-                  checked={settings.showProfileBioToFriends !== false}
-                  onChange={(v) => updateSettings({ showProfileBioToFriends: v })}
-                />
-                <Toggle
-                  label="Show ratings to friends"
-                  checked={settings.showRatingsToFriends !== false}
-                  onChange={(v) => updateSettings({ showRatingsToFriends: v })}
-                />
-                <Toggle
-                  label="Show notes to friends"
-                  checked={settings.showNotesToFriends !== false}
-                  onChange={(v) => updateSettings({ showNotesToFriends: v })}
-                />
-                <Toggle
-                  label="Show tags to friends"
-                  checked={settings.showTagsToFriends !== false}
-                  onChange={(v) => updateSettings({ showTagsToFriends: v })}
-                />
-              </div>
-              <div className="text-[11px] text-neutral-500 mt-3">
-                Private items are always hidden. These controls decide what details friends see on public items.
-              </div>
-            </Panel>
-
-            <Panel
-              title="Preview what friends can see"
-              right={
+              <div className="sm:hidden flex items-center justify-between gap-3 rounded-2xl stack-mobile-readable-surface border border-white/10 px-3 py-3">
                 <button
                   type="button"
-                  onClick={() => setOwnFriendPreviewOpen((prev) => !prev)}
-                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                  onClick={() => setMobileFiltersOpen(true)}
+                  className="flex-1 text-sm px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-neutral-100"
                 >
-                  {ownFriendPreviewOpen ? "Hide preview" : "Show preview"}
+                  Filters
                 </button>
-              }
-            >
-              <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
-                <MiniStat label="Visible" value={String(ownFriendPreviewStats.total)} sub="items" />
-                <MiniStat label="Completed" value={String(ownFriendPreviewStats.completed)} sub="finished" />
-                <MiniStat label="In progress" value={String(ownFriendPreviewStats.inProgress)} sub="active" />
-                <MiniStat
-                  label="Average"
-                  value={settings.showRatingsToFriends === false ? "Hidden" : formatRatingValue(ownFriendPreviewStats.avgRating, settings.ratingFormat)}
-                  sub="rating"
-                />
-                <MiniStat
-                  label="Top genre"
-                  value={settings.showTagsToFriends === false ? "Hidden" : ownFriendPreviewStats.topGenre}
-                  sub={settings.showTagsToFriends === false ? "tags" : `${ownFriendPreviewStats.topGenreCount}`}
-                />
+                <button
+                  type="button"
+                  onClick={clearStackFilters}
+                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-300"
+                >
+                  Clear
+                </button>
               </div>
 
-              {ownFriendPreviewOpen ? (
-                <div className="mt-4 space-y-3">
-                  {(settings.showProfileBioToFriends === false ? "Profile description hidden." : settings.profileBio?.trim() || "No profile description yet.") ? (
-                    <div className="rounded-2xl bg-neutral-950/70 border border-white/10 px-3 py-3 text-sm text-neutral-300 whitespace-pre-wrap">
-                      {settings.showProfileBioToFriends === false
-                        ? "Profile description hidden."
-                        : settings.profileBio?.trim() || "No profile description yet."}
-                    </div>
-                  ) : null}
-                  {ownFriendPreviewItems.length ? (
-                    ownFriendPreviewItems.slice(0, 5).map((item) => (
-                      <FriendReadOnlyRow
-                        key={`preview:${item.id}`}
-                        item={item}
-                        ratingFormat={settings.ratingFormat ?? "ten"}
-                        privacy={profilePrivacyFromSettings(settings)}
-                      />
-                    ))
-                  ) : (
-                    <div className="text-sm text-neutral-500">Friends would not see any items yet because your items are private or your Stack is empty.</div>
-                  )}
-                  {ownFriendPreviewItems.length > 5 ? (
-                    <div className="text-xs text-neutral-500">Showing the first 5 visible items.</div>
-                  ) : null}
-                </div>
-              ) : (
-                <div className="text-xs text-neutral-500 mt-3">Open this to see your Stack the way a friend would see it.</div>
-              )}
-            </Panel>
-
-            <Panel title="Site preferences">
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-stretch">
-                <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 flex flex-col justify-between min-h-[152px]">
+              <div className="hidden sm:flex sm:flex-row sm:items-end sm:justify-between gap-3 rounded-2xl bg-neutral-950/55 border border-white/10 px-3 py-3">
+                <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,220px)_auto] gap-3 items-end w-full sm:w-auto">
                   <Select
-                    label="Rating display"
-                    value={settings.ratingFormat ?? "ten"}
-                    onChange={(v) => updateSettings({ ratingFormat: v as RatingFormat })}
-                    options={[
-                      { value: "ten", label: "10-point scale" },
-                      { value: "five", label: "5-point scale" },
-                      { value: "stars", label: "Stars" },
-                      { value: "percent", label: "Percent" },
-                    ]}
+                    label="Tag filter"
+                    value={tagFilter}
+                    onChange={setTagFilter}
+                    options={tagFilterOptions}
                   />
-                  <div className="text-[11px] text-neutral-500 mt-3">
-                    Ratings are still saved as 0–10 internally. Current display: {ratingFormatLabel(settings.ratingFormat)}.
-                  </div>
+                  <Toggle label="Favorites only" checked={favoriteOnly} onChange={setFavoriteOnly} />
                 </div>
-
-                <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 flex flex-col justify-between min-h-[152px]">
-                  <Select
-                    label="Color theme"
-                    value={settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme}
-                    onChange={(v) => updateSettings({ colorTheme: v as StackColorTheme })}
-                    options={STACK_COLOR_THEME_OPTIONS.map((t) => ({ value: t.value, label: t.label }))}
-                  />
-
-                  <div className="mt-3 grid grid-cols-6 gap-1.5">
-                    {STACK_COLOR_THEME_OPTIONS.map((t) => {
-                      const theme = STACK_COLOR_THEMES[t.value];
-                      return (
-                        <button
-                          key={t.value}
-                          type="button"
-                          onClick={() => updateSettings({ colorTheme: t.value })}
-                          className={[
-                            "h-7 rounded-lg border transition",
-                            (settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme) === t.value
-                              ? "border-white/50 ring-2 ring-white/20"
-                              : "border-white/10 hover:border-white/25",
-                          ].join(" ")}
-                          style={{ background: theme.accent }}
-                          title={t.label}
-                        />
-                      );
-                    })}
-                  </div>
-
-                  <div className="text-[11px] text-neutral-500 mt-3">
-                    Current theme: {STACK_COLOR_THEME_OPTIONS.find((t) => t.value === (settings.colorTheme ?? DEFAULT_SETTINGS.colorTheme))?.description}.
-                  </div>
-                </div>
-
-                <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
-                  <Select
-                    label="Default add status"
-                    value={settings.defaultAddStatus ?? DEFAULT_SETTINGS.defaultAddStatus}
-                    onChange={(v) => {
-                      const nextStatus = v as Status;
-                      updateSettings({ defaultAddStatus: nextStatus });
-                      if (!String(form.title || "").trim()) setForm((prev) => ({ ...prev, status: nextStatus }));
-                    }}
-                    options={[
-                      { value: "completed", label: "Completed" },
-                      { value: "in_progress", label: "In Progress" },
-                      { value: "planned", label: "Planned" },
-                      { value: "dropped", label: "Dropped" },
-                    ]}
-                  />
-                  <div className="text-[11px] text-neutral-500">
-                    New items on the Add page start with this status unless you change it.
-                  </div>
-                </div>
-
-                <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
-                  <Select
-                    label="Default All page view"
-                    value={settings.defaultBoardView ?? DEFAULT_SETTINGS.defaultBoardView}
-                    onChange={(v) => {
-                      const nextView = v as "board" | "list";
-                      updateSettings({ defaultBoardView: nextView });
-                      setBoardView(nextView === "board");
-                    }}
-                    options={[
-                      { value: "board", label: "Board view" },
-                      { value: "list", label: "List view" },
-                    ]}
-                  />
-                  <div className="text-[11px] text-neutral-500">
-                    This also switches the current All page layout.
-                  </div>
-                  <Toggle
-                    label="Compact mode"
-                    checked={!!settings.compactMode}
-                    onChange={(v) => updateSettings({ compactMode: v })}
-                  />
-                </div>
-
-                <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 min-h-[152px] space-y-3">
-                  <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3 items-end">
-                    <div>
-                      <div className="text-xs text-neutral-400 mb-1">Sound effects</div>
-                      <Toggle
-                        label="Hover/click sounds"
-                        checked={!!settings.soundEffects}
-                        onChange={(v) => updateSettings({ soundEffects: v })}
-                      />
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => playStackSoundEffect("click", settings.soundVolume ?? 1)}
-                      className="h-[42px] px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-sm"
-                    >
-                      Test sound
-                    </button>
-                  </div>
-
-                  <label className="block">
-                    <div className="flex items-center justify-between gap-3 text-xs text-neutral-400 mb-1">
-                      <span>Sound volume</span>
-                      <span className="text-neutral-500">{Math.round((settings.soundVolume ?? 1) * 100)}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="0.25"
-                      max="3"
-                      step="0.05"
-                      value={settings.soundVolume ?? 1}
-                      onChange={(e) => updateSettings({ soundVolume: Number(e.target.value) })}
-                      className="w-full accent-emerald-500"
-                    />
-                  </label>
-
-                  <div className="text-[11px] text-neutral-500">
-                    Turn sounds on, then click once or press Test sound to unlock audio. Volume can go up to 300%.
-                  </div>
-                </div>
+                <button
+                  type="button"
+                  onClick={clearStackFilters}
+                  className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-300"
+                >
+                  Clear filters
+                </button>
               </div>
-            </Panel>
-          </div>
-        ) : null}
 
-        {/* LIST PAGES */}
-        {view !== "stats" && view !== "add" && view !== "friends" && view !== "feed" && view !== "discover" && view !== "feedback" && view !== "settings" ? (
-          <div className={view === "all" && boardView ? "space-y-4" : "space-y-4 max-w-5xl mx-auto"}>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
-              <label className="block">
-                <div className="text-xs text-neutral-400 mb-1">Search</div>
-                <input
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search title, notes, tags..."
-                  className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
+              {view === "all" ? (
+                <div className="flex items-center justify-between">
+                  <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
+                  <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
+                </div>
+              ) : null}
+
+              {filtered.length === 0 ? (
+                <EmptyState
+                  title="No items match this view"
+                  message="Try clearing search, tag, or favorite filters, or add something new to your Stack."
                 />
-              </label>
+              ) : null}
 
-              <Select
-                label="Sort"
-                value={sortMode}
-                onChange={(v) => setSortMode(v as SortMode)}
-                options={[
-                  { value: "newest", label: "Newest first" },
-                  { value: "oldest", label: "Oldest first" },
-                  { value: "title", label: "Title (A–Z)" },
-                  { value: "rating_high", label: "Rating (high → low)" },
-                  { value: "rating_low", label: "Rating (low → high)" },
-                  { value: "updated", label: "Last updated" },
-                  { value: "favorites", label: "Favorites first" },
-                ]}
-              />
-            </div>
-
-            <div className="sm:hidden flex items-center justify-between gap-3 rounded-2xl stack-mobile-readable-surface border border-white/10 px-3 py-3">
-              <button
-                type="button"
-                onClick={() => setMobileFiltersOpen(true)}
-                className="flex-1 text-sm px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-neutral-100"
-              >
-                Filters
-              </button>
-              <button
-                type="button"
-                onClick={clearStackFilters}
-                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-300"
-              >
-                Clear
-              </button>
-            </div>
-
-            <div className="hidden sm:flex sm:flex-row sm:items-end sm:justify-between gap-3 rounded-2xl bg-neutral-950/55 border border-white/10 px-3 py-3">
-              <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,220px)_auto] gap-3 items-end w-full sm:w-auto">
-                <Select
-                  label="Tag filter"
-                  value={tagFilter}
-                  onChange={setTagFilter}
-                  options={tagFilterOptions}
-                />
-                <Toggle label="Favorites only" checked={favoriteOnly} onChange={setFavoriteOnly} />
-              </div>
-              <button
-                type="button"
-                onClick={clearStackFilters}
-                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-300"
-              >
-                Clear filters
-              </button>
-            </div>
-
-            {view === "all" ? (
-              <div className="flex items-center justify-between">
-                <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
-                <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
-              </div>
-            ) : null}
-
-            {filtered.length === 0 ? (
-              <EmptyState
-                title="No items match this view"
-                message="Try clearing search, tag, or favorite filters, or add something new to your Stack."
-              />
-            ) : null}
-
-            <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
-              {view === "all" && boardView ? (
-                <BoardView items={filtered} onDelete={removeItem} onUpdate={updateItem} friendsById={friendsNameById} ratingFormat={settings.ratingFormat ?? "ten"} />
-              ) : groupMode !== "none" && grouped ? (
-                <div className="space-y-6">
-                  {grouped.map(([k, list]) => (
-                    <section key={k} className="space-y-2">
-                      <h3 className="text-sm text-neutral-400">{k}</h3>
-                      <div className="space-y-3">
-                        {list.map((i) => (
-                          <MALRow key={i.id} item={i} onDelete={() => removeItem(i.id)} onUpdate={(patch) => updateItem(i.id, patch)} friendsById={friendsNameById} ratingFormat={settings.ratingFormat ?? "ten"} />
-                        ))}
-                      </div>
-                    </section>
-                  ))}
-                </div>
-              ) : (
-                <div className="space-y-6">
-                  {STATUSES.map((s) => {
-                    const list = byStatusFiltered[s.id];
-                    if (!list.length) return null;
-
-                    const collapsed = collapsedStatuses.has(s.id);
-
-                    return (
-                      <section key={s.id} className="space-y-3">
-                        <button
-                          type="button"
-                          onClick={() => toggleCollapsedStatus(s.id)}
-                          className="w-full flex items-center justify-between rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 px-3 py-2 text-left touch-manipulation"
-                          aria-expanded={!collapsed}
-                        >
-                          <h3 className="text-sm text-neutral-300">{s.label}</h3>
-                          <div className="text-xs text-neutral-500">
-                            {collapsed ? "Show" : "Hide"} • {list.length}
-                          </div>
-                        </button>
-
-                        {!collapsed ? (
+              <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+                {view === "all" && boardView ? (
+                  <BoardView
+                    items={filtered}
+                    onDelete={removeItem}
+                    onUpdate={updateItem}
+                    friendsById={friendsNameById}
+                    ratingFormat={settings.ratingFormat ?? "ten"}
+                  />
+                ) : libraryStyle === "poster" ? (
+                  <MediaPosterGrid
+                    items={filtered}
+                    onDelete={removeItem}
+                    onUpdate={updateItem}
+                    friendsById={friendsNameById}
+                    ratingFormat={settings.ratingFormat ?? "ten"}
+                    displayPrefs={listDisplayPrefs}
+                  />
+                ) : groupMode !== "none" && grouped ? (
+                  <div className="space-y-6">
+                    {grouped.map(([k, list]) => (
+                      <section key={k} className="space-y-2">
+                        <h3 className="text-sm text-neutral-400">{k}</h3>
                         <div className="space-y-3">
-                          <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
-                            <div />
-                            <div>Title</div>
-                            <div className="text-center">Score</div>
-                            <div className="text-center">Type</div>
-                            <div className="text-center">Progress / Hours</div>
-                          </div>
-
                           {list.map((i) => (
                             <MALRow
                               key={i.id}
@@ -5912,148 +7437,194 @@ async function pickForMe(mode: "best" | "random" = "best") {
                               onUpdate={(patch) => updateItem(i.id, patch)}
                               friendsById={friendsNameById}
                               ratingFormat={settings.ratingFormat ?? "ten"}
+                              displayPrefs={listDisplayPrefs}
                             />
                           ))}
                         </div>
-                        ) : null}
                       </section>
-                    );
-                  })}
+                    ))}
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    {STATUSES.map((s) => {
+                      const list = byStatusFiltered[s.id];
+                      if (!list.length) return null;
+
+                      const collapsed = collapsedStatuses.has(s.id);
+
+                      return (
+                        <section key={s.id} className="space-y-3">
+                          <button
+                            type="button"
+                            onClick={() => toggleCollapsedStatus(s.id)}
+                            className="w-full flex items-center justify-between rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 px-3 py-2 text-left touch-manipulation"
+                            aria-expanded={!collapsed}
+                          >
+                            <h3 className="text-sm text-neutral-300">{s.label}</h3>
+                            <div className="text-xs text-neutral-500">
+                              {collapsed ? "Show" : "Hide"} • {list.length}
+                            </div>
+                          </button>
+
+                          {!collapsed ? (
+                            <div className="space-y-3">
+                              <div className="hidden sm:grid grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 px-3 py-2 rounded-xl bg-neutral-900/40 ring-1 ring-neutral-800/70 text-xs text-neutral-300">
+                                <div />
+                                <div>Title</div>
+                                <div className="text-center">{listDisplayPrefs.showRating ? "Score" : "—"}</div>
+                                <div className="text-center">{listDisplayPrefs.showType ? "Type" : "—"}</div>
+                                <div className="text-center">{listDisplayPrefs.showProgress ? "Progress / Hours" : "—"}</div>
+                              </div>
+
+                              {list.map((i) => (
+                                <MALRow
+                                  key={i.id}
+                                  item={i}
+                                  onDelete={() => removeItem(i.id)}
+                                  onUpdate={(patch) => updateItem(i.id, patch)}
+                                  friendsById={friendsNameById}
+                                  ratingFormat={settings.ratingFormat ?? "ten"}
+                                />
+                              ))}
+                            </div>
+                          ) : null}
+                        </section>
+                      );
+                    })}
+                  </div>
+                )}
+              </DndContext>
+            </div>
+          ) : null}
+
+          <footer className="pt-6 text-xs text-neutral-500">Stack • Saves to Supabase + local backup</footer>
+        </div>
+
+        {view !== "stats" && view !== "add" && view !== "friends" && view !== "feed" && view !== "discover" && view !== "feedback" && view !== "settings" && mobileFiltersOpen ? (
+          <div className="sm:hidden fixed inset-0 z-50 bg-black/70" onMouseDown={() => setMobileFiltersOpen(false)}>
+            <div
+              className="absolute inset-x-0 bottom-0 rounded-t-3xl stack-mobile-readable-surface border-t border-white/10 p-4 pb-[calc(1rem+env(safe-area-inset-bottom))] shadow-2xl"
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between gap-3 mb-4">
+                <div>
+                  <div className="text-base font-semibold text-neutral-100">Filters</div>
+                  <div className="text-xs text-neutral-500">Search, sort, tags, favorites, and view.</div>
                 </div>
-              )}
-            </DndContext>
+                <button type="button" onClick={() => setMobileFiltersOpen(false)} className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10">
+                  Close
+                </button>
+              </div>
+
+              <div className="space-y-3">
+                <label className="block">
+                  <div className="text-xs text-neutral-400 mb-1">Search</div>
+                  <input
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search title, notes, tags..."
+                    className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base outline-none focus:border-neutral-500"
+                  />
+                </label>
+
+                <Select
+                  label="Sort"
+                  value={sortMode}
+                  onChange={(v) => setSortMode(v as SortMode)}
+                  options={[
+                    { value: "newest", label: "Newest first" },
+                    { value: "oldest", label: "Oldest first" },
+                    { value: "title", label: "Title (A–Z)" },
+                    { value: "rating_high", label: "Rating (high → low)" },
+                    { value: "rating_low", label: "Rating (low → high)" },
+                    { value: "updated", label: "Last updated" },
+                    { value: "favorites", label: "Favorites first" },
+                  ]}
+                />
+
+                <Select label="Tag filter" value={tagFilter} onChange={setTagFilter} options={tagFilterOptions} />
+                <Toggle label="Favorites only" checked={favoriteOnly} onChange={setFavoriteOnly} />
+                {view === "all" ? <Toggle label="Board view" checked={boardView} onChange={setBoardView} /> : null}
+
+                <div className="grid grid-cols-2 gap-2 pt-2">
+                  <button type="button" onClick={clearStackFilters} className="text-sm px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10">
+                    Clear filters
+                  </button>
+                  <button type="button" onClick={() => setMobileFiltersOpen(false)} className="text-sm px-3 py-2 rounded-xl stack-good hover:opacity-95">
+                    Apply
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         ) : null}
 
-        <footer className="pt-6 text-xs text-neutral-500">Stack • Saves to Supabase + local backup</footer>
-      </div>
+        {view !== "add" ? (
+          <Link href="/add" className="sm:hidden fixed right-4 bottom-[5.35rem] z-40 px-4 py-3 rounded-2xl stack-good border border-white/10 shadow-2xl text-sm font-medium text-neutral-50" aria-label="Add to Stack">
+            + Add
+          </Link>
+        ) : null}
 
-      {view !== "stats" && view !== "add" && view !== "friends" && view !== "feed" && view !== "discover" && view !== "feedback" && view !== "settings" && mobileFiltersOpen ? (
-        <div className="sm:hidden fixed inset-0 z-50 bg-black/70" onMouseDown={() => setMobileFiltersOpen(false)}>
-          <div
-            className="absolute inset-x-0 bottom-0 rounded-t-3xl stack-mobile-readable-surface border-t border-white/10 p-4 pb-[calc(1rem+env(safe-area-inset-bottom))] shadow-2xl"
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between gap-3 mb-4">
-              <div>
-                <div className="text-base font-semibold text-neutral-100">Filters</div>
-                <div className="text-xs text-neutral-500">Search, sort, tags, favorites, and view.</div>
+        <nav className="sm:hidden fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-neutral-950/90 backdrop-blur-xl px-2 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))]" aria-label="Mobile Stack navigation">
+          <div className="grid grid-cols-5 gap-1 max-w-md mx-auto">
+            {[
+              { href: "/", label: "All", key: "all" as StackView },
+              { href: "/add", label: "Add", key: "add" as StackView },
+              { href: "/friends", label: "Friends", key: "friends" as StackView },
+              { href: "/stats", label: "Stats", key: "stats" as StackView },
+              { href: "/settings", label: "Settings", key: "settings" as StackView },
+            ].map((n) => (
+              <Link
+                key={n.href}
+                href={n.href}
+                className={[
+                  "min-h-[46px] rounded-2xl grid place-items-center px-1 text-[11px] border transition",
+                  view === n.key ? "bg-white/15 border-white/25 text-neutral-50" : "bg-white/5 border-white/10 text-neutral-300",
+                ].join(" ")}
+              >
+                {n.label}
+              </Link>
+            ))}
+          </div>
+        </nav>
+
+        {undoState ? (
+          <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50">
+            <div className="flex items-center gap-3 rounded-2xl bg-neutral-950 border border-neutral-800 shadow-2xl px-4 py-3">
+              <div className="text-sm text-neutral-200">
+                Deleted <span className="font-semibold">{undoState.item.title}</span>
               </div>
-              <button type="button" onClick={() => setMobileFiltersOpen(false)} className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10">
-                Close
+              <button
+                type="button"
+                onClick={() => {
+                  setItems((prev) => {
+                    const next = prev.slice();
+                    next.splice(undoState.index, 0, undoState.item);
+                    return next;
+                  });
+                  setUndoState(null);
+                  if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+                  undoTimerRef.current = null;
+                }}
+                className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
+              >
+                Undo
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setUndoState(null);
+                  if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+                  undoTimerRef.current = null;
+                }}
+                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+              >
+                Dismiss
               </button>
             </div>
-
-            <div className="space-y-3">
-              <label className="block">
-                <div className="text-xs text-neutral-400 mb-1">Search</div>
-                <input
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search title, notes, tags..."
-                  className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base outline-none focus:border-neutral-500"
-                />
-              </label>
-
-              <Select
-                label="Sort"
-                value={sortMode}
-                onChange={(v) => setSortMode(v as SortMode)}
-                options={[
-                  { value: "newest", label: "Newest first" },
-                  { value: "oldest", label: "Oldest first" },
-                  { value: "title", label: "Title (A–Z)" },
-                  { value: "rating_high", label: "Rating (high → low)" },
-                  { value: "rating_low", label: "Rating (low → high)" },
-                  { value: "updated", label: "Last updated" },
-                  { value: "favorites", label: "Favorites first" },
-                ]}
-              />
-
-              <Select label="Tag filter" value={tagFilter} onChange={setTagFilter} options={tagFilterOptions} />
-              <Toggle label="Favorites only" checked={favoriteOnly} onChange={setFavoriteOnly} />
-              {view === "all" ? <Toggle label="Board view" checked={boardView} onChange={setBoardView} /> : null}
-
-              <div className="grid grid-cols-2 gap-2 pt-2">
-                <button type="button" onClick={clearStackFilters} className="text-sm px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10">
-                  Clear filters
-                </button>
-                <button type="button" onClick={() => setMobileFiltersOpen(false)} className="text-sm px-3 py-2 rounded-xl stack-good hover:opacity-95">
-                  Apply
-                </button>
-              </div>
-            </div>
           </div>
-        </div>
-      ) : null}
-
-      {view !== "add" ? (
-        <Link href="/add" className="sm:hidden fixed right-4 bottom-[5.35rem] z-40 px-4 py-3 rounded-2xl stack-good border border-white/10 shadow-2xl text-sm font-medium text-neutral-50" aria-label="Add to Stack">
-          + Add
-        </Link>
-      ) : null}
-
-      <nav className="sm:hidden fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-neutral-950/90 backdrop-blur-xl px-2 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))]" aria-label="Mobile Stack navigation">
-        <div className="grid grid-cols-5 gap-1 max-w-md mx-auto">
-          {[
-            { href: "/", label: "All", key: "all" as StackView },
-            { href: "/add", label: "Add", key: "add" as StackView },
-            { href: "/friends", label: "Friends", key: "friends" as StackView },
-            { href: "/stats", label: "Stats", key: "stats" as StackView },
-            { href: "/settings", label: "Settings", key: "settings" as StackView },
-          ].map((n) => (
-            <Link
-              key={n.href}
-              href={n.href}
-              className={[
-                "min-h-[46px] rounded-2xl grid place-items-center px-1 text-[11px] border transition",
-                view === n.key ? "bg-white/15 border-white/25 text-neutral-50" : "bg-white/5 border-white/10 text-neutral-300",
-              ].join(" ")}
-            >
-              {n.label}
-            </Link>
-          ))}
-        </div>
-      </nav>
-
-      {/* ✅ UNDO TOAST */}
-      {undoState ? (
-        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50">
-          <div className="flex items-center gap-3 rounded-2xl bg-neutral-950 border border-neutral-800 shadow-2xl px-4 py-3">
-            <div className="text-sm text-neutral-200">
-              Deleted <span className="font-semibold">{undoState.item.title}</span>
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setItems((prev) => {
-                  const next = prev.slice();
-                  next.splice(undoState.index, 0, undoState.item);
-                  return next;
-                });
-                setUndoState(null);
-                if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
-                undoTimerRef.current = null;
-              }}
-              className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15"
-            >
-              Undo
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setUndoState(null);
-                if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
-                undoTimerRef.current = null;
-              }}
-              className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-            >
-              Dismiss
-            </button>
-          </div>
-        </div>
-      ) : null}
-    </div>
+        ) : null}
+      </div>
     </>
   );
 }
@@ -6112,6 +7683,181 @@ function StatusColumn({ status, title, children }: { status: Status; title: stri
   );
 }
 
+function MediaPosterGrid({
+  items,
+  onDelete,
+  onUpdate,
+  friendsById,
+  ratingFormat,
+  displayPrefs,
+}: {
+  items: MediaItem[];
+  onDelete: (id: string) => void;
+  onUpdate: (id: string, patch: Partial<MediaItem>) => void;
+  friendsById: Map<string, string>;
+  ratingFormat: RatingFormat;
+  displayPrefs: ListDisplayPreferences;
+}) {
+  return (
+    <div className="stack-poster-grid">
+      {items.map((item) => (
+        <MediaPosterCard
+          key={item.id}
+          item={item}
+          onDelete={() => onDelete(item.id)}
+          onUpdate={(patch) => onUpdate(item.id, patch)}
+          friendsById={friendsById}
+          ratingFormat={ratingFormat}
+          displayPrefs={displayPrefs}
+        />
+      ))}
+    </div>
+  );
+}
+
+function MediaPosterCard({
+  item,
+  onDelete,
+  onUpdate,
+  friendsById,
+  ratingFormat,
+  displayPrefs,
+}: {
+  item: MediaItem;
+  onDelete: () => void;
+  onUpdate: (patch: Partial<MediaItem>) => void;
+  friendsById: Map<string, string>;
+  ratingFormat: RatingFormat;
+  displayPrefs: ListDisplayPreferences;
+}) {
+  const [showDetail, setShowDetail] = React.useState(false);
+  const poster = item.posterOverrideUrl || item.posterUrl;
+  const withFriends = (item.withFriendIds ?? [])
+    .map((id) => friendsById.get(id) ?? id)
+    .filter(Boolean);
+
+  return (
+    <>
+      {showDetail ? (
+        <MediaItemDetailModal
+          item={item}
+          ratingFormat={ratingFormat}
+          friendsById={friendsById}
+          onUpdate={onUpdate}
+          onDelete={onDelete}
+          onClose={() => setShowDetail(false)}
+        />
+      ) : null}
+
+      <article className="stack-poster-card rounded-3xl group">
+        <button
+          type="button"
+          onClick={() => setShowDetail(true)}
+          className="block w-full aspect-[2/3] bg-neutral-950 overflow-hidden relative"
+        >
+          {poster ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={poster}
+              alt={item.title}
+              className="w-full h-full object-cover transition duration-300 group-hover:scale-[1.025]"
+            />
+          ) : (
+            <div className="w-full h-full grid place-items-center text-xs text-neutral-600">No cover</div>
+          )}
+
+          <div className="absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-black/85 to-transparent" />
+          <div className="absolute left-2 right-2 bottom-2 flex items-end justify-between gap-2">
+            <span className="px-2 py-1 rounded-lg bg-black/55 border border-white/10 text-[10px] text-neutral-200 capitalize backdrop-blur-sm">
+              {item.status.replace("_", " ")}
+            </span>
+            {item.favorite ? (
+              <span className="px-2 py-1 rounded-lg bg-amber-400/15 border border-amber-300/20 text-[10px] text-amber-50">★</span>
+            ) : null}
+          </div>
+        </button>
+
+        <div className="p-3 space-y-2">
+          <button
+            type="button"
+            onClick={() => setShowDetail(true)}
+            className="w-full text-left text-sm font-semibold text-neutral-100 line-clamp-2 min-h-[2.5rem] hover:text-white"
+          >
+            {item.title}
+          </button>
+
+          <div className="flex flex-wrap gap-1.5 text-[10px] text-neutral-500">
+            {displayPrefs.showType ? (
+              <span className="px-2 py-1 rounded-lg bg-white/5 border border-white/10">{TYPE_LABEL[item.type]}</span>
+            ) : null}
+            {displayPrefs.showRating ? (
+              <span className="px-2 py-1 rounded-lg bg-white/5 border border-white/10">{formatRatingValue(item.rating, ratingFormat)}</span>
+            ) : null}
+            {item.isPrivate ? (
+              <span className="px-2 py-1 rounded-lg bg-sky-400/10 border border-sky-400/20">Private</span>
+            ) : null}
+          </div>
+
+          {displayPrefs.showProgress ? (
+            <div className="text-[11px] text-neutral-500">
+              {item.type === "game" ? "Hours" : "Progress"}: {readOnlyProgressLabel(item)}
+            </div>
+          ) : null}
+
+          {displayPrefs.showTags && item.tags?.length ? (
+            <div className="text-[11px] text-neutral-500 line-clamp-1">{item.tags.join(" • ")}</div>
+          ) : null}
+
+          {displayPrefs.showNotes && item.notes ? (
+            <div className="text-[11px] text-neutral-400 line-clamp-2">{item.notes}</div>
+          ) : null}
+
+          {withFriends.length ? (
+            <div className="text-[10px] text-neutral-600 line-clamp-1">With: {withFriends.join(" • ")}</div>
+          ) : null}
+
+          <select
+            value={item.status}
+            onChange={(e) => onUpdate({ status: e.target.value as Status })}
+            className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-2 py-2 text-xs outline-none focus:border-neutral-500"
+          >
+            <option value="completed">Completed</option>
+            <option value="in_progress">In Progress</option>
+            <option value="planned">Planned</option>
+            <option value="dropped">Dropped</option>
+          </select>
+
+          <div className="grid grid-cols-3 gap-1.5">
+            <button
+              type="button"
+              onClick={() => onUpdate({ favorite: !item.favorite })}
+              className="text-[11px] px-2 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+              title={item.favorite ? "Remove favorite" : "Favorite"}
+            >
+              {item.favorite ? "★" : "☆"}
+            </button>
+            <button
+              type="button"
+              onClick={() => onUpdate({ isPrivate: !item.isPrivate })}
+              className="text-[11px] px-2 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+              title={item.isPrivate ? "Make public" : "Make private"}
+            >
+              {item.isPrivate ? "Private" : "Public"}
+            </button>
+            <button
+              type="button"
+              onClick={onDelete}
+              className="text-[11px] px-2 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+            >
+              Delete
+            </button>
+          </div>
+        </div>
+      </article>
+    </>
+  );
+}
+
 /* ================= MAL ROW ================= */
 
 function MALRow({
@@ -6120,30 +7866,29 @@ function MALRow({
   onUpdate,
   friendsById,
   ratingFormat = "ten",
+  displayPrefs = DEFAULT_LIST_DISPLAY,
 }: {
   item: MediaItem;
   onDelete: () => void;
   onUpdate: (patch: Partial<MediaItem>) => void;
   friendsById?: Map<string, string>;
   ratingFormat?: RatingFormat;
+  displayPrefs?: ListDisplayPreferences;
 }) {
   const displayPoster = item.posterOverrideUrl || item.posterUrl;
   const withFriends = (item.withFriendIds ?? [])
     .map((id) => friendsById?.get(id) ?? id)
     .filter(Boolean);
 
-  // ---------------- EDITING ----------------
   const [isEditing, setIsEditing] = React.useState(false);
   const [draftTitle, setDraftTitle] = React.useState(item.title);
   const [draftDate, setDraftDate] = React.useState(item.dateFinished ?? "");
   const [draftRating, setDraftRating] = React.useState(typeof item.rating === "number" ? String(item.rating) : "");
   const [draftNotes, setDraftNotes] = React.useState(item.notes ?? "");
 
-  // full detail / note modals
   const [showFullNote, setShowFullNote] = React.useState(false);
   const [showDetail, setShowDetail] = React.useState(false);
 
-  // keep drafts in sync if item changes while not editing
   useEffect(() => {
     if (isEditing) return;
     setDraftTitle(item.title);
@@ -6182,7 +7927,6 @@ function MALRow({
     setIsEditing(false);
   };
 
-  // ---------------- PROGRESS / HOURS ----------------
   const movieProg = getMovieProgressDefaults(item);
 
   const cur =
@@ -6224,8 +7968,6 @@ function MALRow({
     onUpdate(usingCurOverride ? { progressCurOverride: next } : { progressCur: next });
   };
 
-
-
   const isGame = item.type === "game";
   const hoursText = typeof item.hoursPlayed === "number" ? `${item.hoursPlayed.toFixed(1)}h` : "—";
 
@@ -6246,7 +7988,6 @@ function MALRow({
         />
       ) : null}
 
-      {/* FULL NOTE MODAL */}
       {showFullNote ? (
         <div
           className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4"
@@ -6312,8 +8053,12 @@ function MALRow({
               )}
 
               <div className="flex flex-wrap gap-1.5 text-[11px]">
-                <span className="px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-neutral-300">{TYPE_LABEL[item.type]}</span>
-                <span className="px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-neutral-300">{mobileRatingLabel}</span>
+                {displayPrefs.showType ? (
+                  <span className="px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-neutral-300">{TYPE_LABEL[item.type]}</span>
+                ) : null}
+                {displayPrefs.showRating ? (
+                  <span className="px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-neutral-300">{mobileRatingLabel}</span>
+                ) : null}
                 {item.favorite ? (
                   <span className="px-2 py-1 rounded-lg bg-amber-400/10 border border-amber-400/20 text-neutral-200">Favorite</span>
                 ) : null}
@@ -6363,7 +8108,7 @@ function MALRow({
                 placeholder="Write a note…"
               />
             </div>
-          ) : item.notes ? (
+          ) : displayPrefs.showNotes && item.notes ? (
             <div className="rounded-2xl bg-white/[0.035] border border-white/10 px-3 py-2">
               <div className="text-xs text-neutral-300 line-clamp-3">{item.notes}</div>
               {hasLongNote ? (
@@ -6378,9 +8123,9 @@ function MALRow({
             </div>
           ) : null}
 
-          {item.tags?.length || withFriends.length ? (
+          {(displayPrefs.showTags && item.tags?.length) || withFriends.length ? (
             <div className="space-y-1">
-              {item.tags?.length ? (
+              {displayPrefs.showTags && item.tags?.length ? (
                 <div className="text-[11px] text-neutral-500 line-clamp-2">{item.tags.join(" • ")}</div>
               ) : null}
               {withFriends.length ? (
@@ -6392,7 +8137,9 @@ function MALRow({
           <div className="grid grid-cols-2 gap-2">
             <div className="rounded-2xl bg-white/[0.035] border border-white/10 p-3">
               <div className="text-[11px] text-neutral-500 mb-1">Score</div>
-              {isEditing ? (
+              {!displayPrefs.showRating ? (
+                <div className="text-sm text-neutral-600">Hidden</div>
+              ) : isEditing ? (
                 <input
                   value={draftRating}
                   onChange={(e) => {
@@ -6410,7 +8157,7 @@ function MALRow({
 
             <div className="rounded-2xl bg-white/[0.035] border border-white/10 p-3">
               <div className="text-[11px] text-neutral-500 mb-1">{isGame ? "Hours" : "Progress"}</div>
-              <div className="text-sm text-neutral-200 tabular-nums">{isGame ? hoursText : progressText}</div>
+              <div className="text-sm text-neutral-200 tabular-nums">{displayPrefs.showProgress ? (isGame ? hoursText : progressText) : "Hidden"}</div>
             </div>
           </div>
 
@@ -6562,7 +8309,6 @@ function MALRow({
         </div>
 
         <div className="hidden sm:grid sm:grid-cols-[72px_minmax(0,1fr)_minmax(72px,12%)_minmax(72px,12%)_minmax(140px,20%)] gap-3 p-3 items-center">
-          {/* Poster */}
           <button
             type="button"
             onClick={() => setShowDetail(true)}
@@ -6577,11 +8323,9 @@ function MALRow({
             )}
           </button>
 
-          {/* Title + meta */}
           <div className="min-w-0">
             <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1">
-                {/* TITLE */}
                 {isEditing ? (
                   <input
                     value={draftTitle}
@@ -6599,46 +8343,43 @@ function MALRow({
                   </button>
                 )}
 
-                {/* STATUS + DATE */}
-              <div className="text-xs text-neutral-400 mt-1 flex flex-wrap items-center gap-2">
-                <span>Status:</span>
-                <select
-                  value={item.status}
-                  onChange={(e) => onUpdate({ status: e.target.value as Status })}
-                  className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
-                >
-                  <option value="completed">Completed</option>
-                  <option value="in_progress">In Progress</option>
-                  <option value="planned">Planned</option>
-                  <option value="dropped">Dropped</option>
-                </select>
-
-                <span className="text-neutral-600">•</span>
-
-                {isEditing ? (
-                  <input
-                    type="date"
-                    value={draftDate}
-                    onChange={(e) => setDraftDate(e.target.value)}
+                <div className="text-xs text-neutral-400 mt-1 flex flex-wrap items-center gap-2">
+                  <span>Status:</span>
+                  <select
+                    value={item.status}
+                    onChange={(e) => onUpdate({ status: e.target.value as Status })}
                     className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
-                    title="Date watched"
-                  />
-                ) : item.dateFinished ? (
-                  <span className="text-neutral-500">{item.dateFinished}</span>
-                ) : (
-                  <span className="text-neutral-600">No date</span>
-                )}
+                  >
+                    <option value="completed">Completed</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="planned">Planned</option>
+                    <option value="dropped">Dropped</option>
+                  </select>
 
-                {(Number(item.rewatchCount ?? 0) || 0) > 0 ? (
-                  <>
-                    <span className="text-neutral-600">•</span>
-                    <span className="text-neutral-300">Rewatch x{Number(item.rewatchCount ?? 0) || 0}</span>
-                  </>
-                ) : null}
-              </div>
+                  <span className="text-neutral-600">•</span>
 
+                  {isEditing ? (
+                    <input
+                      type="date"
+                      value={draftDate}
+                      onChange={(e) => setDraftDate(e.target.value)}
+                      className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
+                      title="Date watched"
+                    />
+                  ) : item.dateFinished ? (
+                    <span className="text-neutral-500">{item.dateFinished}</span>
+                  ) : (
+                    <span className="text-neutral-600">No date</span>
+                  )}
 
-                {/* NOTES */}
+                  {(Number(item.rewatchCount ?? 0) || 0) > 0 ? (
+                    <>
+                      <span className="text-neutral-600">•</span>
+                      <span className="text-neutral-300">Rewatch x{Number(item.rewatchCount ?? 0) || 0}</span>
+                    </>
+                  ) : null}
+                </div>
+
                 {isEditing ? (
                   <div className="mt-2">
                     <div className="text-[11px] text-neutral-500 mb-1">Note</div>
@@ -6650,7 +8391,7 @@ function MALRow({
                       placeholder="Write a note…"
                     />
                   </div>
-                ) : item.notes ? (
+                ) : displayPrefs.showNotes && item.notes ? (
                   <div className="mt-2">
                     <div className="text-xs text-neutral-300 line-clamp-2">{item.notes}</div>
                     <div className="mt-1 flex items-center gap-2">
@@ -6667,8 +8408,7 @@ function MALRow({
                   </div>
                 ) : null}
 
-                {/* TAGS */}
-                {item.tags?.length ? (
+                {displayPrefs.showTags && item.tags?.length ? (
                   <div className="text-[11px] text-neutral-500 mt-1 truncate">{item.tags.join(" • ")}</div>
                 ) : null}
 
@@ -6685,7 +8425,6 @@ function MALRow({
                   ) : null}
                 </div>
 
-                {/* ACTIONS */}
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   {isEditing ? (
                     <>
@@ -6755,7 +8494,6 @@ function MALRow({
             </div>
           </div>
 
-          {/* SCORE */}
           <div className="text-center text-sm text-neutral-300 tabular-nums">
             {isEditing ? (
               <input
@@ -6768,17 +8506,19 @@ function MALRow({
                 className="w-[5.5rem] text-center rounded-lg bg-neutral-950 border border-neutral-800 px-2 py-1 text-xs outline-none focus:border-neutral-500"
                 title="Rating (0–10)"
               />
-            ) : (
+            ) : displayPrefs.showRating ? (
               formatRatingValue(item.rating, ratingFormat)
+            ) : (
+              "—"
             )}
           </div>
 
-          {/* TYPE */}
-          <div className="text-center text-sm text-neutral-300">{TYPE_LABEL[item.type]}</div>
+          <div className="text-center text-sm text-neutral-300">{displayPrefs.showType ? TYPE_LABEL[item.type] : "—"}</div>
 
-          {/* PROGRESS / HOURS */}
           <div className="text-center w-full">
-            {isGame ? (
+            {!displayPrefs.showProgress ? (
+              <div className="text-sm text-neutral-600">—</div>
+            ) : isGame ? (
               <>
                 <div className="text-sm text-neutral-200 tabular-nums whitespace-nowrap">{hoursText}</div>
 
@@ -6912,7 +8652,6 @@ function CardDraggable({
         : `${cur ?? 0}`
       : "—";
 
-        // ---------------- NOTES / DETAIL (BOARD VIEW) ----------------
   const [showNote, setShowNote] = React.useState(false);
   const [showDetail, setShowDetail] = React.useState(false);
   const [draftNote, setDraftNote] = React.useState(item.notes ?? "");
@@ -6935,7 +8674,6 @@ function CardDraggable({
         />
       ) : null}
 
-      {/* NOTE MODAL */}
       {showNote ? (
         <div
           className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4"
@@ -7010,7 +8748,6 @@ function CardDraggable({
           isDragging ? "opacity-70" : "opacity-100",
         ].join(" ")}
       >
-        {/* drag handle row */}
         <div
           className="flex items-center justify-between gap-2 px-3 py-2 bg-neutral-950 border-b border-neutral-800"
           {...listeners}
@@ -7022,7 +8759,6 @@ function CardDraggable({
         </div>
 
         <div className="p-4 flex gap-4">
-          {/* LEFT: poster + note button */}
           <div className="shrink-0 space-y-2">
             <button
               type="button"
@@ -7071,7 +8807,6 @@ function CardDraggable({
 
             <div className="text-[11px] text-neutral-500 mt-1">Score: {formatRatingValue(item.rating, ratingFormat)}</div>
 
-            {/* tiny note preview */}
             {item.notes ? (
               <div className="text-[11px] text-neutral-400 mt-1 line-clamp-1">{item.notes}</div>
             ) : null}
@@ -7143,9 +8878,7 @@ function CardDraggable({
       </div>
     </>
   );
-
 }
-
 
 /* ================= FRIEND READ-ONLY PROFILE VIEW ================= */
 
@@ -7573,6 +9306,246 @@ function FriendReadOnlyRow({
   );
 }
 
+function OwnerAdminDashboard({
+  overview,
+  status,
+  members,
+  selectedMember,
+  query,
+  onQueryChange,
+  onSelectMember,
+  onRefresh,
+  ratingFormat,
+}: {
+  overview: AdminOverviewResponse | null;
+  status: string;
+  members: AdminMemberOverview[];
+  selectedMember: AdminMemberOverview | null;
+  query: string;
+  onQueryChange: (value: string) => void;
+  onSelectMember: (id: string) => void;
+  onRefresh: () => void | Promise<void>;
+  ratingFormat: RatingFormat;
+}) {
+  const memberLabel = (member: AdminMemberOverview) => {
+    const normalized = normalizeSettings(member.settings);
+    return (
+      normalized.displayName?.trim() ||
+      member.profileDisplayName?.trim() ||
+      normalized.usernameTag?.trim() ||
+      member.username?.trim() ||
+      member.email?.trim() ||
+      member.id
+    );
+  };
+
+  const selectedSettings = selectedMember ? normalizeSettings(selectedMember.settings) : null;
+  const selectedStats = selectedMember ? computeVisibleProfileStats(selectedMember.items) : null;
+  const selectedPrivateCount = selectedMember?.items.filter((item) => item.isPrivate).length ?? 0;
+  const selectedRecentItems = selectedMember
+    ? sortMediaItems(selectedMember.items, "updated")
+    : [];
+
+  return (
+    <div className="space-y-4">
+      <Panel
+        title="Owner monitoring"
+        right={
+          <button
+            type="button"
+            onClick={() => void onRefresh()}
+            className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+          >
+            Refresh
+          </button>
+        }
+      >
+        <div className="rounded-2xl border border-amber-400/20 bg-amber-400/[0.06] px-4 py-3 text-xs text-amber-50/80">
+          Read-only owner view. It can show private member content for moderation and troubleshooting, but it never exposes passwords, session tokens, or Supabase service-role credentials to the browser.
+        </div>
+
+        <div className="text-[11px] text-neutral-500 mt-3">{status || "Ready."}</div>
+
+        {overview ? (
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 mt-4">
+            <MiniStat label="Members" value={String(overview.summary.members)} />
+            <MiniStat label="Media" value={String(overview.summary.mediaItems)} />
+            <MiniStat label="Public" value={String(overview.summary.publicItems)} />
+            <MiniStat label="Private" value={String(overview.summary.privateItems)} />
+            <MiniStat label="Completed" value={String(overview.summary.completedItems)} />
+            <MiniStat label="Pending requests" value={String(overview.summary.pendingFriendRequests)} />
+            <MiniStat label="Feedback" value={String(overview.summary.feedbackItems)} />
+          </div>
+        ) : null}
+      </Panel>
+
+      <div className="stack-admin-grid">
+        <Panel title="Members" right={<span className="text-xs text-neutral-500">{members.length}</span>}>
+          <label className="block mb-3">
+            <div className="text-xs text-neutral-400 mb-1">Search members</div>
+            <input
+              value={query}
+              onChange={(e) => onQueryChange(e.target.value)}
+              placeholder="Name, username, email, or user ID"
+              className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
+            />
+          </label>
+
+          <div className="space-y-2 max-h-[68vh] overflow-y-auto pr-1">
+            {members.length ? (
+              members.map((member) => {
+                const label = memberLabel(member);
+                const active = selectedMember?.id === member.id;
+                return (
+                  <button
+                    key={member.id}
+                    type="button"
+                    onClick={() => onSelectMember(member.id)}
+                    className={[
+                      "w-full text-left rounded-2xl border px-3 py-3 transition",
+                      active
+                        ? "bg-white/15 border-white/25"
+                        : "bg-neutral-950/70 border-white/10 hover:bg-white/5",
+                    ].join(" ")}
+                  >
+                    <div className="text-sm font-medium text-neutral-100 truncate">{label}</div>
+                    <div className="text-[11px] text-neutral-500 mt-1 truncate">
+                      {member.email || member.username || member.id}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5 mt-2 text-[10px] text-neutral-500">
+                      <span>{member.items.length} media</span>
+                      <span>•</span>
+                      <span>{member.friendCount} friends</span>
+                      <span>•</span>
+                      <span>{member.feedback.length} feedback</span>
+                    </div>
+                  </button>
+                );
+              })
+            ) : (
+              <div className="text-sm text-neutral-500 py-8 text-center">No members match this search.</div>
+            )}
+          </div>
+        </Panel>
+
+        <div className="space-y-4 min-w-0">
+          {selectedMember && selectedSettings && selectedStats ? (
+            <>
+              <Panel title={memberLabel(selectedMember)} right={<span className="text-xs text-neutral-500">Read only</span>}>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                  <AdminField label="User ID" value={selectedMember.id} mono />
+                  <AdminField label="Email" value={selectedMember.email || "—"} />
+                  <AdminField label="Username" value={selectedMember.username ? `@${selectedMember.username}` : "—"} />
+                  <AdminField label="Profile name" value={selectedMember.profileDisplayName || "—"} />
+                  <AdminField label="Created" value={selectedMember.createdAt ? new Date(selectedMember.createdAt).toLocaleString() : "—"} />
+                  <AdminField label="Last sign-in" value={selectedMember.lastSignInAt ? new Date(selectedMember.lastSignInAt).toLocaleString() : "—"} />
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4">
+                  <MiniStat label="Media" value={String(selectedMember.items.length)} />
+                  <MiniStat label="Private" value={String(selectedPrivateCount)} />
+                  <MiniStat label="Friends" value={String(selectedMember.friendCount)} />
+                  <MiniStat label="Feedback" value={String(selectedMember.feedback.length)} />
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2">
+                  <MiniStat label="Completed" value={String(selectedStats.completed)} />
+                  <MiniStat label="Active" value={String(selectedStats.inProgress)} />
+                  <MiniStat label="Planned" value={String(selectedStats.planned)} />
+                  <MiniStat label="Dropped" value={String(selectedStats.dropped)} />
+                </div>
+              </Panel>
+
+              <Panel title="Member settings">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                  <AdminField label="Display name" value={selectedSettings.displayName || "—"} />
+                  <AdminField label="Custom tag" value={selectedSettings.usernameTag || "—"} />
+                  <AdminField label="Theme" value={selectedSettings.colorTheme || "midnight"} />
+                  <AdminField label="Library style" value={selectedSettings.libraryStyle || "detailed"} />
+                  <AdminField label="Default view" value={selectedSettings.defaultBoardView || "board"} />
+                  <AdminField label="Rating format" value={selectedSettings.ratingFormat || "ten"} />
+                </div>
+                <div className="mt-3 rounded-2xl bg-neutral-950/70 border border-white/10 px-3 py-3">
+                  <div className="text-[11px] text-neutral-500 mb-1">Profile bio</div>
+                  <div className="text-sm text-neutral-300 whitespace-pre-wrap">{selectedSettings.profileBio?.trim() || "—"}</div>
+                </div>
+              </Panel>
+
+              <Panel title="Member library" right={<span className="text-xs text-neutral-500">Private items included for owner monitoring</span>}>
+                <div className="space-y-2 max-h-[72vh] overflow-y-auto pr-1">
+                  {selectedRecentItems.length ? (
+                    selectedRecentItems.map((item) => (
+                      <div key={item.id} className="rounded-2xl bg-neutral-950/70 border border-white/10 px-3 py-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="text-sm font-medium text-neutral-100 truncate">{item.title}</div>
+                            <div className="text-[11px] text-neutral-500 mt-1">
+                              {TYPE_LABEL[item.type]} • {item.status.replace("_", " ")} • {formatRatingValue(item.rating, ratingFormat)}
+                            </div>
+                            {item.tags?.length ? (
+                              <div className="text-[11px] text-neutral-500 mt-1 line-clamp-1">{item.tags.join(" • ")}</div>
+                            ) : null}
+                            {item.notes ? (
+                              <div className="text-xs text-neutral-400 mt-2 line-clamp-3 whitespace-pre-wrap">{item.notes}</div>
+                            ) : null}
+                          </div>
+                          <span
+                            className={[
+                              "shrink-0 px-2 py-1 rounded-lg border text-[10px]",
+                              item.isPrivate
+                                ? "bg-sky-400/10 border-sky-400/20 text-sky-100/80"
+                                : "bg-emerald-400/10 border-emerald-400/20 text-emerald-100/80",
+                            ].join(" ")}
+                          >
+                            {item.isPrivate ? "Private" : "Public"}
+                          </span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-sm text-neutral-500">This member has no media items.</div>
+                  )}
+                </div>
+              </Panel>
+
+              <Panel title="Member feedback">
+                <div className="space-y-2">
+                  {selectedMember.feedback.length ? (
+                    selectedMember.feedback
+                      .slice()
+                      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+                      .map((entry) => (
+                        <div key={entry.id} className="rounded-2xl bg-neutral-950/70 border border-white/10 px-3 py-3">
+                          <div className="text-[11px] text-neutral-500">
+                            {entry.type === "problem" ? "Problem" : "Suggestion"} • {(entry.status ?? "new").toUpperCase()} • {new Date(entry.createdAt).toLocaleString()}
+                          </div>
+                          <div className="text-sm text-neutral-200 mt-2 whitespace-pre-wrap">{entry.message}</div>
+                        </div>
+                      ))
+                  ) : (
+                    <div className="text-sm text-neutral-500">No feedback from this member.</div>
+                  )}
+                </div>
+              </Panel>
+            </>
+          ) : (
+            <EmptyState title="Select a member" message="Choose a member on the left to inspect their Stack data." />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AdminField({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="rounded-xl bg-neutral-950/70 border border-white/10 px-3 py-2 min-w-0">
+      <div className="text-[10px] uppercase tracking-wide text-neutral-600">{label}</div>
+      <div className={["text-xs text-neutral-200 mt-1 break-words", mono ? "font-mono" : ""].join(" ")}>{value}</div>
+    </div>
+  );
+}
+
 /* ================= SMALL UI COMPONENTS ================= */
 
 function Panel({
@@ -7621,7 +9594,6 @@ function MiniStat({ label, value, sub }: { label: string; value: string; sub?: s
   );
 }
 
-
 function StatCard({ title, value, sub }: { title: string; value: string; sub?: string }) {
   return (
     <div className="bg-neutral-950/72 p-4 rounded-2xl ring-1 ring-neutral-800/80 shadow-sm text-center">
@@ -7649,9 +9621,6 @@ function BarRow({ label, value, total }: { label: string; value: number; total: 
   );
 }
 
-/**
- * Simple pie chart (SVG) — colored slices.
- */
 function PieChartSimple({ data }: { data: Array<{ label: string; value: number }> }) {
   const total = Math.max(1, data.reduce((a, b) => a + (b.value || 0), 0));
   let acc = 0;
@@ -7690,7 +9659,6 @@ function PieChartSimple({ data }: { data: Array<{ label: string; value: number }
     </div>
   );
 }
-
 
 function Select({
   label,
