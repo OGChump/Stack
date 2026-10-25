@@ -256,6 +256,8 @@ const LOCAL_BACKUP_KEY = "stack-items-backup-v1";
 const LOCAL_LAST_GOOD_KEY = "stack-items-backup-v1-last-good";
 const LOCAL_BOARD_VIEW_KEY = "stack-board-view-v1";
 const LOCAL_COLOR_THEME_KEY = "stack-color-theme-v1";
+const LOCAL_BACKGROUND_IMAGE_KEY = "stack-background-image-v1";
+const LOCAL_BANNER_IMAGE_KEY = "stack-banner-image-v1";
 const STACK_ADMIN_USER_IDS = ["a990813e-af9d-4e1c-a15d-2e9281128c71"];
 
 function backupKeyForUser(uid?: string | null) {
@@ -349,6 +351,152 @@ function saveLocalColorTheme(theme: StackColorTheme) {
   try {
     document.cookie = `stack_color_theme=${theme}; Max-Age=31536000; Path=/; SameSite=Lax`;
   } catch {}
+}
+
+function loadLocalBackgroundImage(): string {
+  if (typeof window === "undefined") return "";
+
+  try {
+    const stored = String(localStorage.getItem(LOCAL_BACKGROUND_IMAGE_KEY) ?? "").trim();
+    if (stored) return stored;
+  } catch {}
+
+  try {
+    const cookieValue = document.cookie
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("stack_background_image="))
+      ?.slice("stack_background_image=".length);
+
+    return cookieValue ? decodeURIComponent(cookieValue).trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function saveLocalBackgroundImage(url: string) {
+  if (typeof window === "undefined") return;
+
+  const clean = String(url ?? "").trim();
+
+  try {
+    if (clean) localStorage.setItem(LOCAL_BACKGROUND_IMAGE_KEY, clean);
+    else localStorage.removeItem(LOCAL_BACKGROUND_IMAGE_KEY);
+  } catch {}
+
+  try {
+    document.cookie = clean
+      ? `stack_background_image=${encodeURIComponent(clean)}; Max-Age=31536000; Path=/; SameSite=Lax`
+      : "stack_background_image=; Max-Age=0; Path=/; SameSite=Lax";
+  } catch {}
+}
+
+function loadLocalBannerImage(): string {
+  if (typeof window === "undefined") return "";
+
+  try {
+    const stored = String(localStorage.getItem(LOCAL_BANNER_IMAGE_KEY) ?? "").trim();
+    if (stored) return stored;
+  } catch {}
+
+  try {
+    const cookieValue = document.cookie
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("stack_banner_image="))
+      ?.slice("stack_banner_image=".length);
+
+    return cookieValue ? decodeURIComponent(cookieValue).trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function saveLocalBannerImage(url: string) {
+  if (typeof window === "undefined") return;
+
+  const clean = String(url ?? "").trim();
+
+  try {
+    if (clean) localStorage.setItem(LOCAL_BANNER_IMAGE_KEY, clean);
+    else localStorage.removeItem(LOCAL_BANNER_IMAGE_KEY);
+  } catch {}
+
+  try {
+    document.cookie = clean
+      ? `stack_banner_image=${encodeURIComponent(clean)}; Max-Age=31536000; Path=/; SameSite=Lax`
+      : "stack_banner_image=; Max-Age=0; Path=/; SameSite=Lax";
+  } catch {}
+}
+
+function applyStackBannerToDocument(urlValue: unknown) {
+  if (typeof document === "undefined") return;
+
+  const clean = typeof urlValue === "string" ? urlValue.trim() : "";
+  const root = document.documentElement;
+
+  if (!clean) {
+    root.style.removeProperty("--stack-custom-banner-image");
+    root.style.removeProperty("--stack-custom-banner-base");
+    delete root.dataset.stackCustomBanner;
+    return;
+  }
+
+  const cssUrl = JSON.stringify(clean);
+  root.style.setProperty("--stack-custom-banner-image", `url(${cssUrl})`);
+  root.style.setProperty("--stack-custom-banner-base", "#03060e");
+  root.dataset.stackCustomBanner = "1";
+
+  try {
+    let preload = document.querySelector('link[data-stack-banner-preload="1"]') as HTMLLinkElement | null;
+    if (!preload) {
+      preload = document.createElement("link");
+      preload.rel = "preload";
+      preload.as = "image";
+      preload.setAttribute("data-stack-banner-preload", "1");
+      preload.setAttribute("fetchpriority", "high");
+      document.head.appendChild(preload);
+    }
+    preload.href = clean;
+  } catch {}
+}
+
+function applyStackBackgroundToDocument(urlValue: unknown) {
+  if (typeof document === "undefined") return;
+
+  const clean = typeof urlValue === "string" ? urlValue.trim() : "";
+  const root = document.documentElement;
+
+  if (!clean) {
+    root.style.removeProperty("--stack-custom-background");
+    root.style.removeProperty("background-color");
+    root.style.removeProperty("background-image");
+    root.style.removeProperty("background-position");
+    root.style.removeProperty("background-size");
+    root.style.removeProperty("background-repeat");
+    root.style.removeProperty("background-attachment");
+    delete root.dataset.stackCustomBackground;
+    return;
+  }
+
+  const cssUrl = JSON.stringify(clean);
+  const overlay = "linear-gradient(rgba(3, 6, 14, 0.76), rgba(3, 6, 14, 0.90))";
+
+  // The final dark layer prevents the selected color theme from flashing through
+  // while a remote production background image is still downloading.
+  root.style.setProperty(
+    "--stack-custom-background",
+    `${overlay}, url(${cssUrl}) center / cover fixed, linear-gradient(#03060e, #03060e)`
+  );
+
+  // Paint the document root immediately too, before the Stack shell/CSS is ready.
+  root.style.backgroundColor = "#03060e";
+  root.style.backgroundImage = `${overlay}, url(${cssUrl})`;
+  root.style.backgroundPosition = "center, center";
+  root.style.backgroundSize = "cover, cover";
+  root.style.backgroundRepeat = "no-repeat, no-repeat";
+  root.style.backgroundAttachment = "fixed, fixed";
+  root.dataset.stackCustomBackground = "1";
 }
 
 const STACK_COLOR_THEMES: Record<
@@ -1281,18 +1429,24 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   useEffect(() => {
     const savedTheme = loadLocalColorTheme();
+    const savedBackground = loadLocalBackgroundImage();
+    const savedBanner = loadLocalBannerImage();
 
-    // The root boot script has already painted this palette before React.
-    // Re-applying here is idempotent and keeps the runtime state in sync.
+    // The root boot script has already painted these before React.
+    // Re-applying here is idempotent and keeps runtime state in sync.
     applyStackThemeToDocument(savedTheme);
+    applyStackBackgroundToDocument(savedBackground);
+    applyStackBannerToDocument(savedBanner);
 
     setSettings((prev) => {
-      if (prev.colorTheme === savedTheme) return prev;
-
-      return {
+      const next = {
         ...prev,
         colorTheme: savedTheme,
+        backgroundImageUrl: savedBackground || prev.backgroundImageUrl || "",
+        bannerImageUrl: savedBanner || prev.bannerImageUrl || "",
       };
+
+      return next;
     });
   }, []);
 
@@ -1591,6 +1745,20 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       saveLocalColorTheme(patch.colorTheme);
     }
 
+    if (typeof patch.backgroundImageUrl === "string") {
+      // Backgrounds use the same pre-paint persistence strategy as color themes.
+      // This prevents theme -> image flicker on refresh and route changes.
+      applyStackBackgroundToDocument(patch.backgroundImageUrl);
+      saveLocalBackgroundImage(patch.backgroundImageUrl);
+    }
+
+    if (typeof patch.bannerImageUrl === "string") {
+      // Banners are cached and preloaded before paint too, so the theme surface
+      // does not flash through while the remote banner image is downloading.
+      applyStackBannerToDocument(patch.bannerImageUrl);
+      saveLocalBannerImage(patch.bannerImageUrl);
+    }
+
     setSettings((prev) => ({ ...prev, ...patch }));
   }, []);
 
@@ -1598,11 +1766,24 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     if (typeof window === "undefined") return;
 
     const onStorage = (e: StorageEvent) => {
-      if (e.key !== LOCAL_COLOR_THEME_KEY) return;
-      if (!isStackColorTheme(e.newValue)) return;
+      if (e.key === LOCAL_COLOR_THEME_KEY && isStackColorTheme(e.newValue)) {
+        applyStackThemeToDocument(e.newValue);
+        setSettings((prev) => ({ ...prev, colorTheme: e.newValue as StackColorTheme }));
+        return;
+      }
 
-      applyStackThemeToDocument(e.newValue);
-      setSettings((prev) => ({ ...prev, colorTheme: e.newValue as StackColorTheme }));
+      if (e.key === LOCAL_BACKGROUND_IMAGE_KEY) {
+        const nextBackground = String(e.newValue ?? "").trim();
+        applyStackBackgroundToDocument(nextBackground);
+        setSettings((prev) => ({ ...prev, backgroundImageUrl: nextBackground }));
+        return;
+      }
+
+      if (e.key === LOCAL_BANNER_IMAGE_KEY) {
+        const nextBanner = String(e.newValue ?? "").trim();
+        applyStackBannerToDocument(nextBanner);
+        setSettings((prev) => ({ ...prev, bannerImageUrl: nextBanner }));
+      }
     };
 
     window.addEventListener("storage", onStorage);
@@ -2161,12 +2342,18 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const applyLoadedSettings = useCallback((rawSettings: unknown) => {
     const nextSettings = normalizeSettings(rawSettings);
     const theme = nextSettings.colorTheme ?? DEFAULT_SETTINGS.colorTheme;
+    const background = String(nextSettings.backgroundImageUrl ?? "").trim();
+    const banner = String(nextSettings.bannerImageUrl ?? "").trim();
 
     if (isStackColorTheme(theme)) {
       applyStackThemeToDocument(theme);
       saveLocalColorTheme(theme);
     }
 
+    applyStackBackgroundToDocument(background);
+    saveLocalBackgroundImage(background);
+    applyStackBannerToDocument(banner);
+    saveLocalBannerImage(banner);
     setSettings(nextSettings);
   }, []);
 
@@ -2262,6 +2449,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       setItems([]);
       applyStackThemeToDocument(DEFAULT_SETTINGS.colorTheme);
       saveLocalColorTheme(DEFAULT_SETTINGS.colorTheme);
+      applyStackBackgroundToDocument("");
+      saveLocalBackgroundImage("");
+      applyStackBannerToDocument("");
+      saveLocalBannerImage("");
       setSettings(DEFAULT_SETTINGS);
       setFeedbackEntries([]);
       setCloudExtraData({});
@@ -3463,27 +3654,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     }
   }, [userId]);
 
-  const filteredAdminMembers = useMemo(() => {
-    const q = adminMemberQuery.trim().toLowerCase();
-    const members = adminOverview?.members ?? [];
-    if (!q) return members;
-
-    return members.filter((member) => {
-      const normalized = normalizeSettings(member.settings);
-      return [
-        normalized.displayName,
-        normalized.usernameTag,
-        member.profileDisplayName,
-        member.username,
-        member.email,
-        member.id,
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-        .includes(q);
-    });
-  }, [adminOverview, adminMemberQuery]);
+  const adminMembers = useMemo(() => adminOverview?.members ?? [], [adminOverview]);
 
   const selectedAdminMember = useMemo(() => {
     if (!selectedAdminMemberId) return null;
@@ -4442,15 +4613,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           .filter(Boolean)
           .join(" ")}
       >
-        {backgroundImageUrl ? (
-          <div
-            aria-hidden="true"
-            className="stack-custom-background"
-            style={{
-              backgroundImage: `linear-gradient(rgba(3, 6, 14, 0.76), rgba(3, 6, 14, 0.90)), url(${JSON.stringify(backgroundImageUrl)})`,
-            }}
-          />
-        ) : null}
         <style>{`
           :root {
             --stack-theme-bg: ${STACK_COLOR_THEMES.midnight.bg};
@@ -4466,19 +4628,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           }
 
           .stack-bg {
-            background: var(--stack-theme-bg) !important;
+            background: var(--stack-custom-background, var(--stack-theme-bg)) !important;
             color: var(--stack-theme-fg) !important;
-          }
-
-          .stack-custom-background {
-            position: fixed;
-            inset: 0;
-            z-index: 0;
-            background-position: center;
-            background-size: cover;
-            background-repeat: no-repeat;
-            filter: saturate(0.92) contrast(1.02);
-            pointer-events: none;
           }
 
           .stack-surface-glass .stack-surface {
@@ -4661,13 +4812,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           {/* Header */}
           <header className="space-y-4">
             <div className="relative overflow-hidden rounded-[2rem] stack-surface border border-white/10 shadow-2xl shadow-black/20">
-              {bannerImageUrl ? (
-                <div
-                  aria-hidden="true"
-                  className="absolute inset-0 bg-cover bg-center opacity-35"
-                  style={{ backgroundImage: `url(${JSON.stringify(bannerImageUrl)})` }}
-                />
-              ) : null}
+              <div
+                aria-hidden="true"
+                className="absolute inset-0 bg-cover bg-center opacity-35"
+                style={{
+                  backgroundColor: "var(--stack-custom-banner-base, #03060e)",
+                  backgroundImage: bannerImageUrl
+                    ? `url(${JSON.stringify(bannerImageUrl)})`
+                    : "var(--stack-custom-banner-image, none)",
+                }}
+              />
               <div className="absolute inset-0 bg-gradient-to-r from-black/72 via-black/38 to-transparent pointer-events-none" />
               <div className="relative p-4 sm:p-6 flex flex-col lg:flex-row lg:items-end lg:justify-between gap-5">
                 <div className="min-w-0">
@@ -6902,14 +7056,17 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           {/* SETTINGS PAGE */}
           {view === "settings" ? (
             <div className="space-y-5 max-w-6xl mx-auto">
-              <div className="relative overflow-hidden rounded-[2rem] stack-accent border border-white/10 shadow-2xl shadow-black/20">
-                {bannerImageUrl ? (
-                  <div
-                    aria-hidden="true"
-                    className="absolute inset-0 bg-cover bg-center opacity-45"
-                    style={{ backgroundImage: `url(${JSON.stringify(bannerImageUrl)})` }}
-                  />
-                ) : null}
+              <div className="relative overflow-hidden rounded-[2rem] bg-[#03060e] border border-white/10 shadow-2xl shadow-black/20">
+                <div
+                  aria-hidden="true"
+                  className="absolute inset-0 bg-cover bg-center opacity-45"
+                  style={{
+                    backgroundColor: "var(--stack-custom-banner-base, #03060e)",
+                    backgroundImage: bannerImageUrl
+                      ? `url(${JSON.stringify(bannerImageUrl)})`
+                      : "var(--stack-custom-banner-image, none)",
+                  }}
+                />
                 <div className="absolute inset-0 bg-gradient-to-r from-black/65 via-black/35 to-transparent pointer-events-none" />
                 <div className="relative p-5 sm:p-8">
                   <div className="stack-section-kicker">Personal control center</div>
@@ -6982,13 +7139,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       onChange={(v) => updateSettings({ bannerImageUrl: v })}
                       helper="Used as a decorative banner in Settings and future profile surfaces."
                     />
-                    <div className="mt-4 overflow-hidden rounded-3xl border border-white/10 min-h-[170px] relative stack-accent">
-                      {bannerImageUrl ? (
-                        <div
-                          className="absolute inset-0 bg-cover bg-center"
-                          style={{ backgroundImage: `url(${JSON.stringify(bannerImageUrl)})` }}
-                        />
-                      ) : null}
+                    <div className="mt-4 overflow-hidden rounded-3xl border border-white/10 min-h-[170px] relative bg-[#03060e]">
+                      <div
+                        className="absolute inset-0 bg-cover bg-center"
+                        style={{
+                          backgroundColor: "var(--stack-custom-banner-base, #03060e)",
+                          backgroundImage: bannerImageUrl
+                            ? `url(${JSON.stringify(bannerImageUrl)})`
+                            : "var(--stack-custom-banner-image, none)",
+                        }}
+                      />
                       <div className="absolute inset-0 bg-gradient-to-r from-black/75 via-black/35 to-transparent" />
                       <div className="relative p-5 sm:p-7 flex items-end min-h-[170px]">
                         <div>
@@ -7313,10 +7473,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 <OwnerAdminDashboard
                   overview={adminOverview}
                   status={adminOverviewStatus}
-                  members={filteredAdminMembers}
+                  members={adminMembers}
                   selectedMember={selectedAdminMember}
-                  query={adminMemberQuery}
-                  onQueryChange={setAdminMemberQuery}
                   onSelectMember={setSelectedAdminMemberId}
                   onRefresh={loadAdminOverview}
                   ratingFormat={settings.ratingFormat ?? "ten"}
@@ -9113,6 +9271,8 @@ function FriendReadOnlyCard({
 }) {
   const [showDetail, setShowDetail] = React.useState(false);
   const displayPoster = item.posterOverrideUrl || item.posterUrl;
+  const visibleNote = privacy.showNotes ? item.notes : undefined;
+  const hasLongNote = !!visibleNote && visibleNote.length > 120;
 
   return (
     <>
@@ -9161,8 +9321,19 @@ function FriendReadOnlyCard({
             {privacy.showRatings ? (
               <div className="text-[11px] text-neutral-500 mt-1">Score: {formatRatingValue(item.rating, ratingFormat)}</div>
             ) : null}
-            {privacy.showNotes && item.notes ? (
-              <div className="text-[11px] text-neutral-400 mt-1 line-clamp-2">{item.notes}</div>
+            {visibleNote ? (
+              <div className="mt-1">
+                <div className="text-[11px] text-neutral-400 line-clamp-3 whitespace-pre-wrap">{visibleNote}</div>
+                {hasLongNote ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowDetail(true)}
+                    className="mt-1 text-[11px] px-2 py-1 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-200"
+                  >
+                    Read full note
+                  </button>
+                ) : null}
+              </div>
             ) : null}
             {privacy.showTags && item.tags?.length ? (
               <div className="text-[11px] text-neutral-500 mt-1 line-clamp-1">{item.tags.join(" • ")}</div>
@@ -9311,8 +9482,6 @@ function OwnerAdminDashboard({
   status,
   members,
   selectedMember,
-  query,
-  onQueryChange,
   onSelectMember,
   onRefresh,
   ratingFormat,
@@ -9321,8 +9490,6 @@ function OwnerAdminDashboard({
   status: string;
   members: AdminMemberOverview[];
   selectedMember: AdminMemberOverview | null;
-  query: string;
-  onQueryChange: (value: string) => void;
   onSelectMember: (id: string) => void;
   onRefresh: () => void | Promise<void>;
   ratingFormat: RatingFormat;
@@ -9380,16 +9547,10 @@ function OwnerAdminDashboard({
       </Panel>
 
       <div className="stack-admin-grid">
-        <Panel title="Members" right={<span className="text-xs text-neutral-500">{members.length}</span>}>
-          <label className="block mb-3">
-            <div className="text-xs text-neutral-400 mb-1">Search members</div>
-            <input
-              value={query}
-              onChange={(e) => onQueryChange(e.target.value)}
-              placeholder="Name, username, email, or user ID"
-              className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-base sm:text-sm outline-none focus:border-neutral-500"
-            />
-          </label>
+        <Panel title="All members" right={<span className="text-xs text-neutral-500">{members.length}</span>}>
+          <div className="text-xs text-neutral-500 mb-3">
+            Every Stack member is listed here automatically. Select anyone to view their account and library details.
+          </div>
 
           <div className="space-y-2 max-h-[68vh] overflow-y-auto pr-1">
             {members.length ? (
@@ -9423,7 +9584,7 @@ function OwnerAdminDashboard({
                 );
               })
             ) : (
-              <div className="text-sm text-neutral-500 py-8 text-center">No members match this search.</div>
+              <div className="text-sm text-neutral-500 py-8 text-center">No members are available yet.</div>
             )}
           </div>
         </Panel>

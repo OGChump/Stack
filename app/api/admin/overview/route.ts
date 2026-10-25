@@ -16,6 +16,25 @@ function safeArray<T = unknown>(value: unknown): T[] {
   return Array.isArray(value) ? (value as T[]) : [];
 }
 
+async function listAllAuthUsers(admin: ReturnType<typeof createSupabaseAdmin>) {
+  const users = [];
+  const perPage = 1000;
+  let page = 1;
+
+  while (true) {
+    const result = await admin.auth.admin.listUsers({ page, perPage });
+    if (result.error) throw result.error;
+
+    const batch = result.data.users ?? [];
+    users.push(...batch);
+
+    if (batch.length < perPage) break;
+    page += 1;
+  }
+
+  return users;
+}
+
 export async function GET(request: NextRequest) {
   try {
     const authHeader = request.headers.get("authorization") || "";
@@ -25,7 +44,21 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: "Missing access token." }, { status: 401 });
     }
 
-    const admin = createSupabaseAdmin();
+    let admin: ReturnType<typeof createSupabaseAdmin>;
+
+    try {
+      admin = createSupabaseAdmin();
+    } catch (error) {
+      console.error("Owner monitoring configuration error", error);
+      return NextResponse.json(
+        {
+          error:
+            "Owner monitoring is not configured on this deployment. Add SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY) to the server environment and redeploy.",
+        },
+        { status: 503 }
+      );
+    }
+
     const { data: authData, error: authError } = await admin.auth.getUser(token);
     const requestingUser = authData.user;
 
@@ -37,47 +70,72 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: "Admin access required." }, { status: 403 });
     }
 
-    const [mediaResult, profilesResult, requestsResult, friendsResult, usersResult] =
-      await Promise.all([
-        admin.from("media_items").select("user_id,data"),
-        admin.from("profiles").select("id,username,display_name"),
-        admin
-          .from("friend_requests")
-          .select("id,requester_id,requested_id,status,created_at"),
-        admin.from("friends").select("user_id,friend_id"),
-        admin.auth.admin.listUsers({ page: 1, perPage: 1000 }),
-      ]);
+    const [mediaResult, requestsResult, friendsResult, authUsers] = await Promise.all([
+      admin.from("media_items").select("user_id,data"),
+      admin
+        .from("friend_requests")
+        .select("id,requester_id,requested_id,status,created_at"),
+      admin.from("friends").select("user_id,friend_id"),
+      listAllAuthUsers(admin),
+    ]);
 
     if (mediaResult.error) throw mediaResult.error;
-    if (profilesResult.error) throw profilesResult.error;
-    if (requestsResult.error) throw requestsResult.error;
-    if (friendsResult.error) throw friendsResult.error;
-    if (usersResult.error) throw usersResult.error;
+
+    if (requestsResult.error) {
+      console.warn("Owner monitoring: friend_requests unavailable", requestsResult.error);
+    }
+
+    if (friendsResult.error) {
+      console.warn("Owner monitoring: friends unavailable", friendsResult.error);
+    }
+
+    let profileRows: Array<{
+      id: string;
+      username?: string | null;
+      display_name?: string | null;
+    }> = [];
+
+    const profilesResult = await admin.from("profiles").select("*");
+    if (profilesResult.error) {
+      console.warn("Owner monitoring: profiles unavailable", profilesResult.error);
+    } else {
+      profileRows = (profilesResult.data ?? []).map((row: Record<string, unknown>) => ({
+        id: String(row.id ?? ""),
+        username: typeof row.username === "string" ? row.username : null,
+        display_name: typeof row.display_name === "string" ? row.display_name : null,
+      }));
+    }
 
     const mediaRows = mediaResult.data ?? [];
-    const profileRows = profilesResult.data ?? [];
-    const requestRows = requestsResult.data ?? [];
-    const friendRows = friendsResult.data ?? [];
-    const authUsers = usersResult.data.users ?? [];
+    const requestRows = requestsResult.error ? [] : requestsResult.data ?? [];
+    const friendRows = friendsResult.error ? [] : friendsResult.data ?? [];
 
-    const profileById = new Map(profileRows.map((row) => [row.id, row]));
+    const profileById = new Map(profileRows.filter((row) => row.id).map((row) => [row.id, row]));
     const mediaById = new Map(mediaRows.map((row) => [row.user_id, row]));
     const authById = new Map(authUsers.map((user) => [user.id, user]));
 
     const ids = new Set<string>();
     authUsers.forEach((user) => ids.add(user.id));
     mediaRows.forEach((row) => ids.add(row.user_id));
-    profileRows.forEach((row) => ids.add(row.id));
+    profileRows.forEach((row) => {
+      if (row.id) ids.add(row.id);
+    });
 
     const members = Array.from(ids).map((id) => {
       const authUser = authById.get(id);
       const profile = profileById.get(id);
       const rawData = mediaById.get(id)?.data;
-      const data = rawData && typeof rawData === "object" && !Array.isArray(rawData)
-        ? (rawData as Record<string, unknown>)
-        : {};
 
-      const items = safeArray<Record<string, unknown>>(data.items);
+      const legacyItems = Array.isArray(rawData)
+        ? safeArray<Record<string, unknown>>(rawData)
+        : null;
+
+      const data =
+        rawData && typeof rawData === "object" && !Array.isArray(rawData)
+          ? (rawData as Record<string, unknown>)
+          : {};
+
+      const items = legacyItems ?? safeArray<Record<string, unknown>>(data.items);
       const feedback = safeArray<Record<string, unknown>>(data.feedback);
       const settings =
         data.settings && typeof data.settings === "object" && !Array.isArray(data.settings)
@@ -155,6 +213,9 @@ export async function GET(request: NextRequest) {
     );
   } catch (error) {
     console.error("Admin overview error", error);
-    return NextResponse.json({ error: "Could not load admin overview." }, { status: 500 });
+    return NextResponse.json(
+      { error: "Could not load admin overview. Check the server logs for details." },
+      { status: 500 }
+    );
   }
 }
