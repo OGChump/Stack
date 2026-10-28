@@ -2,7 +2,7 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import {
@@ -25,8 +25,8 @@ type RatingFormat = "ten" | "five" | "stars" | "percent";
 type StackColorTheme = "midnight" | "ocean" | "emerald" | "violet" | "rose" | "amber";
 type StackLibraryStyle = "detailed" | "poster" | "classic";
 type StackPosterSize = "small" | "medium" | "large";
-type StackSurfaceStyle = "glass" | "solid";
-type StackCornerStyle = "rounded" | "soft" | "square";
+type StackSurfaceStyle = "glass";
+type StackCornerStyle = "rounded" | "square";
 
 export type StackView =
   | "all"
@@ -258,14 +258,106 @@ const LOCAL_BOARD_VIEW_KEY = "stack-board-view-v1";
 const LOCAL_COLOR_THEME_KEY = "stack-color-theme-v1";
 const LOCAL_BACKGROUND_IMAGE_KEY = "stack-background-image-v1";
 const LOCAL_BANNER_IMAGE_KEY = "stack-banner-image-v1";
+const LOCAL_LIBRARY_STYLE_KEY = "stack-library-style-v1";
+const LOCAL_ACTIVE_USER_KEY = "stack-active-user-v1";
+const SESSION_CONFIRMED_USER_KEY = "stack-session-confirmed-user-v1";
+const SESSION_DISPLAY_CACHE_KEY = "stack-session-display-cache-v1";
 const STACK_ADMIN_USER_IDS = ["a990813e-af9d-4e1c-a15d-2e9281128c71"];
 
-function backupKeyForUser(uid?: string | null) {
-  return uid ? `${LOCAL_BACKUP_KEY}:${uid}` : LOCAL_BACKUP_KEY;
+function scopedLocalKey(base: string, uid?: string | null) {
+  const cleanUid = String(uid ?? "").trim();
+  return cleanUid ? `${base}:${cleanUid}` : base;
 }
 
-function lastGoodKeyForUser(uid?: string | null) {
-  return uid ? `${LOCAL_LAST_GOOD_KEY}:${uid}` : LOCAL_LAST_GOOD_KEY;
+function backupKeyForUser(uid: string) {
+  return scopedLocalKey(LOCAL_BACKUP_KEY, uid);
+}
+
+function lastGoodKeyForUser(uid: string) {
+  return scopedLocalKey(LOCAL_LAST_GOOD_KEY, uid);
+}
+
+function loadLocalActiveUserId(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return String(localStorage.getItem(LOCAL_ACTIVE_USER_KEY) ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function saveLocalActiveUserId(uid?: string | null) {
+  if (typeof window === "undefined") return;
+  const cleanUid = String(uid ?? "").trim();
+  try {
+    if (cleanUid) localStorage.setItem(LOCAL_ACTIVE_USER_KEY, cleanUid);
+    else localStorage.removeItem(LOCAL_ACTIVE_USER_KEY);
+  } catch {}
+}
+
+function loadSessionConfirmedUserId(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return String(sessionStorage.getItem(SESSION_CONFIRMED_USER_KEY) ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function saveSessionConfirmedUserId(uid?: string | null) {
+  if (typeof window === "undefined") return;
+  const cleanUid = String(uid ?? "").trim();
+  try {
+    if (cleanUid) sessionStorage.setItem(SESSION_CONFIRMED_USER_KEY, cleanUid);
+    else sessionStorage.removeItem(SESSION_CONFIRMED_USER_KEY);
+  } catch {}
+}
+
+type SessionDisplayCache = {
+  userId: string;
+  items: MediaItem[];
+  settings: StackSettings;
+  feedback: FeedbackEntry[];
+  cloudExtraData: Record<string, any>;
+  savedAt: string;
+};
+
+function sessionDisplayCacheKeyForUser(uid: string) {
+  return `${SESSION_DISPLAY_CACHE_KEY}:${uid}`;
+}
+
+function loadSessionDisplayCache(uid: string): SessionDisplayCache | null {
+  if (typeof window === "undefined" || !uid) return null;
+  try {
+    const raw = sessionStorage.getItem(sessionDisplayCacheKeyForUser(uid));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as SessionDisplayCache;
+    if (parsed?.userId !== uid || !Array.isArray(parsed?.items)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function saveSessionDisplayCache(
+  uid: string,
+  items: MediaItem[],
+  settings: StackSettings,
+  feedback: FeedbackEntry[],
+  cloudExtraData: Record<string, any>
+) {
+  if (typeof window === "undefined" || !uid) return;
+  try {
+    const payload: SessionDisplayCache = {
+      userId: uid,
+      items,
+      settings: normalizeSettings(settings),
+      feedback,
+      cloudExtraData,
+      savedAt: new Date().toISOString(),
+    };
+    sessionStorage.setItem(sessionDisplayCacheKeyForUser(uid), JSON.stringify(payload));
+  } catch {}
 }
 
 function parseBackupItems(raw: string | null): MediaItem[] | null {
@@ -282,6 +374,22 @@ function parseBackupItems(raw: string | null): MediaItem[] | null {
     return cleaned;
   } catch {
     return null;
+  }
+}
+
+function persistenceFingerprint(
+  items: MediaItem[],
+  settings: StackSettings,
+  feedback: FeedbackEntry[]
+) {
+  try {
+    return JSON.stringify({
+      items,
+      settings: normalizeSettings(settings),
+      feedback,
+    });
+  } catch {
+    return "";
   }
 }
 
@@ -322,110 +430,110 @@ function isStackColorTheme(value: unknown): value is StackColorTheme {
   return typeof value === "string" && STACK_COLOR_THEME_VALUES.includes(value as StackColorTheme);
 }
 
-function loadLocalColorTheme(): StackColorTheme {
+function loadLocalColorTheme(uid?: string | null): StackColorTheme {
   if (typeof window === "undefined") return "midnight";
 
+  const activeUid = String(uid ?? loadLocalActiveUserId()).trim();
+
   try {
-    const stored = localStorage.getItem(LOCAL_COLOR_THEME_KEY);
+    const stored = localStorage.getItem(scopedLocalKey(LOCAL_COLOR_THEME_KEY, activeUid));
     if (isStackColorTheme(stored)) return stored;
+  } catch {}
 
-    const cookieTheme = document.cookie
-      .split(";")
-      .map((part) => part.trim())
-      .find((part) => part.startsWith("stack_color_theme="))
-      ?.split("=")[1];
-
-    return isStackColorTheme(cookieTheme) ? cookieTheme : "midnight";
-  } catch {
-    return "midnight";
-  }
+  // Do not borrow another account's legacy appearance cache. Cloud settings will
+  // populate the scoped key after the authenticated user is verified.
+  return "midnight";
 }
 
-function saveLocalColorTheme(theme: StackColorTheme) {
+function saveLocalColorTheme(theme: StackColorTheme, uid?: string | null) {
   if (typeof window === "undefined") return;
+  const activeUid = String(uid ?? loadLocalActiveUserId()).trim();
+  if (!activeUid) return;
 
   try {
-    localStorage.setItem(LOCAL_COLOR_THEME_KEY, theme);
-  } catch {}
-
-  try {
-    document.cookie = `stack_color_theme=${theme}; Max-Age=31536000; Path=/; SameSite=Lax`;
+    localStorage.setItem(scopedLocalKey(LOCAL_COLOR_THEME_KEY, activeUid), theme);
   } catch {}
 }
 
-function loadLocalBackgroundImage(): string {
+function loadLocalBackgroundImage(uid?: string | null): string {
   if (typeof window === "undefined") return "";
+  const activeUid = String(uid ?? loadLocalActiveUserId()).trim();
+  if (!activeUid) return "";
 
   try {
-    const stored = String(localStorage.getItem(LOCAL_BACKGROUND_IMAGE_KEY) ?? "").trim();
-    if (stored) return stored;
-  } catch {}
-
-  try {
-    const cookieValue = document.cookie
-      .split(";")
-      .map((part) => part.trim())
-      .find((part) => part.startsWith("stack_background_image="))
-      ?.slice("stack_background_image=".length);
-
-    return cookieValue ? decodeURIComponent(cookieValue).trim() : "";
+    return String(
+      localStorage.getItem(scopedLocalKey(LOCAL_BACKGROUND_IMAGE_KEY, activeUid)) ?? ""
+    ).trim();
   } catch {
     return "";
   }
 }
 
-function saveLocalBackgroundImage(url: string) {
+function saveLocalBackgroundImage(url: string, uid?: string | null) {
   if (typeof window === "undefined") return;
+  const activeUid = String(uid ?? loadLocalActiveUserId()).trim();
+  if (!activeUid) return;
 
   const clean = String(url ?? "").trim();
-
+  const key = scopedLocalKey(LOCAL_BACKGROUND_IMAGE_KEY, activeUid);
   try {
-    if (clean) localStorage.setItem(LOCAL_BACKGROUND_IMAGE_KEY, clean);
-    else localStorage.removeItem(LOCAL_BACKGROUND_IMAGE_KEY);
-  } catch {}
-
-  try {
-    document.cookie = clean
-      ? `stack_background_image=${encodeURIComponent(clean)}; Max-Age=31536000; Path=/; SameSite=Lax`
-      : "stack_background_image=; Max-Age=0; Path=/; SameSite=Lax";
+    if (clean) localStorage.setItem(key, clean);
+    else localStorage.removeItem(key);
   } catch {}
 }
 
-function loadLocalBannerImage(): string {
+function loadLocalBannerImage(uid?: string | null): string {
   if (typeof window === "undefined") return "";
+  const activeUid = String(uid ?? loadLocalActiveUserId()).trim();
+  if (!activeUid) return "";
 
   try {
-    const stored = String(localStorage.getItem(LOCAL_BANNER_IMAGE_KEY) ?? "").trim();
-    if (stored) return stored;
-  } catch {}
-
-  try {
-    const cookieValue = document.cookie
-      .split(";")
-      .map((part) => part.trim())
-      .find((part) => part.startsWith("stack_banner_image="))
-      ?.slice("stack_banner_image=".length);
-
-    return cookieValue ? decodeURIComponent(cookieValue).trim() : "";
+    return String(
+      localStorage.getItem(scopedLocalKey(LOCAL_BANNER_IMAGE_KEY, activeUid)) ?? ""
+    ).trim();
   } catch {
     return "";
   }
 }
 
-function saveLocalBannerImage(url: string) {
+function saveLocalBannerImage(url: string, uid?: string | null) {
   if (typeof window === "undefined") return;
+  const activeUid = String(uid ?? loadLocalActiveUserId()).trim();
+  if (!activeUid) return;
 
   const clean = String(url ?? "").trim();
+  const key = scopedLocalKey(LOCAL_BANNER_IMAGE_KEY, activeUid);
+  try {
+    if (clean) localStorage.setItem(key, clean);
+    else localStorage.removeItem(key);
+  } catch {}
+}
+
+
+function loadLocalLibraryStyle(uid?: string | null): StackLibraryStyle | null {
+  if (typeof window === "undefined") return null;
+  const activeUid = String(uid ?? loadLocalActiveUserId()).trim();
+  if (!activeUid) return null;
 
   try {
-    if (clean) localStorage.setItem(LOCAL_BANNER_IMAGE_KEY, clean);
-    else localStorage.removeItem(LOCAL_BANNER_IMAGE_KEY);
+    const stored = localStorage.getItem(scopedLocalKey(LOCAL_LIBRARY_STYLE_KEY, activeUid));
+    if (stored === "detailed" || stored === "poster" || stored === "classic") return stored;
+  } catch {}
+
+  return null;
+}
+
+function saveLocalLibraryStyle(style: StackLibraryStyle, uid?: string | null) {
+  if (typeof window === "undefined") return;
+  const activeUid = String(uid ?? loadLocalActiveUserId()).trim();
+  if (!activeUid) return;
+
+  try {
+    localStorage.setItem(scopedLocalKey(LOCAL_LIBRARY_STYLE_KEY, activeUid), style);
   } catch {}
 
   try {
-    document.cookie = clean
-      ? `stack_banner_image=${encodeURIComponent(clean)}; Max-Age=31536000; Path=/; SameSite=Lax`
-      : "stack_banner_image=; Max-Age=0; Path=/; SameSite=Lax";
+    document.documentElement.dataset.stackLibraryStyle = style;
   } catch {}
 }
 
@@ -755,19 +863,15 @@ function normalizeSettings(raw: unknown): StackSettings {
       : DEFAULT_SETTINGS.defaultAddStatus,
     libraryStyle: ["detailed", "poster", "classic"].includes(obj.libraryStyle)
       ? (obj.libraryStyle as StackLibraryStyle)
-      : DEFAULT_SETTINGS.libraryStyle,
+      : loadLocalLibraryStyle() ?? DEFAULT_SETTINGS.libraryStyle,
     posterSize: ["small", "medium", "large"].includes(obj.posterSize)
       ? (obj.posterSize as StackPosterSize)
       : DEFAULT_SETTINGS.posterSize,
-    surfaceStyle: obj.surfaceStyle === "solid" || obj.surfaceStyle === "glass"
-      ? (obj.surfaceStyle as StackSurfaceStyle)
-      : DEFAULT_SETTINGS.surfaceStyle,
-    cornerStyle: ["rounded", "soft", "square"].includes(obj.cornerStyle)
-      ? (obj.cornerStyle as StackCornerStyle)
-      : DEFAULT_SETTINGS.cornerStyle,
+    surfaceStyle: "glass",
+    cornerStyle: obj.cornerStyle === "square" ? "square" : "rounded",
     bannerImageUrl: typeof obj.bannerImageUrl === "string" ? obj.bannerImageUrl : "",
     backgroundImageUrl: typeof obj.backgroundImageUrl === "string" ? obj.backgroundImageUrl : "",
-    reduceMotion: typeof obj.reduceMotion === "boolean" ? obj.reduceMotion : DEFAULT_SETTINGS.reduceMotion,
+    reduceMotion: false,
     showListRating: typeof obj.showListRating === "boolean" ? obj.showListRating : DEFAULT_SETTINGS.showListRating,
     showListType: typeof obj.showListType === "boolean" ? obj.showListType : DEFAULT_SETTINGS.showListType,
     showListProgress: typeof obj.showListProgress === "boolean" ? obj.showListProgress : DEFAULT_SETTINGS.showListProgress,
@@ -1422,33 +1526,24 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [statsMonth, setStatsMonth] = useState<string>("all");
   const [items, setItems] = useState<MediaItem[]>([]);
   const [userId, setUserId] = useState<string | null>(null);
+  const [authEmail, setAuthEmail] = useState<string>("");
+  const [loadedUserId, setLoadedUserId] = useState<string | null>(null);
+  const [hasSessionDisplayCache, setHasSessionDisplayCache] = useState(false);
+  const loadedUserIdRef = useRef<string | null>(null);
+  const activeAuthUserRef = useRef<string | null>(null);
+  const confirmedUserIdRef = useRef<string | null>(null);
+  const lastPersistedFingerprintRef = useRef<string>("");
+  const loadGenerationRef = useRef(0);
+  const [pendingAuthUser, setPendingAuthUser] = useState<{
+    id: string;
+    email: string;
+    reason: "first-confirmation" | "account-changed";
+  } | null>(null);
   const [settings, setSettings] = useState<StackSettings>(() => ({
     ...DEFAULT_SETTINGS,
     colorTheme: "midnight",
   }));
-
-  useEffect(() => {
-    const savedTheme = loadLocalColorTheme();
-    const savedBackground = loadLocalBackgroundImage();
-    const savedBanner = loadLocalBannerImage();
-
-    // The root boot script has already painted these before React.
-    // Re-applying here is idempotent and keeps runtime state in sync.
-    applyStackThemeToDocument(savedTheme);
-    applyStackBackgroundToDocument(savedBackground);
-    applyStackBannerToDocument(savedBanner);
-
-    setSettings((prev) => {
-      const next = {
-        ...prev,
-        colorTheme: savedTheme,
-        backgroundImageUrl: savedBackground || prev.backgroundImageUrl || "",
-        bannerImageUrl: savedBanner || prev.bannerImageUrl || "",
-      };
-
-      return next;
-    });
-  }, []);
+  const [displayPreferencesReady, setDisplayPreferencesReady] = useState(false);
 
   const [feedbackEntries, setFeedbackEntries] = useState<FeedbackEntry[]>([]);
   const [cloudExtraData, setCloudExtraData] = useState<Record<string, any>>({});
@@ -1472,27 +1567,53 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [adminMemberQuery, setAdminMemberQuery] = useState("");
   const [selectedAdminMemberId, setSelectedAdminMemberId] = useState<string | null>(null);
 
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(LOCAL_BOARD_VIEW_KEY);
-      if (raw !== null) {
-        setBoardView(raw === "1" || raw === "true");
-        return;
-      }
+  useLayoutEffect(() => {
+    const activeUid = loadLocalActiveUserId();
+    const savedTheme = loadLocalColorTheme(activeUid);
+    const savedBackground = loadLocalBackgroundImage(activeUid);
+    const savedBanner = loadLocalBannerImage(activeUid);
+    const savedLibraryStyle = loadLocalLibraryStyle(activeUid);
 
-      if (typeof window !== "undefined" && window.matchMedia("(max-width: 640px)").matches) {
+    // Only restore preferences belonging to the last verified Stack user.
+    // No media/library data is loaded until Supabase auth is verified below.
+    applyStackThemeToDocument(savedTheme);
+    applyStackBackgroundToDocument(savedBackground);
+    applyStackBannerToDocument(savedBanner);
+
+    let hasSavedBoardPreference = false;
+    try {
+      const raw = activeUid
+        ? localStorage.getItem(scopedLocalKey(LOCAL_BOARD_VIEW_KEY, activeUid))
+        : null;
+      if (raw !== null) {
+        hasSavedBoardPreference = true;
+        setBoardView(raw === "1" || raw === "true");
+      } else if (typeof window !== "undefined" && window.matchMedia("(max-width: 640px)").matches) {
         setBoardView(false);
       }
     } catch {}
+
+    setSettings((prev) => ({
+      ...prev,
+      colorTheme: savedTheme,
+      backgroundImageUrl: savedBackground || "",
+      bannerImageUrl: savedBanner || "",
+      libraryStyle: savedLibraryStyle ?? prev.libraryStyle,
+    }));
+
+    if (savedLibraryStyle || hasSavedBoardPreference) {
+      setDisplayPreferencesReady(true);
+    }
   }, []);
 
   useEffect(() => {
+    if (!userId || loadedUserId !== userId) return;
     try {
-      const raw = localStorage.getItem(LOCAL_BOARD_VIEW_KEY);
+      const raw = localStorage.getItem(scopedLocalKey(LOCAL_BOARD_VIEW_KEY, userId));
       if (raw !== null) return;
       setBoardView((settings.defaultBoardView ?? DEFAULT_SETTINGS.defaultBoardView) === "board");
     } catch {}
-  }, [settings.defaultBoardView]);
+  }, [settings.defaultBoardView, userId, loadedUserId]);
 
   const [autofillStatus, setAutofillStatus] = useState("");
   const [autoAutofill, setAutoAutofill] = useState(true);
@@ -1586,10 +1707,11 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const undoTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
+    if (!userId || loadedUserId !== userId) return;
     try {
-      localStorage.setItem(LOCAL_BOARD_VIEW_KEY, boardView ? "1" : "0");
+      localStorage.setItem(scopedLocalKey(LOCAL_BOARD_VIEW_KEY, userId), boardView ? "1" : "0");
     } catch {}
-  }, [boardView]);
+  }, [boardView, userId, loadedUserId]);
 
   useEffect(() => {
     return () => {
@@ -1742,53 +1864,90 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       // Apply the selected palette immediately so the UI never paints one frame
       // with the previous/default theme before React commits the settings update.
       applyStackThemeToDocument(patch.colorTheme);
-      saveLocalColorTheme(patch.colorTheme);
+      saveLocalColorTheme(patch.colorTheme, userId);
     }
 
     if (typeof patch.backgroundImageUrl === "string") {
       // Backgrounds use the same pre-paint persistence strategy as color themes.
       // This prevents theme -> image flicker on refresh and route changes.
       applyStackBackgroundToDocument(patch.backgroundImageUrl);
-      saveLocalBackgroundImage(patch.backgroundImageUrl);
+      saveLocalBackgroundImage(patch.backgroundImageUrl, userId);
     }
 
     if (typeof patch.bannerImageUrl === "string") {
       // Banners are cached and preloaded before paint too, so the theme surface
       // does not flash through while the remote banner image is downloading.
       applyStackBannerToDocument(patch.bannerImageUrl);
-      saveLocalBannerImage(patch.bannerImageUrl);
+      saveLocalBannerImage(patch.bannerImageUrl, userId);
     }
 
-    setSettings((prev) => ({ ...prev, ...patch }));
-  }, []);
+    if (
+      patch.libraryStyle === "detailed" ||
+      patch.libraryStyle === "poster" ||
+      patch.libraryStyle === "classic"
+    ) {
+      saveLocalLibraryStyle(patch.libraryStyle, userId);
+      setDisplayPreferencesReady(true);
+    }
+
+    // Surface is intentionally standardized to glass and the removed legacy
+    // settings are normalized away rather than deleting any saved user data.
+    const safePatch: Partial<StackSettings> = {
+      ...patch,
+      ...(patch.surfaceStyle ? { surfaceStyle: "glass" as StackSurfaceStyle } : {}),
+      ...(patch.cornerStyle
+        ? { cornerStyle: patch.cornerStyle === "square" ? "square" : "rounded" }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(patch, "reduceMotion")
+        ? { reduceMotion: false }
+        : {}),
+    };
+
+    setSettings((prev) => ({ ...prev, ...safePatch }));
+  }, [userId]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !userId) return;
+
+    const themeKey = scopedLocalKey(LOCAL_COLOR_THEME_KEY, userId);
+    const backgroundKey = scopedLocalKey(LOCAL_BACKGROUND_IMAGE_KEY, userId);
+    const bannerKey = scopedLocalKey(LOCAL_BANNER_IMAGE_KEY, userId);
+    const libraryKey = scopedLocalKey(LOCAL_LIBRARY_STYLE_KEY, userId);
 
     const onStorage = (e: StorageEvent) => {
-      if (e.key === LOCAL_COLOR_THEME_KEY && isStackColorTheme(e.newValue)) {
+      if (e.key === themeKey && isStackColorTheme(e.newValue)) {
         applyStackThemeToDocument(e.newValue);
         setSettings((prev) => ({ ...prev, colorTheme: e.newValue as StackColorTheme }));
         return;
       }
 
-      if (e.key === LOCAL_BACKGROUND_IMAGE_KEY) {
+      if (e.key === backgroundKey) {
         const nextBackground = String(e.newValue ?? "").trim();
         applyStackBackgroundToDocument(nextBackground);
         setSettings((prev) => ({ ...prev, backgroundImageUrl: nextBackground }));
         return;
       }
 
-      if (e.key === LOCAL_BANNER_IMAGE_KEY) {
+      if (e.key === bannerKey) {
         const nextBanner = String(e.newValue ?? "").trim();
         applyStackBannerToDocument(nextBanner);
         setSettings((prev) => ({ ...prev, bannerImageUrl: nextBanner }));
+        return;
+      }
+
+      if (
+        e.key === libraryKey &&
+        (e.newValue === "detailed" || e.newValue === "poster" || e.newValue === "classic")
+      ) {
+        document.documentElement.dataset.stackLibraryStyle = e.newValue;
+        setSettings((prev) => ({ ...prev, libraryStyle: e.newValue as StackLibraryStyle }));
+        setDisplayPreferencesReady(true);
       }
     };
 
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, []);
+  }, [userId]);
 
   const updateFriendNickname = useCallback((friendId: string, nickname: string) => {
     setSettings((prev) => {
@@ -1849,16 +2008,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   /* ================= LOCAL BACKUP ================= */
 
   const loadLocalBackup = useCallback((uid?: string | null): MediaItem[] | null => {
-    try {
-      const keys = uid
-        ? [backupKeyForUser(uid), lastGoodKeyForUser(uid), LOCAL_BACKUP_KEY, LOCAL_LAST_GOOD_KEY]
-        : [LOCAL_BACKUP_KEY, LOCAL_LAST_GOOD_KEY];
+    const cleanUid = String(uid ?? "").trim();
+    if (!cleanUid) return null;
 
-      for (const key of Array.from(new Set(keys))) {
+    try {
+      const keys = [backupKeyForUser(cleanUid), lastGoodKeyForUser(cleanUid)];
+      for (const key of keys) {
         const parsed = parseBackupItems(localStorage.getItem(key));
         if (parsed && parsed.length > 0) return parsed;
       }
-
       return null;
     } catch {
       return null;
@@ -1866,34 +2024,28 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   }, []);
 
   const saveLocalBackup = useCallback((next: MediaItem[], uid?: string | null) => {
-    try {
-      const primaryKey = backupKeyForUser(uid);
-      const lastGoodKey = lastGoodKeyForUser(uid);
+    const cleanUid = String(uid ?? "").trim();
+    if (!cleanUid) return;
 
+    try {
+      const primaryKey = backupKeyForUser(cleanUid);
+      const lastGoodKey = lastGoodKeyForUser(cleanUid);
       const existingPrimary = parseBackupItems(localStorage.getItem(primaryKey));
       const existingLastGood = parseBackupItems(localStorage.getItem(lastGoodKey));
-      const existingGeneral = uid ? parseBackupItems(localStorage.getItem(LOCAL_BACKUP_KEY)) : null;
-      const existingGeneralLastGood = uid
-        ? parseBackupItems(localStorage.getItem(LOCAL_LAST_GOOD_KEY))
-        : null;
-
-      const bestExisting = [existingPrimary, existingLastGood, existingGeneral, existingGeneralLastGood]
+      const bestExisting = [existingPrimary, existingLastGood]
         .filter((x): x is MediaItem[] => Array.isArray(x) && x.length > 0)
         .sort((a, b) => b.length - a.length)[0];
 
       if (next.length === 0 && bestExisting && bestExisting.length > 0) {
         console.warn(
-          `Blocked empty local backup overwrite. Existing backup has ${bestExisting.length} items.`
+          `Blocked empty local backup overwrite for ${cleanUid}. Existing backup has ${bestExisting.length} items.`
         );
         return;
       }
 
       localStorage.setItem(primaryKey, JSON.stringify(next));
-
       if (next.length > 0) {
         localStorage.setItem(lastGoodKey, JSON.stringify(next));
-        localStorage.setItem(LOCAL_BACKUP_KEY, JSON.stringify(next));
-        localStorage.setItem(LOCAL_LAST_GOOD_KEY, JSON.stringify(next));
       }
     } catch {}
   }, []);
@@ -2061,6 +2213,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         return;
       }
 
+      if (activeAuthUserRef.current !== me) return;
       setFriendsList((data ?? []) as FriendRow[]);
     },
     [userId]
@@ -2085,6 +2238,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         return;
       }
 
+      if (activeAuthUserRef.current !== me) return;
       setIncomingRequests((data ?? []) as IncomingRequestRow[]);
     },
     [userId]
@@ -2109,6 +2263,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         return;
       }
 
+      if (activeAuthUserRef.current !== me) return;
       setOutgoingRequests((data ?? []) as OutgoingRequestRow[]);
     },
     [userId]
@@ -2339,7 +2494,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       : [];
   };
 
-  const applyLoadedSettings = useCallback((rawSettings: unknown) => {
+  const applyLoadedSettings = useCallback((rawSettings: unknown, uidStr: string) => {
     const nextSettings = normalizeSettings(rawSettings);
     const theme = nextSettings.colorTheme ?? DEFAULT_SETTINGS.colorTheme;
     const background = String(nextSettings.backgroundImageUrl ?? "").trim();
@@ -2347,21 +2502,55 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
     if (isStackColorTheme(theme)) {
       applyStackThemeToDocument(theme);
-      saveLocalColorTheme(theme);
+      saveLocalColorTheme(theme, uidStr);
     }
 
     applyStackBackgroundToDocument(background);
-    saveLocalBackgroundImage(background);
+    saveLocalBackgroundImage(background, uidStr);
     applyStackBannerToDocument(banner);
-    saveLocalBannerImage(banner);
-    setSettings(nextSettings);
+    saveLocalBannerImage(banner, uidStr);
+
+    const libraryStyle = nextSettings.libraryStyle ?? DEFAULT_SETTINGS.libraryStyle;
+    saveLocalLibraryStyle(libraryStyle, uidStr);
+
+    try {
+      const savedBoard = localStorage.getItem(scopedLocalKey(LOCAL_BOARD_VIEW_KEY, uidStr));
+      if (savedBoard === null) {
+        setBoardView(
+          (nextSettings.defaultBoardView ?? DEFAULT_SETTINGS.defaultBoardView) === "board"
+        );
+      }
+    } catch {}
+
+    setDisplayPreferencesReady(true);
+
+    const normalizedForState = {
+      ...nextSettings,
+      surfaceStyle: "glass" as StackSurfaceStyle,
+      cornerStyle: nextSettings.cornerStyle === "square" ? "square" as StackCornerStyle : "rounded" as StackCornerStyle,
+      reduceMotion: false,
+    };
+
+    setSettings(normalizedForState);
+    return normalizedForState;
   }, []);
 
   const loadCloud = useCallback(
     async (uidStr: string) => {
+      const generation = ++loadGenerationRef.current;
+      const isCurrentLoad = () =>
+        generation === loadGenerationRef.current &&
+        activeAuthUserRef.current === uidStr &&
+        confirmedUserIdRef.current === uidStr;
+
+      loadedUserIdRef.current = null;
+      lastPersistedFingerprintRef.current = "";
+      setLoadedUserId(null);
       setSaveStatus("Loading…");
       setCloudLoaded(false);
 
+      // Keep an existing user-scoped local backup only as an emergency copy.
+      // It is NEVER automatically applied to cloud data or to another account.
       const localBackup = loadLocalBackup(uidStr);
       const localBackupCount = localBackup?.length ?? 0;
 
@@ -2371,20 +2560,28 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         .eq("user_id", uidStr)
         .maybeSingle();
 
+      if (!isCurrentLoad()) return;
+
       if (error) {
         console.error(error);
-        if (localBackupCount > 0) {
-          setItems(localBackup!);
-          saveLocalBackup(localBackup!, uidStr);
-        }
-        setCloudLoaded(true);
         setSaveStatus(
-          localBackupCount > 0 ? `Loaded local backup (${localBackupCount})` : "Cloud load error"
+          localBackupCount > 0
+            ? `Cloud load failed. Your ${localBackupCount}-item local backup is preserved, but automatic recovery is disabled.`
+            : "Cloud load failed. Editing is locked to protect your account data."
         );
         return;
       }
 
-      const raw = data?.data as unknown;
+      if (!data) {
+        setSaveStatus(
+          localBackupCount > 0
+            ? `Account storage row is missing. Your ${localBackupCount}-item local backup is preserved; nothing was written.`
+            : "Account storage row is missing. Nothing was written."
+        );
+        return;
+      }
+
+      const raw = data.data as unknown;
       const rawObj =
         raw && typeof raw === "object" && raw !== null && !Array.isArray(raw)
           ? (raw as any)
@@ -2401,63 +2598,49 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               .map((x) => x as MediaItem)
           : null;
 
-      if (parsedItems) {
-        if (parsedItems.length === 0 && localBackupCount > 0) {
-          setItems(localBackup!);
-          applyLoadedSettings(rawObj?.settings);
-          setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
-          setCloudExtraData(omitKnownDataKeys(raw));
-          saveLocalBackup(localBackup!, uidStr);
-          setCloudLoaded(true);
-          setSaveStatus(`Recovery mode: cloud was empty, showing backup (${localBackupCount})`);
-          return;
-        }
+      if (!isCurrentLoad()) return;
 
-        setItems(parsedItems);
-        applyLoadedSettings(rawObj?.settings);
-        setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
-        setCloudExtraData(omitKnownDataKeys(raw));
-        saveLocalBackup(parsedItems, uidStr);
-        setCloudLoaded(true);
-        setSaveStatus("Loaded");
+      if (!parsedItems) {
+        setSaveStatus(
+          localBackupCount > 0
+            ? `Cloud data could not be validated. Your ${localBackupCount}-item local backup is preserved; editing is locked.`
+            : "Cloud data could not be validated. Editing is locked."
+        );
         return;
       }
 
-      if (localBackupCount > 0) {
-        setItems(localBackup!);
-        applyLoadedSettings(rawObj?.settings);
-        setFeedbackEntries(parseFeedbackEntries(rawObj?.feedback));
-        setCloudExtraData(omitKnownDataKeys(raw));
-        saveLocalBackup(localBackup!, uidStr);
-        setCloudLoaded(true);
-        setSaveStatus(`Recovery mode: missing cloud items, showing backup (${localBackupCount})`);
-        return;
-      }
+      // The cloud row is authoritative. Local backups are refreshed FROM cloud,
+      // never the other way around automatically.
+      const loadedSettings = applyLoadedSettings(rawObj?.settings, uidStr);
+      const loadedFeedback = parseFeedbackEntries(rawObj?.feedback);
+      const loadedExtraData = omitKnownDataKeys(raw);
 
-      const initialData = { items: [], settings: DEFAULT_SETTINGS, feedback: [] };
-      const up = await supabase
-        .from("media_items")
-        .upsert([{ user_id: uidStr, data: initialData }], { onConflict: "user_id" });
+      setItems(parsedItems);
+      setFeedbackEntries(loadedFeedback);
+      setCloudExtraData(loadedExtraData);
+      saveLocalBackup(parsedItems, uidStr);
+      saveSessionDisplayCache(
+        uidStr,
+        parsedItems,
+        loadedSettings,
+        loadedFeedback,
+        loadedExtraData
+      );
+      setHasSessionDisplayCache(true);
 
-      if (up.error) {
-        console.error(up.error);
-        setCloudLoaded(true);
-        setSaveStatus("Cloud setup error");
-        return;
-      }
-
-      setItems([]);
-      applyStackThemeToDocument(DEFAULT_SETTINGS.colorTheme);
-      saveLocalColorTheme(DEFAULT_SETTINGS.colorTheme);
-      applyStackBackgroundToDocument("");
-      saveLocalBackgroundImage("");
-      applyStackBannerToDocument("");
-      saveLocalBannerImage("");
-      setSettings(DEFAULT_SETTINGS);
-      setFeedbackEntries([]);
-      setCloudExtraData({});
+      loadedUserIdRef.current = uidStr;
+      lastPersistedFingerprintRef.current = persistenceFingerprint(
+        parsedItems,
+        loadedSettings,
+        loadedFeedback
+      );
+      setLoadedUserId(uidStr);
       setCloudLoaded(true);
-      setSaveStatus("Loaded");
+      setSaveStatus(
+        parsedItems.length === 0 && localBackupCount > 0
+          ? `Loaded empty cloud library. A ${localBackupCount}-item local backup was preserved and was not applied automatically.`
+          : "Loaded"
+      );
     },
     [loadLocalBackup, saveLocalBackup, applyLoadedSettings]
   );
@@ -2469,61 +2652,120 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       nextSettings: StackSettings,
       nextFeedback: FeedbackEntry[]
     ) => {
+      if (
+        activeAuthUserRef.current !== uidStr ||
+        confirmedUserIdRef.current !== uidStr ||
+        loadedUserIdRef.current !== uidStr ||
+        !cloudLoaded
+      ) {
+        return;
+      }
+
+      // Re-verify the authenticated user against Supabase Auth before EVERY
+      // cloud write. getUser() performs a server-backed authenticity check.
+      const { data: verifiedAuth, error: verifiedAuthError } =
+        await supabase.auth.getUser();
+
+      if (
+        verifiedAuthError ||
+        !verifiedAuth.user ||
+        verifiedAuth.user.id !== uidStr ||
+        activeAuthUserRef.current !== uidStr ||
+        confirmedUserIdRef.current !== uidStr ||
+        loadedUserIdRef.current !== uidStr
+      ) {
+        console.error("Blocked Stack save because the verified auth user did not match the loaded account.");
+        setSaveStatus("Save blocked: account verification changed. Reload or sign in again.");
+        return;
+      }
+
+      // Protect against accidental whole-library wipes. A legitimate zero-item
+      // reset should be a separate explicit recovery/admin operation, never an
+      // automatic state transition.
       if (next.length === 0) {
         const backup = loadLocalBackup(uidStr);
-
         if (backup && backup.length > 0) {
-          setItems(backup);
-          saveLocalBackup(backup, uidStr);
-          setSaveStatus(`Blocked empty save; restored backup (${backup.length})`);
+          setSaveStatus(
+            `Blocked empty cloud save. Your ${backup.length}-item user backup remains preserved.`
+          );
           return;
         }
       }
 
-      saveLocalBackup(next, uidStr);
-      if (!cloudLoaded) return;
+      const normalizedSettings = normalizeSettings(nextSettings);
+      const fingerprint = persistenceFingerprint(
+        next,
+        normalizedSettings,
+        nextFeedback
+      );
 
-      setSaveStatus("Saving…");
+      // Loading the cloud row should not immediately write it back again.
+      if (
+        fingerprint &&
+        fingerprint === lastPersistedFingerprintRef.current
+      ) {
+        return;
+      }
 
       const dataPayload = {
         ...cloudExtraData,
         items: next,
-        settings: normalizeSettings(nextSettings),
+        settings: normalizedSettings,
         feedback: nextFeedback,
       };
 
-      const { error } = await supabase
+      // Save the local copy only after the exact authenticated account has been
+      // verified. It is scoped by UUID and can never be used automatically to
+      // overwrite cloud data.
+      saveLocalBackup(next, uidStr);
+      setSaveStatus("Saving…");
+
+      // UPDATE only. Never UPSERT from the browser. If the account row is
+      // missing, fail closed instead of creating/replacing data unexpectedly.
+      const { data: updatedRow, error } = await supabase
         .from("media_items")
-        .upsert([{ user_id: uidStr, data: dataPayload }], { onConflict: "user_id" });
+        .update({ data: dataPayload })
+        .eq("user_id", uidStr)
+        .select("user_id")
+        .maybeSingle();
 
       if (error) {
         console.error(error);
-        setSaveStatus("Saved locally (cloud error)");
+        setSaveStatus("Saved to your local backup only (cloud error). No other account was touched.");
         return;
       }
 
+      if (!updatedRow?.user_id || updatedRow.user_id !== uidStr) {
+        setSaveStatus("Save blocked: your account storage row was not found. Nothing was created or overwritten.");
+        return;
+      }
+
+      lastPersistedFingerprintRef.current = fingerprint;
+      saveSessionDisplayCache(
+        uidStr,
+        next,
+        normalizedSettings,
+        nextFeedback,
+        cloudExtraData
+      );
+      setHasSessionDisplayCache(true);
       setSaveStatus("Saved");
     },
     [cloudLoaded, saveLocalBackup, loadLocalBackup, cloudExtraData]
   );
 
   useEffect(() => {
-    const backup = loadLocalBackup(null);
-    if (backup) setItems(backup);
-  }, [loadLocalBackup]);
-
-  useEffect(() => {
-    if (!userId) return;
+    if (!userId || loadedUserId !== userId) return;
 
     Promise.all([
       loadIncomingFriendRequests(userId),
       loadOutgoingFriendRequests(userId),
       loadFriends(userId),
     ]);
-  }, [userId, loadIncomingFriendRequests, loadOutgoingFriendRequests, loadFriends]);
+  }, [userId, loadedUserId, loadIncomingFriendRequests, loadOutgoingFriendRequests, loadFriends]);
 
   useEffect(() => {
-    if (!userId || !cloudLoaded) return;
+    if (!userId || !cloudLoaded || loadedUserId !== userId) return;
 
     const displayName = (settings.displayName ?? "").trim();
     const timer = window.setTimeout(async () => {
@@ -2540,32 +2782,187 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     }, 600);
 
     return () => window.clearTimeout(timer);
-  }, [userId, cloudLoaded, settings.displayName]);
+  }, [userId, cloudLoaded, loadedUserId, settings.displayName]);
+
+  const resetAccountState = useCallback(() => {
+    loadGenerationRef.current += 1;
+    loadedUserIdRef.current = null;
+    confirmedUserIdRef.current = null;
+    lastPersistedFingerprintRef.current = "";
+    setLoadedUserId(null);
+    setHasSessionDisplayCache(false);
+    setItems([]);
+    setFeedbackEntries([]);
+    setFriendsList([]);
+    setIncomingRequests([]);
+    setOutgoingRequests([]);
+    setFriendActivityRows([]);
+    setSelectedFriendProfileId(null);
+    setSelectedFriendIds([]);
+    setSettings({ ...DEFAULT_SETTINGS, colorTheme: "midnight" });
+    setBoardView(true);
+    setQuery("");
+    setTagFilter("all");
+    setFavoriteOnly(false);
+    setForm({
+      title: "",
+      type: "movie",
+      status: DEFAULT_SETTINGS.defaultAddStatus,
+      tags: [],
+      inTheaters: false,
+      notes: "",
+      dateFinished: "",
+      posterUrl: "",
+      posterOverrideUrl: "",
+      runtime: undefined,
+      rewatchCount: 0,
+      rating: undefined,
+      tmdbId: undefined,
+      tmdbType: undefined,
+      igdbId: undefined,
+      anilistId: undefined,
+      anilistType: undefined,
+      progressCur: undefined,
+      progressTotal: undefined,
+      hoursPlayed: undefined,
+    });
+    setAutoTags([]);
+    setManualTags([]);
+    setRatingText("");
+    setProgressCurText("");
+    setProgressTotalText("");
+    setIsRewatch(false);
+    setRewatchText("0");
+    setUndoState(null);
+    setCloudExtraData({});
+    setAdminOverview(null);
+    setSelectedAdminMemberId(null);
+    setCloudLoaded(false);
+    setDisplayPreferencesReady(false);
+  }, []);
+
+  const beginVerifiedAccountLoad = useCallback(
+    (uidStr: string) => {
+      if (activeAuthUserRef.current !== uidStr) {
+        setSaveStatus("Account confirmation no longer matches the active session.");
+        return;
+      }
+
+      confirmedUserIdRef.current = uidStr;
+      saveLocalActiveUserId(uidStr);
+      saveSessionConfirmedUserId(uidStr);
+      setPendingAuthUser(null);
+
+      const sessionDisplayCache = loadSessionDisplayCache(uidStr);
+      if (sessionDisplayCache) {
+        applyLoadedSettings(sessionDisplayCache.settings, uidStr);
+        setItems(sessionDisplayCache.items);
+        setFeedbackEntries(sessionDisplayCache.feedback ?? []);
+        setCloudExtraData(sessionDisplayCache.cloudExtraData ?? {});
+        setHasSessionDisplayCache(true);
+      } else {
+        setHasSessionDisplayCache(false);
+      }
+
+      const savedTheme = loadLocalColorTheme(uidStr);
+      const savedBackground = loadLocalBackgroundImage(uidStr);
+      const savedBanner = loadLocalBannerImage(uidStr);
+      const savedLibraryStyle = loadLocalLibraryStyle(uidStr);
+
+      applyStackThemeToDocument(savedTheme);
+      applyStackBackgroundToDocument(savedBackground);
+      applyStackBannerToDocument(savedBanner);
+
+      setSettings((prev) => ({
+        ...prev,
+        colorTheme: savedTheme,
+        backgroundImageUrl: savedBackground,
+        bannerImageUrl: savedBanner,
+        libraryStyle: savedLibraryStyle ?? prev.libraryStyle,
+      }));
+
+      try {
+        const savedBoard = localStorage.getItem(scopedLocalKey(LOCAL_BOARD_VIEW_KEY, uidStr));
+        if (savedBoard !== null) setBoardView(savedBoard === "1" || savedBoard === "true");
+      } catch {}
+
+      void loadCloud(uidStr);
+    },
+    [loadCloud, applyLoadedSettings]
+  );
+
+  const handleAuthenticatedUser = useCallback(
+    (authUser: { id: string; email?: string | null } | null) => {
+      const nextUid = authUser?.id ?? null;
+      const nextEmail = String(authUser?.email ?? "");
+
+      if (activeAuthUserRef.current === nextUid) {
+        setAuthEmail(nextEmail);
+        return;
+      }
+
+      const rememberedUid = loadLocalActiveUserId();
+      const sessionConfirmedUid = loadSessionConfirmedUserId();
+      activeAuthUserRef.current = nextUid;
+      resetAccountState();
+      setUserId(nextUid);
+      setAuthEmail(nextEmail);
+
+      if (!nextUid) {
+        saveLocalActiveUserId(null);
+        saveSessionConfirmedUserId(null);
+        setPendingAuthUser(null);
+        setSaveStatus("Signed out");
+        return;
+      }
+
+      // A fresh browser tab/session must explicitly confirm the verified
+      // Supabase identity once before any library data is loaded. Normal route
+      // navigation in the same tab remains seamless via sessionStorage.
+      if (sessionConfirmedUid !== nextUid) {
+        setPendingAuthUser({
+          id: nextUid,
+          email: nextEmail,
+          reason:
+            rememberedUid && rememberedUid !== nextUid
+              ? "account-changed"
+              : "first-confirmation",
+        });
+        setSaveStatus(
+          rememberedUid && rememberedUid !== nextUid
+            ? "Account change detected. Confirm before loading data."
+            : "Confirm this Stack account before loading data."
+        );
+        return;
+      }
+
+      beginVerifiedAccountLoad(nextUid);
+    },
+    [beginVerifiedAccountLoad, resetAccountState]
+  );
 
   useEffect(() => {
     let mounted = true;
 
     supabase.auth.getUser().then(({ data }) => {
       if (!mounted) return;
-      const uidStr = data.user?.id ?? null;
-      setUserId(uidStr);
-      if (uidStr) loadCloud(uidStr);
+      handleAuthenticatedUser(data.user ? { id: data.user.id, email: data.user.email } : null);
     });
 
     const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
-      const uidStr = session?.user?.id ?? null;
-      setUserId(uidStr);
-      if (uidStr) loadCloud(uidStr);
+      if (!mounted) return;
+      const user = session?.user ?? null;
+      handleAuthenticatedUser(user ? { id: user.id, email: user.email } : null);
     });
 
     return () => {
       mounted = false;
       sub?.subscription?.unsubscribe();
     };
-  }, [loadCloud]);
+  }, [handleAuthenticatedUser]);
 
   useEffect(() => {
-    if (!userId || !cloudLoaded) return;
+    if (!userId || !cloudLoaded || loadedUserId !== userId) return;
 
     const reloadFromCloud = () => {
       loadCloud(userId);
@@ -2582,12 +2979,25 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       window.removeEventListener("focus", reloadFromCloud);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [userId, cloudLoaded, loadCloud]);
+  }, [userId, cloudLoaded, loadedUserId, loadCloud]);
 
   useEffect(() => {
-    if (userId) saveCloud(userId, items, settings, feedbackEntries);
-    else saveLocalBackup(items, null);
-  }, [items, settings, feedbackEntries, userId, saveCloud, saveLocalBackup]);
+    if (
+      !userId ||
+      !cloudLoaded ||
+      loadedUserId !== userId ||
+      confirmedUserIdRef.current !== userId ||
+      activeAuthUserRef.current !== userId
+    ) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void saveCloud(userId, items, settings, feedbackEntries);
+    }, 450);
+
+    return () => window.clearTimeout(timer);
+  }, [items, settings, feedbackEntries, userId, cloudLoaded, loadedUserId, saveCloud]);
 
   /* ================= ACTIONS ================= */
 
@@ -3637,7 +4047,21 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       });
 
       const json = (await response.json()) as AdminOverviewResponse & { error?: string };
-      if (!response.ok) throw new Error(json.error || "Could not load owner dashboard.");
+      if (!response.ok) {
+        const message = json.error || "Could not load owner dashboard.";
+
+        if (response.status === 503) {
+          setAdminOverview(null);
+          setAdminOverviewStatus(
+            `${message} For the live site, add SUPABASE_SECRET_KEY to Vercel → Settings → Environment Variables for Production, then redeploy.`
+          );
+          return;
+        }
+
+        setAdminOverview(null);
+        setAdminOverviewStatus(message);
+        return;
+      }
 
       setAdminOverview(json);
       setAdminOverviewStatus(`Updated ${new Date(json.generatedAt).toLocaleTimeString()}.`);
@@ -3671,55 +4095,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     });
   }, [adminFeedbackRows, adminFeedbackFilter, adminHideDone]);
 
-  const updateAdminFeedbackStatus = useCallback(
-    async (
-      targetUserId: string,
-      feedbackId: string,
-      nextStatus: "new" | "reviewed" | "done"
-    ) => {
-      if (!userId || !STACK_ADMIN_USER_IDS.includes(userId)) return;
-
-      try {
-        setAdminFeedbackStatus("Updating feedback…");
-        const { data, error } = await supabase
-          .from("media_items")
-          .select("data")
-          .eq("user_id", targetUserId)
-          .maybeSingle();
-
-        if (error) throw error;
-
-        const raw =
-          data?.data && typeof data.data === "object"
-            ? (data.data as Record<string, any>)
-            : {};
-        const feedback = parseFeedbackEntries(raw.feedback).map((entry) =>
-          entry.id === feedbackId ? { ...entry, status: nextStatus } : entry
-        );
-
-        const { error: updateError } = await supabase
-          .from("media_items")
-          .upsert([{ user_id: targetUserId, data: { ...raw, feedback } }], {
-            onConflict: "user_id",
-          });
-
-        if (updateError) throw updateError;
-
-        setAdminFeedbackRows((prev) =>
-          prev.map((entry) =>
-            entry.userId === targetUserId && entry.id === feedbackId
-              ? { ...entry, status: nextStatus }
-              : entry
-          )
-        );
-        setAdminFeedbackStatus("Feedback updated.");
-      } catch (e) {
-        console.error(e);
-        setAdminFeedbackStatus("Could not update feedback with the current sharing rules.");
-      }
-    },
-    [userId]
-  );
+  // Admin feedback is intentionally read-only in the browser.
+  // Cross-user media JSON is never rewritten from an admin client view.
 
   useEffect(() => {
     if (view === "feedback" && isAdminUser) loadAdminFeedback();
@@ -3732,6 +4109,9 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   }, [view, settingsTab, isAdminUser, adminOverview, loadAdminOverview]);
 
   const loadFriendActivity = useCallback(async () => {
+    const requestingUserId = activeAuthUserRef.current;
+    if (!requestingUserId || loadedUserIdRef.current !== requestingUserId) return;
+
     if (!friendsList.length) {
       setFriendActivityRows([]);
       setFriendActivityStatus("No friends yet.");
@@ -3752,6 +4132,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         return;
       }
 
+      if (activeAuthUserRef.current !== requestingUserId) return;
       setFriendActivityRows((data ?? []) as Array<{ user_id: string; data: any }>);
       setFriendActivityStatus(data?.length ? "Loaded." : "No friend activity found yet.");
     } catch {
@@ -4554,6 +4935,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       const { error } = await supabase.auth.signOut();
       if (error) throw error;
 
+      saveLocalActiveUserId(null);
+      saveSessionConfirmedUserId(null);
+      loadGenerationRef.current += 1;
+      activeAuthUserRef.current = null;
+      confirmedUserIdRef.current = null;
+      lastPersistedFingerprintRef.current = "";
+      loadedUserIdRef.current = null;
+      setLoadedUserId(null);
+      setPendingAuthUser(null);
+      setAuthEmail("");
       setUserId(null);
       setItems([]);
       setFeedbackEntries([]);
@@ -4586,7 +4977,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const libraryStyle = settings.libraryStyle ?? DEFAULT_SETTINGS.libraryStyle;
   const posterSize = settings.posterSize ?? DEFAULT_SETTINGS.posterSize;
-  const surfaceStyle = settings.surfaceStyle ?? DEFAULT_SETTINGS.surfaceStyle;
+  const surfaceStyle: StackSurfaceStyle = "glass";
   const cornerStyle = settings.cornerStyle ?? DEFAULT_SETTINGS.cornerStyle;
   const backgroundImageUrl = String(settings.backgroundImageUrl ?? "").trim();
   const bannerImageUrl = String(settings.bannerImageUrl ?? "").trim();
@@ -4598,6 +4989,111 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     showTags: settings.showListTags !== false,
   };
 
+  const accountDataReady =
+    !userId || (cloudLoaded && loadedUserId === userId);
+  const showingVerifiedSessionCache =
+    !!userId && hasSessionDisplayCache && !accountDataReady;
+
+  if (pendingAuthUser) {
+    const accountLabel = pendingAuthUser.email || `${pendingAuthUser.id.slice(0, 8)}…`;
+    return (
+      <div className="min-h-screen bg-[#03060e] text-neutral-100 grid place-items-center px-4">
+        <div className="w-full max-w-lg rounded-3xl border border-white/10 bg-neutral-950/90 p-6 sm:p-8 shadow-2xl">
+          <div className="text-[11px] uppercase tracking-[0.2em] text-neutral-500">Account safety check</div>
+          <h1 className="text-2xl font-semibold mt-2">Confirm your Stack account</h1>
+          <p className="text-sm text-neutral-400 mt-3 leading-6">
+            {pendingAuthUser.reason === "account-changed"
+              ? "Stack detected a different Supabase account than the one previously verified on this browser. No library data has been loaded."
+              : "Stack is enabling strict account isolation on this browser. Confirm the Supabase account below before any library data is loaded."}
+          </p>
+          <div className="mt-5 rounded-2xl border border-white/10 bg-white/[0.04] p-4">
+            <div className="text-xs text-neutral-500">Verified Supabase session</div>
+            <div className="text-sm font-medium mt-1 break-all">{accountLabel}</div>
+            <div className="text-[11px] text-neutral-600 mt-1 break-all">{pendingAuthUser.id}</div>
+          </div>
+          <div className="mt-5 flex flex-col sm:flex-row gap-2">
+            <button
+              type="button"
+              onClick={() => beginVerifiedAccountLoad(pendingAuthUser.id)}
+              className="flex-1 px-4 py-3 rounded-xl bg-white text-black text-sm font-medium hover:bg-neutral-200"
+            >
+              Yes, continue as {accountLabel}
+            </button>
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="px-4 py-3 rounded-xl border border-white/15 bg-white/5 text-sm text-neutral-300 hover:bg-white/10"
+            >
+              Sign out
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (userId && !accountDataReady && !hasSessionDisplayCache) {
+    return (
+      <div
+        className="min-h-screen text-neutral-100 relative overflow-hidden"
+        style={{
+          background: backgroundImageUrl
+            ? `linear-gradient(rgba(3,6,14,0.64), rgba(3,6,14,0.78)), url(${JSON.stringify(backgroundImageUrl)}) center / cover fixed`
+            : "#03060e",
+        }}
+      >
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-5 sm:py-7">
+          <div className="rounded-3xl border border-white/10 bg-black/35 backdrop-blur-xl overflow-hidden">
+            <div
+              className="h-36 sm:h-44 bg-[#050914] bg-cover bg-center relative"
+              style={{
+                backgroundImage: bannerImageUrl
+                  ? `url(${JSON.stringify(bannerImageUrl)})`
+                  : "var(--stack-custom-banner-image, none)",
+              }}
+            >
+              <div className="absolute inset-0 bg-gradient-to-r from-black/75 via-black/35 to-transparent" />
+              <div className="absolute inset-x-0 bottom-0 p-5 sm:p-6">
+                <div className="text-[11px] uppercase tracking-[0.2em] text-neutral-500">Stack</div>
+                <div className="text-2xl sm:text-3xl font-semibold mt-1">Your media library</div>
+                <div className="text-sm text-neutral-400 mt-1">Securely syncing your verified account…</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-5 grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {[0, 1, 2, 3].map((n) => (
+              <div key={n} className="h-20 rounded-2xl border border-white/10 bg-white/[0.035] animate-pulse" />
+            ))}
+          </div>
+
+          <div className="mt-5 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+            {[0, 1, 2, 3, 4, 5].map((n) => (
+              <div key={n} className="space-y-2">
+                <div className="aspect-[2/3] rounded-2xl border border-white/10 bg-white/[0.035] animate-pulse" />
+                <div className="h-3 rounded-full bg-white/[0.05] animate-pulse" />
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-6 flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-black/35 backdrop-blur-xl px-4 py-3">
+            <div className="min-w-0">
+              <div className="text-xs text-neutral-500">{saveStatus || "Verifying account data…"}</div>
+              {authEmail ? <div className="text-[11px] text-neutral-600 mt-0.5 truncate">{authEmail}</div> : null}
+            </div>
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="shrink-0 px-3 py-2 rounded-xl border border-white/15 bg-white/5 text-xs text-neutral-300 hover:bg-white/10"
+            >
+              Sign out
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <>
       <div
@@ -4608,11 +5104,34 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           `stack-poster-${posterSize}`,
           `stack-surface-${surfaceStyle}`,
           `stack-corners-${cornerStyle}`,
-          settings.reduceMotion ? "stack-reduce-motion" : "",
         ]
           .filter(Boolean)
           .join(" ")}
       >
+        {showingVerifiedSessionCache ? (
+          <div
+            className="fixed inset-0 z-[70] cursor-wait"
+            aria-live="polite"
+            aria-label="Stack is securely revalidating your account data"
+          >
+            <div className="absolute top-3 right-3 sm:top-4 sm:right-4 flex items-center gap-2 rounded-xl border border-white/10 bg-black/85 px-3 py-2 shadow-xl backdrop-blur-xl">
+              <div className="min-w-0">
+                <div className="text-[11px] font-medium text-neutral-200">Secure sync</div>
+                <div className="max-w-[240px] truncate text-[10px] text-neutral-500">
+                  {saveStatus || "Revalidating your account…"}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="px-2.5 py-1.5 rounded-lg border border-white/10 bg-white/5 text-[10px] text-neutral-300 hover:bg-white/10 cursor-pointer"
+              >
+                Sign out
+              </button>
+            </div>
+          </div>
+        ) : null}
+
         <style>{`
           :root {
             --stack-theme-bg: ${STACK_COLOR_THEMES.midnight.bg};
@@ -4637,28 +5156,20 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             -webkit-backdrop-filter: blur(22px) saturate(1.16);
           }
 
-          .stack-surface-solid .stack-surface {
-            backdrop-filter: none !important;
-            -webkit-backdrop-filter: none !important;
-            background: color-mix(in srgb, var(--stack-theme-surface) 92%, #05070d 8%) !important;
+          /* Square means square. Keep only intentional circular controls round. */
+          .stack-corners-square :where(
+            [class~="rounded-[2rem]"],
+            .rounded-3xl,
+            .rounded-2xl,
+            .rounded-xl,
+            .rounded-lg,
+            .rounded-md
+          ) {
+            border-radius: 0 !important;
           }
 
-          .stack-corners-square .rounded-3xl,
-          .stack-corners-square .rounded-2xl,
-          .stack-corners-square .rounded-xl,
-          .stack-corners-square .rounded-\[2rem\] { border-radius: 0.35rem !important; }
-
-          .stack-corners-soft .rounded-3xl,
-          .stack-corners-soft .rounded-\[2rem\] { border-radius: 1rem !important; }
-          .stack-corners-soft .rounded-2xl { border-radius: 0.8rem !important; }
-
-          .stack-reduce-motion *,
-          .stack-reduce-motion *::before,
-          .stack-reduce-motion *::after {
-            scroll-behavior: auto !important;
-            transition-duration: 0.001ms !important;
-            animation-duration: 0.001ms !important;
-            animation-iteration-count: 1 !important;
+          .stack-corners-square .rounded-full {
+            border-radius: 9999px !important;
           }
 
           .stack-poster-grid {
@@ -4680,16 +5191,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           .stack-poster-card {
             position: relative;
             overflow: hidden;
-            border: 1px solid rgba(255,255,255,0.10);
-            background: rgba(7,10,18,0.78);
-            box-shadow: 0 18px 52px rgba(0,0,0,0.26);
-            transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+            border: 1px solid rgba(255,255,255,0.09);
+            background: rgba(7,10,18,0.76);
+            box-shadow: 0 12px 34px rgba(0,0,0,0.22);
+            transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
           }
 
           .stack-poster-card:hover {
-            transform: translateY(-4px);
-            border-color: rgba(255,255,255,0.20);
-            box-shadow: 0 24px 64px rgba(0,0,0,0.34);
+            transform: translateY(-2px);
+            border-color: rgba(255,255,255,0.18);
+            box-shadow: 0 18px 46px rgba(0,0,0,0.28);
           }
 
           .stack-classic-row {
@@ -4717,13 +5228,29 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
           .stack-admin-grid {
             display: grid;
-            grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.7fr);
+            grid-template-columns: minmax(260px, 0.78fr) minmax(0, 1.72fr);
             gap: 1rem;
+            align-items: start;
           }
 
           @media (max-width: 900px) {
             .stack-admin-grid { grid-template-columns: 1fr; }
-            .stack-settings-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+          }
+
+          @media (max-width: 639px) {
+            .stack-settings-tabs {
+              display: flex;
+              overflow-x: auto;
+              scrollbar-width: none;
+              overscroll-behavior-inline: contain;
+              scroll-snap-type: x proximity;
+            }
+            .stack-settings-tabs::-webkit-scrollbar { display: none; }
+            .stack-settings-tabs > button {
+              min-width: 7.25rem;
+              flex: 0 0 auto;
+              scroll-snap-align: start;
+            }
           }
 
           @media (max-width: 639px) {
@@ -4736,8 +5263,18 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           }
 
           .stack-surface {
-            background: var(--stack-theme-surface) !important;
-            box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28), 0 0 0 1px var(--stack-theme-ring) inset;
+            background: color-mix(in srgb, var(--stack-theme-surface) 92%, rgba(3, 6, 14, 0.08)) !important;
+            box-shadow: 0 16px 46px rgba(0, 0, 0, 0.22), 0 0 0 1px var(--stack-theme-ring) inset;
+          }
+
+          .stack-surface,
+          .stack-poster-card,
+          .stack-mobile-item-card {
+            transition: border-color 160ms ease, background-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+          }
+
+          .stack-shell-divider {
+            border-color: rgba(255, 255, 255, 0.08);
           }
 
           .stack-accent {
@@ -4767,8 +5304,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           .stack-compact .space-y-6 > :not([hidden]) ~ :not([hidden]) { margin-top: 1rem !important; }
           .stack-compact .space-y-4 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.75rem !important; }
           .stack-compact .space-y-3 > :not([hidden]) ~ :not([hidden]) { margin-top: 0.5rem !important; }
-          .stack-compact .rounded-3xl { border-radius: 1.15rem !important; }
-          .stack-compact .rounded-2xl { border-radius: 0.9rem !important; }
+          .stack-compact:not(.stack-corners-square) .rounded-3xl { border-radius: 1.15rem !important; }
+          .stack-compact:not(.stack-corners-square) .rounded-2xl { border-radius: 0.9rem !important; }
 
           @media (max-width: 639px) {
             .stack-bg { min-height: 100dvh; }
@@ -4806,7 +5343,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         <div
           className={[
             isWideBoard ? "max-w-[104rem]" : "max-w-6xl",
-            "relative z-10 mx-auto px-3 sm:px-6 py-5 pb-28 sm:py-6 sm:pb-6 space-y-6 min-w-0 overflow-x-hidden",
+            "relative z-10 mx-auto px-3 sm:px-6 py-5 pb-24 sm:py-6 sm:pb-6 space-y-6 min-w-0 overflow-x-hidden",
           ].join(" ")}
         >
           {/* Header */}
@@ -4826,7 +5363,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               <div className="relative p-4 sm:p-6 flex flex-col lg:flex-row lg:items-end lg:justify-between gap-5">
                 <div className="min-w-0">
                   <div className="stack-section-kicker">Personal media tracker</div>
-                  <h1 className="text-3xl sm:text-5xl font-semibold tracking-tight mt-1">Stack</h1>
+                  <h1 className="text-3xl sm:text-4xl font-semibold tracking-[-0.025em] mt-1">Stack</h1>
                   <p className="text-sm text-neutral-300/80 mt-1">Your movies, shows, anime, manga, books, and games in one place.</p>
 
                   <div className="flex flex-wrap gap-2 mt-4">
@@ -4852,8 +5389,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             </div>
 
             <nav className="space-y-2" aria-label="Stack navigation">
-              <div className="flex justify-center">
-                <div className="inline-flex flex-wrap justify-center gap-[clamp(0.35rem,1.5vw,0.65rem)] rounded-3xl bg-neutral-950/55 ring-1 ring-white/10 shadow-lg shadow-black/20 px-[clamp(0.45rem,1.6vw,0.8rem)] py-[clamp(0.4rem,1.2vw,0.65rem)] max-w-[96vw] backdrop-blur-xl">
+              <div className="flex justify-start sm:justify-center overflow-x-auto pb-1 sm:pb-0">
+                <div className="inline-flex flex-nowrap sm:flex-wrap justify-start sm:justify-center gap-[clamp(0.35rem,1.5vw,0.65rem)] rounded-3xl bg-neutral-950/55 ring-1 ring-white/10 shadow-lg shadow-black/20 px-[clamp(0.45rem,1.6vw,0.8rem)] py-[clamp(0.4rem,1.2vw,0.65rem)] max-w-[96vw] min-w-max sm:min-w-0 backdrop-blur-xl">
                   {navMain.map((n) => (
                     <Link
                       key={n.href}
@@ -4880,7 +5417,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       title={n.label}
                       aria-label={n.label}
                       className={[
-                        "h-[clamp(2.35rem,10vw,2.85rem)] min-w-[clamp(2.35rem,10vw,2.85rem)] px-2 grid place-items-center rounded-2xl border transition shadow-sm touch-manipulation",
+                        "h-[2.75rem] min-w-[2.75rem] px-3 items-center justify-center gap-2 rounded-2xl border transition shadow-sm touch-manipulation",
+                        n.key === "feed" || n.key === "discover" || n.key === "feedback"
+                          ? "inline-flex"
+                          : "hidden sm:inline-flex",
                         "bg-neutral-950/50 ring-1 ring-white/5 backdrop-blur-xl",
                         view === n.key
                           ? "bg-white/15 border-white/25 text-neutral-50 shadow-inner"
@@ -4902,6 +5442,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                       ) : (
                         <span className="text-[clamp(0.95rem,2.2vw,1.25rem)] leading-none">⚙</span>
                       )}
+                      <span className="hidden lg:inline text-xs font-medium">{n.label}</span>
                     </Link>
                   ))}
                 </div>
@@ -6984,7 +7525,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   }
                 >
                   <div className="text-xs text-neutral-500 mb-3">
-                    Only the admin account shows this section. It gathers saved Suggestions / Problems from visible Stack data.
+                    Only the admin account shows this section. It gathers saved Suggestions / Problems from visible Stack data and is intentionally read-only to avoid cross-user writes.
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,220px)_auto] gap-3 items-end mb-4">
@@ -7018,28 +7559,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                               </div>
                               <div className="text-sm text-neutral-200 whitespace-pre-wrap">{f.message}</div>
                             </div>
-                            <div className="flex flex-wrap gap-2 sm:justify-end">
-                              <button
-                                type="button"
-                                onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "new")}
-                                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                              >
-                                New
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "reviewed")}
-                                className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-                              >
-                                Reviewed
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => updateAdminFeedbackStatus(f.userId, f.id, "done")}
-                                className="text-xs px-3 py-2 rounded-xl stack-good hover:opacity-95"
-                              >
-                                Done
-                              </button>
+                            <div className="shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg border border-white/10 bg-white/[0.04] text-neutral-500">
+                              Read-only
                             </div>
                           </div>
                         </div>
@@ -7107,6 +7628,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               {settingsTab === "profile" ? (
                 <div className="space-y-4">
                   <Panel title="Profile / personal info">
+                    <div className="mb-4 rounded-2xl border border-emerald-400/15 bg-emerald-400/[0.05] px-4 py-3">
+                      <div className="text-[10px] uppercase tracking-[0.16em] text-emerald-300/70">Verified Stack session</div>
+                      <div className="text-sm text-neutral-200 mt-1 break-all">{authEmail || "Authenticated user"}</div>
+                      {userId ? <div className="text-[10px] text-neutral-600 mt-1 break-all">User ID: {userId}</div> : null}
+                      <div className="text-[11px] text-neutral-500 mt-2">If this is not your account, log out immediately before making changes.</div>
+                    </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <Text
                         label="Display name"
@@ -7168,7 +7695,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
               {settingsTab === "appearance" ? (
                 <div className="space-y-4">
-                  <Panel title="Theme studio" right={<span className="text-xs text-neutral-500">MAL-inspired customization, Stack style</span>}>
+                  <Panel title="Appearance" right={<span className="text-xs text-neutral-500">Layout, color, density, and shape</span>}>
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                       <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4">
                         <Select
@@ -7227,29 +7754,24 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
                       <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 space-y-3">
                         <Select
-                          label="Surface style"
-                          value={settings.surfaceStyle ?? DEFAULT_SETTINGS.surfaceStyle}
-                          onChange={(v) => updateSettings({ surfaceStyle: v as StackSurfaceStyle })}
-                          options={[
-                            { value: "glass", label: "Glass" },
-                            { value: "solid", label: "Solid" },
-                          ]}
-                        />
-                        <Select
                           label="Corner style"
                           value={settings.cornerStyle ?? DEFAULT_SETTINGS.cornerStyle}
                           onChange={(v) => updateSettings({ cornerStyle: v as StackCornerStyle })}
                           options={[
                             { value: "rounded", label: "Rounded" },
-                            { value: "soft", label: "Soft" },
                             { value: "square", label: "Square" },
                           ]}
                         />
+                        <div className="text-[11px] text-neutral-500">
+                          Glass surfaces are now the standard Stack finish for a cleaner, more consistent look.
+                        </div>
                       </div>
 
                       <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 space-y-3">
                         <Toggle label="Compact spacing" checked={!!settings.compactMode} onChange={(v) => updateSettings({ compactMode: v })} />
-                        <Toggle label="Reduce motion" checked={!!settings.reduceMotion} onChange={(v) => updateSettings({ reduceMotion: v })} />
+                        <div className="text-[11px] text-neutral-500">
+                          Compact mode reduces padding while keeping the same information and controls.
+                        </div>
                       </div>
                     </div>
                   </Panel>
@@ -7486,7 +8008,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           {/* LIST PAGES */}
           {view !== "stats" && view !== "add" && view !== "friends" && view !== "feed" && view !== "discover" && view !== "feedback" && view !== "settings" ? (
             <div className={view === "all" && boardView ? "space-y-4" : "space-y-4 max-w-5xl mx-auto"}>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
+              <div className="stack-surface rounded-3xl border border-white/10 p-3 sm:p-4 space-y-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
                 <label className="block">
                   <div className="text-xs text-neutral-400 mb-1">Search</div>
                   <input
@@ -7549,12 +8072,13 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 </button>
               </div>
 
-              {view === "all" ? (
-                <div className="flex items-center justify-between">
-                  <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
-                  <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
-                </div>
-              ) : null}
+                {view === "all" ? (
+                  <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-3">
+                    <div className="text-xs text-neutral-500">Board view lets you drag cards between statuses.</div>
+                    <Toggle label="Board view" checked={boardView} onChange={setBoardView} />
+                  </div>
+                ) : null}
+              </div>
 
               {filtered.length === 0 ? (
                 <EmptyState
@@ -7563,6 +8087,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                 />
               ) : null}
 
+              {displayPreferencesReady ? (
               <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
                 {view === "all" && boardView ? (
                   <BoardView
@@ -7652,6 +8177,9 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   </div>
                 )}
               </DndContext>
+              ) : (
+                <LibraryLoadingSkeleton />
+              )}
             </div>
           ) : null}
 
@@ -7715,12 +8243,6 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
               </div>
             </div>
           </div>
-        ) : null}
-
-        {view !== "add" ? (
-          <Link href="/add" className="sm:hidden fixed right-4 bottom-[5.35rem] z-40 px-4 py-3 rounded-2xl stack-good border border-white/10 shadow-2xl text-sm font-medium text-neutral-50" aria-label="Add to Stack">
-            + Add
-          </Link>
         ) : null}
 
         <nav className="sm:hidden fixed inset-x-0 bottom-0 z-40 border-t border-white/10 bg-neutral-950/90 backdrop-blur-xl px-2 pt-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))]" aria-label="Mobile Stack navigation">
@@ -7889,6 +8411,7 @@ function MediaPosterCard({
   displayPrefs: ListDisplayPreferences;
 }) {
   const [showDetail, setShowDetail] = React.useState(false);
+  const [detailStartsEditing, setDetailStartsEditing] = React.useState(false);
   const poster = item.posterOverrideUrl || item.posterUrl;
   const withFriends = (item.withFriendIds ?? [])
     .map((id) => friendsById.get(id) ?? id)
@@ -7903,14 +8426,21 @@ function MediaPosterCard({
           friendsById={friendsById}
           onUpdate={onUpdate}
           onDelete={onDelete}
-          onClose={() => setShowDetail(false)}
+          initialEditing={detailStartsEditing}
+          onClose={() => {
+            setShowDetail(false);
+            setDetailStartsEditing(false);
+          }}
         />
       ) : null}
 
       <article className="stack-poster-card rounded-3xl group">
         <button
           type="button"
-          onClick={() => setShowDetail(true)}
+          onClick={() => {
+            setDetailStartsEditing(false);
+            setShowDetail(true);
+          }}
           className="block w-full aspect-[2/3] bg-neutral-950 overflow-hidden relative"
         >
           {poster ? (
@@ -7938,7 +8468,10 @@ function MediaPosterCard({
         <div className="p-3 space-y-2">
           <button
             type="button"
-            onClick={() => setShowDetail(true)}
+            onClick={() => {
+              setDetailStartsEditing(false);
+              setShowDetail(true);
+            }}
             className="w-full text-left text-sm font-semibold text-neutral-100 line-clamp-2 min-h-[2.5rem] hover:text-white"
           >
             {item.title}
@@ -7985,12 +8518,13 @@ function MediaPosterCard({
             <option value="dropped">Dropped</option>
           </select>
 
-          <div className="grid grid-cols-3 gap-1.5">
+          <div className="grid grid-cols-2 gap-1.5">
             <button
               type="button"
               onClick={() => onUpdate({ favorite: !item.favorite })}
               className="text-[11px] px-2 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
               title={item.favorite ? "Remove favorite" : "Favorite"}
+              aria-label={item.favorite ? "Remove favorite" : "Favorite"}
             >
               {item.favorite ? "★" : "☆"}
             </button>
@@ -8001,6 +8535,17 @@ function MediaPosterCard({
               title={item.isPrivate ? "Make public" : "Make private"}
             >
               {item.isPrivate ? "Private" : "Public"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setDetailStartsEditing(true);
+                setShowDetail(true);
+              }}
+              className="text-[11px] px-2 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+              title="Edit entry"
+            >
+              Edit
             </button>
             <button
               type="button"
@@ -8043,6 +8588,7 @@ function MALRow({
   const [draftDate, setDraftDate] = React.useState(item.dateFinished ?? "");
   const [draftRating, setDraftRating] = React.useState(typeof item.rating === "number" ? String(item.rating) : "");
   const [draftNotes, setDraftNotes] = React.useState(item.notes ?? "");
+  const [draftPosterOverride, setDraftPosterOverride] = React.useState(item.posterOverrideUrl ?? "");
 
   const [showFullNote, setShowFullNote] = React.useState(false);
   const [showDetail, setShowDetail] = React.useState(false);
@@ -8053,7 +8599,8 @@ function MALRow({
     setDraftDate(item.dateFinished ?? "");
     setDraftRating(typeof item.rating === "number" ? String(item.rating) : "");
     setDraftNotes(item.notes ?? "");
-  }, [item.id, item.title, item.dateFinished, item.rating, item.notes, isEditing]);
+    setDraftPosterOverride(item.posterOverrideUrl ?? "");
+  }, [item.id, item.title, item.dateFinished, item.rating, item.notes, item.posterOverrideUrl, isEditing]);
 
   const cancelEdit = () => {
     setIsEditing(false);
@@ -8061,6 +8608,7 @@ function MALRow({
     setDraftDate(item.dateFinished ?? "");
     setDraftRating(typeof item.rating === "number" ? String(item.rating) : "");
     setDraftNotes(item.notes ?? "");
+    setDraftPosterOverride(item.posterOverrideUrl ?? "");
   };
 
   const saveEdit = () => {
@@ -8080,6 +8628,7 @@ function MALRow({
       dateFinished: nextDate ? nextDate : undefined,
       rating: nextRating,
       notes: nextNotes,
+      posterOverrideUrl: draftPosterOverride.trim() || undefined,
     });
 
     setIsEditing(false);
@@ -8256,15 +8805,27 @@ function MALRow({
           </div>
 
           {isEditing ? (
-            <div>
-              <div className="text-[11px] text-neutral-500 mb-1">Note</div>
-              <textarea
-                value={draftNotes}
-                onChange={(e) => setDraftNotes(e.target.value)}
-                rows={3}
-                className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base outline-none focus:border-neutral-500 resize-none"
-                placeholder="Write a note…"
-              />
+            <div className="space-y-3">
+              <div>
+                <div className="text-[11px] text-neutral-500 mb-1">Note</div>
+                <textarea
+                  value={draftNotes}
+                  onChange={(e) => setDraftNotes(e.target.value)}
+                  rows={3}
+                  className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base outline-none focus:border-neutral-500 resize-none"
+                  placeholder="Write a note…"
+                />
+              </div>
+              <div>
+                <div className="text-[11px] text-neutral-500 mb-1">Custom image URL</div>
+                <input
+                  value={draftPosterOverride}
+                  onChange={(e) => setDraftPosterOverride(e.target.value)}
+                  placeholder={item.posterUrl || "https://..."}
+                  className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base outline-none focus:border-neutral-500"
+                />
+                <div className="text-[10px] text-neutral-600 mt-1">Leave blank to use the original image.</div>
+              </div>
             </div>
           ) : displayPrefs.showNotes && item.notes ? (
             <div className="rounded-2xl bg-white/[0.035] border border-white/10 px-3 py-2">
@@ -8539,15 +9100,27 @@ function MALRow({
                 </div>
 
                 {isEditing ? (
-                  <div className="mt-2">
-                    <div className="text-[11px] text-neutral-500 mb-1">Note</div>
-                    <textarea
-                      value={draftNotes}
-                      onChange={(e) => setDraftNotes(e.target.value)}
-                      rows={3}
-                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500 resize-none"
-                      placeholder="Write a note…"
-                    />
+                  <div className="mt-2 space-y-3">
+                    <div>
+                      <div className="text-[11px] text-neutral-500 mb-1">Note</div>
+                      <textarea
+                        value={draftNotes}
+                        onChange={(e) => setDraftNotes(e.target.value)}
+                        rows={3}
+                        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500 resize-none"
+                        placeholder="Write a note…"
+                      />
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-neutral-500 mb-1">Custom image URL</div>
+                      <input
+                        value={draftPosterOverride}
+                        onChange={(e) => setDraftPosterOverride(e.target.value)}
+                        placeholder={item.posterUrl || "https://..."}
+                        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-base sm:text-sm outline-none focus:border-neutral-500"
+                      />
+                      <div className="text-[10px] text-neutral-600 mt-1">Leave blank to use the original image.</div>
+                    </div>
                   </div>
                 ) : displayPrefs.showNotes && item.notes ? (
                   <div className="mt-2">
@@ -9075,6 +9648,7 @@ function MediaItemDetailModal({
   onClose,
   onUpdate,
   onDelete,
+  initialEditing = false,
 }: {
   item: MediaItem;
   ratingFormat: RatingFormat;
@@ -9083,133 +9657,554 @@ function MediaItemDetailModal({
   onClose: () => void;
   onUpdate?: (patch: Partial<MediaItem>) => void;
   onDelete?: () => void;
+  initialEditing?: boolean;
 }) {
-  const displayPoster = item.posterOverrideUrl || item.posterUrl;
   const withFriends = (item.withFriendIds ?? [])
     .map((id) => friendsById?.get(id) ?? id)
     .filter(Boolean);
 
+  const movieProgress = getMovieProgressDefaults(item);
+  const effectiveProgressCur =
+    item.type === "movie"
+      ? movieProgress.cur
+      : typeof item.progressCurOverride === "number"
+      ? item.progressCurOverride
+      : item.progressCur;
+  const effectiveProgressTotal =
+    item.type === "movie"
+      ? movieProgress.total
+      : typeof item.progressTotalOverride === "number"
+      ? item.progressTotalOverride
+      : item.progressTotal;
+
+  const [isEditing, setIsEditing] = React.useState(!!initialEditing);
+  const [draftTitle, setDraftTitle] = React.useState(item.title);
+  const [draftStatus, setDraftStatus] = React.useState<Status>(item.status);
+  const [draftDate, setDraftDate] = React.useState(item.dateFinished ?? "");
+  const [draftRating, setDraftRating] = React.useState(
+    typeof item.rating === "number" ? String(item.rating) : ""
+  );
+  const [draftNotes, setDraftNotes] = React.useState(item.notes ?? "");
+  const [draftTags, setDraftTags] = React.useState((item.tags ?? []).join(", "));
+  const [draftPosterOverride, setDraftPosterOverride] = React.useState(
+    item.posterOverrideUrl ?? ""
+  );
+  const [draftRewatchCount, setDraftRewatchCount] = React.useState(
+    String(Math.max(0, Number(item.rewatchCount ?? 0) || 0))
+  );
+  const [draftProgressCur, setDraftProgressCur] = React.useState(
+    typeof effectiveProgressCur === "number" ? String(effectiveProgressCur) : ""
+  );
+  const [draftProgressTotal, setDraftProgressTotal] = React.useState(
+    typeof effectiveProgressTotal === "number" ? String(effectiveProgressTotal) : ""
+  );
+  const [draftHoursPlayed, setDraftHoursPlayed] = React.useState(
+    typeof item.hoursPlayed === "number" ? String(item.hoursPlayed) : ""
+  );
+
+  const resetDrafts = () => {
+    const latestMovieProgress = getMovieProgressDefaults(item);
+    const latestCur =
+      item.type === "movie"
+        ? latestMovieProgress.cur
+        : typeof item.progressCurOverride === "number"
+        ? item.progressCurOverride
+        : item.progressCur;
+    const latestTotal =
+      item.type === "movie"
+        ? latestMovieProgress.total
+        : typeof item.progressTotalOverride === "number"
+        ? item.progressTotalOverride
+        : item.progressTotal;
+
+    setDraftTitle(item.title);
+    setDraftStatus(item.status);
+    setDraftDate(item.dateFinished ?? "");
+    setDraftRating(typeof item.rating === "number" ? String(item.rating) : "");
+    setDraftNotes(item.notes ?? "");
+    setDraftTags((item.tags ?? []).join(", "));
+    setDraftPosterOverride(item.posterOverrideUrl ?? "");
+    setDraftRewatchCount(String(Math.max(0, Number(item.rewatchCount ?? 0) || 0)));
+    setDraftProgressCur(typeof latestCur === "number" ? String(latestCur) : "");
+    setDraftProgressTotal(typeof latestTotal === "number" ? String(latestTotal) : "");
+    setDraftHoursPlayed(typeof item.hoursPlayed === "number" ? String(item.hoursPlayed) : "");
+  };
+
+  useEffect(() => {
+    if (isEditing) return;
+    resetDrafts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    item.id,
+    item.title,
+    item.status,
+    item.dateFinished,
+    item.rating,
+    item.notes,
+    item.tags,
+    item.posterOverrideUrl,
+    item.rewatchCount,
+    item.progressCur,
+    item.progressTotal,
+    item.progressCurOverride,
+    item.progressTotalOverride,
+    item.hoursPlayed,
+    isEditing,
+  ]);
+
+  const cancelEditing = () => {
+    resetDrafts();
+    setIsEditing(false);
+  };
+
+  const saveEditing = () => {
+    if (!onUpdate) return;
+
+    const cleanTitle = draftTitle.trim() || item.title;
+    const cleanDate = draftDate.trim();
+    const cleanNotes = draftNotes.trim();
+    const cleanPosterOverride = draftPosterOverride.trim();
+    const nextTags = uniqTags(
+      draftTags
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter(Boolean)
+    );
+
+    const ratingRaw = draftRating.trim();
+    const ratingNumber = ratingRaw === "" ? undefined : Number(ratingRaw);
+    const nextRating =
+      typeof ratingNumber === "number" && Number.isFinite(ratingNumber)
+        ? clamp(ratingNumber, 0, 10)
+        : undefined;
+
+    const rewatchNumber = Math.max(
+      0,
+      Math.floor(Number(draftRewatchCount.trim() || "0") || 0)
+    );
+
+    const patch: Partial<MediaItem> = {
+      title: cleanTitle,
+      status: draftStatus,
+      dateFinished: cleanDate || undefined,
+      rating: nextRating,
+      notes: cleanNotes || undefined,
+      tags: nextTags,
+      posterOverrideUrl: cleanPosterOverride || undefined,
+      rewatchCount: rewatchNumber,
+    };
+
+    if (item.type === "game") {
+      const hoursRaw = draftHoursPlayed.trim();
+      const hoursNumber = hoursRaw === "" ? undefined : Number(hoursRaw);
+      patch.hoursPlayed =
+        typeof hoursNumber === "number" && Number.isFinite(hoursNumber)
+          ? Math.max(0, hoursNumber)
+          : undefined;
+    } else if (item.type === "movie") {
+      patch.progressTotal = 1;
+      patch.progressCur = draftStatus === "completed" ? 1 : clamp(Number(draftProgressCur || 0) || 0, 0, 1);
+      patch.progressCurOverride = undefined;
+      patch.progressTotalOverride = undefined;
+    } else {
+      const curRaw = draftProgressCur.trim();
+      const totalRaw = draftProgressTotal.trim();
+      const curNumber = curRaw === "" ? undefined : Number(curRaw);
+      const totalNumber = totalRaw === "" ? undefined : Number(totalRaw);
+
+      patch.progressCurOverride =
+        typeof curNumber === "number" && Number.isFinite(curNumber)
+          ? Math.max(0, curNumber)
+          : undefined;
+      patch.progressTotalOverride =
+        typeof totalNumber === "number" && Number.isFinite(totalNumber)
+          ? Math.max(0, totalNumber)
+          : undefined;
+    }
+
+    onUpdate(patch);
+    setIsEditing(false);
+  };
+
+  const displayPoster = isEditing
+    ? draftPosterOverride.trim() || item.posterUrl
+    : item.posterOverrideUrl || item.posterUrl;
+
   return (
     <div
-      className="fixed inset-0 z-50 grid place-items-end sm:place-items-center bg-black/70 p-0 sm:p-4"
+      className="fixed inset-0 z-50 grid place-items-end sm:place-items-center bg-black/72 p-0 sm:p-4"
       onMouseDown={onClose}
       role="dialog"
       aria-modal="true"
+      aria-label={`${item.title} details`}
     >
       <div
-        className="w-full max-w-3xl max-h-[92dvh] sm:max-h-[86vh] rounded-t-3xl sm:rounded-2xl bg-neutral-950 border border-neutral-800 shadow-2xl overflow-hidden flex flex-col"
+        className="w-full max-w-4xl max-h-[94dvh] sm:max-h-[88vh] rounded-t-3xl sm:rounded-3xl bg-[#080b12] border border-white/10 shadow-2xl overflow-hidden flex flex-col"
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-neutral-800">
+        <div className="flex items-center justify-between gap-3 px-4 sm:px-5 py-3.5 border-b border-white/10 bg-black/20">
           <div className="min-w-0">
-            <div className="text-sm text-neutral-200 font-medium truncate">{item.title}</div>
+            <div className="text-sm text-neutral-100 font-medium truncate">
+              {isEditing ? "Edit entry" : item.title}
+            </div>
             <div className="text-[11px] text-neutral-500">
               {TYPE_LABEL[item.type]} • {item.status.replace("_", " ")}
             </div>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
-          >
-            Close
-          </button>
+          <div className="flex items-center gap-2">
+            {!isEditing && onUpdate ? (
+              <button
+                type="button"
+                onClick={() => setIsEditing(true)}
+                className="text-xs px-3 py-2 rounded-xl bg-white/8 border border-white/10 hover:bg-white/12"
+              >
+                Edit
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={onClose}
+              className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+            >
+              Close
+            </button>
+          </div>
         </div>
 
-        <div className="p-4 grid grid-cols-1 sm:grid-cols-[140px_minmax(0,1fr)] gap-4 overflow-y-auto stack-mobile-scroll-panel">
-          <div className="w-32 sm:w-full max-w-[160px] mx-auto sm:mx-0 aspect-[2/3] rounded-2xl overflow-hidden bg-neutral-900 border border-neutral-800">
-            {displayPoster ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
-            ) : (
-              <div className="w-full h-full grid place-items-center text-xs text-neutral-600">No cover</div>
-            )}
+        <div className="p-4 sm:p-5 grid grid-cols-1 sm:grid-cols-[180px_minmax(0,1fr)] gap-5 overflow-y-auto stack-mobile-scroll-panel">
+          <div className="space-y-3">
+            <div className="w-36 sm:w-full max-w-[190px] mx-auto sm:mx-0 aspect-[2/3] rounded-2xl overflow-hidden bg-neutral-900 border border-white/10 shadow-lg shadow-black/20">
+              {displayPoster ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={displayPoster} alt={item.title} className="w-full h-full object-cover" />
+              ) : (
+                <div className="w-full h-full grid place-items-center text-xs text-neutral-600">
+                  No cover
+                </div>
+              )}
+            </div>
+
+            {isEditing ? (
+              <div className="space-y-2">
+                <label className="block">
+                  <div className="text-[11px] text-neutral-500 mb-1">Image URL</div>
+                  <input
+                    value={draftPosterOverride}
+                    onChange={(e) => setDraftPosterOverride(e.target.value)}
+                    placeholder={item.posterUrl || "https://..."}
+                    className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-xs outline-none focus:border-neutral-500"
+                  />
+                </label>
+                <div className="text-[10px] text-neutral-600 leading-relaxed">
+                  Set a custom poster URL for this entry. Leave it blank to use the original artwork.
+                </div>
+                {draftPosterOverride.trim() ? (
+                  <button
+                    type="button"
+                    onClick={() => setDraftPosterOverride("")}
+                    className="w-full text-[11px] px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                  >
+                    Use original image
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
           </div>
 
           <div className="min-w-0 space-y-3">
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
-              <MiniStat label="Status" value={item.status.replace("_", " ")} />
-              <MiniStat label="Type" value={TYPE_LABEL[item.type]} />
-              <MiniStat label={item.type === "game" ? "Hours" : "Progress"} value={readOnlyProgressLabel(item)} />
-              <MiniStat label="Rating" value={privacy.showRatings ? formatRatingValue(item.rating, ratingFormat) : "Hidden"} />
-            </div>
+            {isEditing ? (
+              <>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <label className="block sm:col-span-2">
+                    <div className="text-xs text-neutral-500 mb-1">Title</div>
+                    <input
+                      value={draftTitle}
+                      onChange={(e) => setDraftTitle(e.target.value)}
+                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-sm outline-none focus:border-neutral-500"
+                    />
+                  </label>
 
-            <div className="rounded-2xl bg-neutral-900/40 border border-white/10 px-3 py-3 text-sm text-neutral-300">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-neutral-400">
-                <div>Date watched: <span className="text-neutral-200">{item.dateFinished || "—"}</span></div>
-                <div>Updated: <span className="text-neutral-200">{safeDateLabel(item.updatedAt ?? item.createdAt)}</span></div>
-                <div>Rewatch count: <span className="text-neutral-200">{Number(item.rewatchCount ?? 0) || 0}</span></div>
-                <div>Visibility: <span className="text-neutral-200">{item.isPrivate ? "Private" : "Public"}</span></div>
-              </div>
-            </div>
+                  <label className="block">
+                    <div className="text-xs text-neutral-500 mb-1">Status</div>
+                    <select
+                      value={draftStatus}
+                      onChange={(e) => setDraftStatus(e.target.value as Status)}
+                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-sm outline-none focus:border-neutral-500"
+                    >
+                      <option value="completed">Completed</option>
+                      <option value="in_progress">In Progress</option>
+                      <option value="planned">Planned</option>
+                      <option value="dropped">Dropped</option>
+                    </select>
+                  </label>
 
-            {privacy.showNotes ? (
-              <div className="rounded-2xl bg-neutral-900/40 border border-white/10 px-3 py-3">
-                <div className="text-xs text-neutral-500 mb-1">Notes</div>
-                <div className="text-sm text-neutral-200 whitespace-pre-wrap leading-relaxed">{item.notes || "No notes yet."}</div>
-              </div>
-            ) : null}
+                  <label className="block">
+                    <div className="text-xs text-neutral-500 mb-1">Date watched</div>
+                    <input
+                      type="date"
+                      value={draftDate}
+                      onChange={(e) => setDraftDate(e.target.value)}
+                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-sm outline-none focus:border-neutral-500"
+                    />
+                  </label>
 
-            {privacy.showTags ? (
-              <div className="rounded-2xl bg-neutral-900/40 border border-white/10 px-3 py-3">
-                <div className="text-xs text-neutral-500 mb-2">Tags</div>
-                {item.tags?.length ? (
-                  <div className="flex flex-wrap gap-2">
-                    {item.tags.map((tag) => (
-                      <span key={tag} className="px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-xs text-neutral-200">
-                        {tag}
-                      </span>
-                    ))}
+                  <label className="block">
+                    <div className="text-xs text-neutral-500 mb-1">Rating (0–10)</div>
+                    <input
+                      inputMode="decimal"
+                      value={draftRating}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        if (value === "" || /^\d{0,2}(\.\d{0,1})?$/.test(value)) {
+                          setDraftRating(value);
+                        }
+                      }}
+                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-sm outline-none focus:border-neutral-500"
+                      placeholder="—"
+                    />
+                  </label>
+
+                  <label className="block">
+                    <div className="text-xs text-neutral-500 mb-1">Rewatch count</div>
+                    <input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={draftRewatchCount}
+                      onChange={(e) => setDraftRewatchCount(e.target.value)}
+                      className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-sm outline-none focus:border-neutral-500"
+                    />
+                  </label>
+
+                  {item.type === "game" ? (
+                    <label className="block sm:col-span-2">
+                      <div className="text-xs text-neutral-500 mb-1">Hours played</div>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.1"
+                        value={draftHoursPlayed}
+                        onChange={(e) => setDraftHoursPlayed(e.target.value)}
+                        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-sm outline-none focus:border-neutral-500"
+                        placeholder="—"
+                      />
+                    </label>
+                  ) : item.type === "movie" ? (
+                    <label className="block sm:col-span-2">
+                      <div className="text-xs text-neutral-500 mb-1">Progress</div>
+                      <select
+                        value={draftStatus === "completed" ? "1" : draftProgressCur || "0"}
+                        onChange={(e) => setDraftProgressCur(e.target.value)}
+                        className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-sm outline-none focus:border-neutral-500"
+                        disabled={draftStatus === "completed"}
+                      >
+                        <option value="0">0 / 1</option>
+                        <option value="1">1 / 1</option>
+                      </select>
+                    </label>
+                  ) : (
+                    <>
+                      <label className="block">
+                        <div className="text-xs text-neutral-500 mb-1">Progress</div>
+                        <input
+                          type="number"
+                          min={0}
+                          value={draftProgressCur}
+                          onChange={(e) => setDraftProgressCur(e.target.value)}
+                          className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-sm outline-none focus:border-neutral-500"
+                          placeholder="Current"
+                        />
+                      </label>
+                      <label className="block">
+                        <div className="text-xs text-neutral-500 mb-1">Total</div>
+                        <input
+                          type="number"
+                          min={0}
+                          value={draftProgressTotal}
+                          onChange={(e) => setDraftProgressTotal(e.target.value)}
+                          className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-sm outline-none focus:border-neutral-500"
+                          placeholder="Total"
+                        />
+                      </label>
+                    </>
+                  )}
+                </div>
+
+                <label className="block">
+                  <div className="text-xs text-neutral-500 mb-1">Notes</div>
+                  <textarea
+                    value={draftNotes}
+                    onChange={(e) => setDraftNotes(e.target.value)}
+                    rows={5}
+                    className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-base sm:text-sm outline-none focus:border-neutral-500 resize-y"
+                    placeholder="Write anything you want to remember…"
+                  />
+                </label>
+
+                <label className="block">
+                  <div className="text-xs text-neutral-500 mb-1">Tags</div>
+                  <input
+                    value={draftTags}
+                    onChange={(e) => setDraftTags(e.target.value)}
+                    className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2.5 text-sm outline-none focus:border-neutral-500"
+                    placeholder="Action, Fantasy, Family"
+                  />
+                  <div className="text-[10px] text-neutral-600 mt-1">
+                    Separate tags with commas.
                   </div>
-                ) : (
-                  <div className="text-sm text-neutral-500">No tags yet.</div>
-                )}
-              </div>
-            ) : null}
+                </label>
+              </>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+                  <MiniStat label="Status" value={item.status.replace("_", " ")} />
+                  <MiniStat label="Type" value={TYPE_LABEL[item.type]} />
+                  <MiniStat
+                    label={item.type === "game" ? "Hours" : "Progress"}
+                    value={readOnlyProgressLabel(item)}
+                  />
+                  <MiniStat
+                    label="Rating"
+                    value={
+                      privacy.showRatings
+                        ? formatRatingValue(item.rating, ratingFormat)
+                        : "Hidden"
+                    }
+                  />
+                </div>
 
-            {withFriends.length ? (
-              <div className="text-xs text-neutral-500">With: {withFriends.join(" • ")}</div>
-            ) : null}
+                <div className="rounded-2xl bg-neutral-900/40 border border-white/10 px-3 py-3 text-sm text-neutral-300">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-neutral-400">
+                    <div>
+                      Date watched:{" "}
+                      <span className="text-neutral-200">{item.dateFinished || "—"}</span>
+                    </div>
+                    <div>
+                      Updated:{" "}
+                      <span className="text-neutral-200">
+                        {safeDateLabel(item.updatedAt ?? item.createdAt)}
+                      </span>
+                    </div>
+                    <div>
+                      Rewatch count:{" "}
+                      <span className="text-neutral-200">
+                        {Number(item.rewatchCount ?? 0) || 0}
+                      </span>
+                    </div>
+                    <div>
+                      Visibility:{" "}
+                      <span className="text-neutral-200">
+                        {item.isPrivate ? "Private" : "Public"}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {privacy.showNotes ? (
+                  <div className="rounded-2xl bg-neutral-900/40 border border-white/10 px-3 py-3">
+                    <div className="text-xs text-neutral-500 mb-1">Notes</div>
+                    <div className="text-sm text-neutral-200 whitespace-pre-wrap leading-relaxed">
+                      {item.notes || "No notes yet."}
+                    </div>
+                  </div>
+                ) : null}
+
+                {privacy.showTags ? (
+                  <div className="rounded-2xl bg-neutral-900/40 border border-white/10 px-3 py-3">
+                    <div className="text-xs text-neutral-500 mb-2">Tags</div>
+                    {item.tags?.length ? (
+                      <div className="flex flex-wrap gap-2">
+                        {item.tags.map((tag) => (
+                          <span
+                            key={tag}
+                            className="px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-xs text-neutral-200"
+                          >
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-sm text-neutral-500">No tags yet.</div>
+                    )}
+                  </div>
+                ) : null}
+
+                {withFriends.length ? (
+                  <div className="text-xs text-neutral-500">
+                    With: {withFriends.join(" • ")}
+                  </div>
+                ) : null}
+              </>
+            )}
 
             {onUpdate || onDelete ? (
-              <div className="sticky bottom-0 flex flex-wrap gap-2 pt-3 pb-1 border-t border-white/10 bg-neutral-950/95 backdrop-blur">
-                {onUpdate ? (
+              <div className="sticky bottom-0 flex flex-wrap gap-2 pt-3 pb-1 border-t border-white/10 bg-[#080b12]/95 backdrop-blur">
+                {isEditing && onUpdate ? (
                   <>
                     <button
                       type="button"
-                      onClick={() => onUpdate({ favorite: !item.favorite })}
-                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                      onClick={saveEditing}
+                      className="text-xs px-4 py-2.5 rounded-xl stack-good border hover:opacity-95"
                     >
-                      {item.favorite ? "Remove favorite" : "Favorite"}
+                      Save changes
                     </button>
                     <button
                       type="button"
-                      onClick={() => onUpdate({ isPrivate: !item.isPrivate })}
-                      className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                      onClick={cancelEditing}
+                      className="text-xs px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
                     >
-                      {item.isPrivate ? "Make public" : "Make private"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onUpdate({ status: "completed" })}
-                      className="text-xs px-3 py-2 rounded-xl stack-good hover:opacity-95"
-                    >
-                      Mark completed
+                      Cancel
                     </button>
                   </>
-                ) : null}
-                {onDelete ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onDelete();
-                      onClose();
-                    }}
-                    className="text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
-                  >
-                    Delete
-                  </button>
-                ) : null}
+                ) : (
+                  <>
+                    {onUpdate ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => onUpdate({ favorite: !item.favorite })}
+                          className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                        >
+                          {item.favorite ? "Remove favorite" : "Favorite"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onUpdate({ isPrivate: !item.isPrivate })}
+                          className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10"
+                        >
+                          {item.isPrivate ? "Make public" : "Make private"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setIsEditing(true)}
+                          className="text-xs px-3 py-2 rounded-xl bg-white/10 border border-white/15 hover:bg-white/15"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onUpdate({ status: "completed" })}
+                          className="text-xs px-3 py-2 rounded-xl stack-good border hover:opacity-95"
+                        >
+                          Mark completed
+                        </button>
+                      </>
+                    ) : null}
+
+                    {onDelete ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onDelete();
+                          onClose();
+                        }}
+                        className="text-xs px-3 py-2 rounded-xl bg-red-500/10 border border-red-500/20 hover:bg-red-500/20"
+                      >
+                        Delete
+                      </button>
+                    ) : null}
+                  </>
+                )}
               </div>
             ) : null}
           </div>
@@ -9698,6 +10693,33 @@ function OwnerAdminDashboard({
   );
 }
 
+
+function LibraryLoadingSkeleton() {
+  return (
+    <div
+      className="stack-surface rounded-3xl border border-white/10 p-4 sm:p-5"
+      aria-label="Loading saved library layout"
+      aria-busy="true"
+    >
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <div>
+          <div className="h-3 w-28 rounded-full bg-white/10 animate-pulse" />
+          <div className="h-2.5 w-44 rounded-full bg-white/5 animate-pulse mt-2" />
+        </div>
+        <div className="h-8 w-20 rounded-xl bg-white/5 animate-pulse" />
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+        {Array.from({ length: 5 }).map((_, index) => (
+          <div
+            key={index}
+            className="aspect-[2/3] rounded-2xl bg-white/[0.045] border border-white/5 animate-pulse"
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function AdminField({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="rounded-xl bg-neutral-950/70 border border-white/10 px-3 py-2 min-w-0">
@@ -9723,11 +10745,11 @@ function Panel({
   return (
     <div
       className={[
-        "stack-surface p-4 sm:p-6 rounded-3xl border border-white/10 shadow-xl shadow-black/10 backdrop-blur-xl mx-auto w-full",
+        "stack-surface p-4 sm:p-5 rounded-3xl border border-white/10 backdrop-blur-xl mx-auto w-full",
         className || "",
       ].join(" ")}
     >
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4 text-center sm:text-left">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4 text-left">
         <div className="text-sm font-medium text-neutral-200">{title}</div>
         {right ? <div className="shrink-0">{right}</div> : null}
       </div>
