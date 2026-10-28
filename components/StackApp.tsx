@@ -6,6 +6,13 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import {
+  parseLetterboxdFiles,
+  parseMyAnimeListXml,
+  parseSmartPaste,
+  readMyAnimeListFile,
+  type StackImportCandidate,
+} from "@/lib/stackImporters";
+import {
   DndContext,
   DragEndEvent,
   MouseSensor,
@@ -86,6 +93,11 @@ type MediaItem = {
   progressTotalOverride?: number;
 
   hoursPlayed?: number;
+
+  importSource?: "paste" | "myanimelist" | "letterboxd";
+  importExternalId?: string;
+  importedAt?: string;
+  importYearMonth?: string;
 };
 
 type TmdbSearchResult = {
@@ -1520,6 +1532,372 @@ function diversifyPicks<T extends { score: number; tags: string[] }>(
   return out.length ? out : picks.slice(0, 8);
 }
 
+
+/* ================= IMPORT HELPERS ================= */
+
+function cleanImportSearchTitle(title: string) {
+  return title
+    .replace(/\s+[–—-]?\s*season\s+\d+\s*$/i, "")
+    .replace(/\s+[–—-]?\s*s\d+\s*$/i, "")
+    .replace(/\s+season\s+\d+\b/i, "")
+    .trim();
+}
+
+function importCandidateDuplicate(candidate: StackImportCandidate, existingItems: MediaItem[]) {
+  const exactTitle = normTitle(candidate.title);
+
+  return existingItems.some((item) => {
+    if (
+      candidate.source !== "paste" &&
+      candidate.externalId &&
+      item.importSource === candidate.source &&
+      item.importExternalId === candidate.externalId
+    ) {
+      return true;
+    }
+
+    if (candidate.source !== "paste") {
+      if (candidate.tmdbId && item.tmdbId === candidate.tmdbId) return true;
+      if (candidate.anilistId && item.anilistId === candidate.anilistId) return true;
+      if (candidate.igdbId && item.igdbId === candidate.igdbId) return true;
+    }
+
+    return item.type === candidate.type && normTitle(item.title) === exactTitle;
+  });
+}
+
+async function matchImportWithTmdb(
+  candidate: StackImportCandidate,
+  tmdbType: "movie" | "tv"
+): Promise<StackImportCandidate> {
+  const query = cleanImportSearchTitle(candidate.title) || candidate.title;
+  const search = await tmdbSearch(query, tmdbType);
+  const results = (search.results ?? []).filter((row) => row && row.id);
+  if (!results.length) {
+    return {
+      ...candidate,
+      warnings: uniqTags([...(candidate.warnings ?? []), `No TMDB ${tmdbType} match found.`]),
+      matchConfidence: 0,
+      matchLabel: "No TMDB match",
+    };
+  }
+
+  const scored = results.map((row) => {
+    const title = String(row.title || row.name || "").trim();
+    const date = tmdbType === "movie" ? row.release_date : row.first_air_date;
+    const resultYear = date ? Number(String(date).slice(0, 4)) : undefined;
+    let score = similarityScore(query, title);
+    if (candidate.year && resultYear === candidate.year) score = Math.min(1, score + 0.08);
+    return { row, title, score, resultYear };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0];
+
+  if (!best || best.score < 0.48) {
+    return {
+      ...candidate,
+      warnings: uniqTags([...(candidate.warnings ?? []), `Low-confidence TMDB match for “${candidate.title}”. Review before importing.`]),
+      matchConfidence: best?.score ?? 0,
+      matchLabel: best ? `Possible: ${best.title}` : "No TMDB match",
+    };
+  }
+
+  const details = await tmdbDetails(best.row.id, tmdbType);
+  const posterPath = (best.row as any).poster_path;
+  const posterUrl = posterPath
+    ? `https://image.tmdb.org/t/p/w500${posterPath}`
+    : candidate.posterUrl;
+  const tags = uniqTags([...(candidate.tags ?? []), ...((details.genres ?? []).map((genre) => genre.name))]);
+  const progressTotal =
+    tmdbType === "movie"
+      ? 1
+      : typeof details.number_of_episodes === "number" && details.number_of_episodes > 0
+      ? details.number_of_episodes
+      : candidate.progressTotal;
+  const progressCur =
+    candidate.status === "completed" && progressTotal
+      ? progressTotal
+      : candidate.progressCur;
+
+  return {
+    ...candidate,
+    type: tmdbType,
+    typeHint: "exact",
+    tmdbId: best.row.id,
+    tmdbType,
+    posterUrl,
+    tags,
+    runtime:
+      tmdbType === "movie" && typeof details.runtime === "number"
+        ? details.runtime
+        : candidate.runtime,
+    progressTotal,
+    progressCur,
+    matchConfidence: best.score,
+    matchLabel: `TMDB: ${best.title}${best.resultYear ? ` (${best.resultYear})` : ""}`,
+  };
+}
+
+async function anilistImportMatchByMalId(
+  malId: number,
+  anilistType: "ANIME" | "MANGA"
+): Promise<{
+  id: number;
+  title: string;
+  coverUrl?: string;
+  genres?: string[];
+  episodes?: number | null;
+  duration?: number | null;
+  chapters?: number | null;
+} | null> {
+  const query = `
+    query ($idMal: Int, $type: MediaType) {
+      Media(idMal: $idMal, type: $type) {
+        id
+        title { romaji english native }
+        coverImage { extraLarge large medium }
+        genres
+        episodes
+        duration
+        chapters
+      }
+    }
+  `;
+  const res = await fetch("https://graphql.anilist.co", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ query, variables: { idMal: malId, type: anilistType } }),
+  });
+  if (!res.ok) return null;
+  const json = (await res.json()) as any;
+  const media = json?.data?.Media;
+  if (!media?.id) return null;
+  return {
+    id: Number(media.id),
+    title: String(media.title?.english || media.title?.romaji || media.title?.native || "").trim(),
+    coverUrl:
+      media.coverImage?.extraLarge || media.coverImage?.large || media.coverImage?.medium || undefined,
+    genres: Array.isArray(media.genres) ? media.genres.map((tag: unknown) => String(tag)) : undefined,
+    episodes: typeof media.episodes === "number" ? media.episodes : null,
+    duration: typeof media.duration === "number" ? media.duration : null,
+    chapters: typeof media.chapters === "number" ? media.chapters : null,
+  };
+}
+
+async function matchImportWithAniList(
+  candidate: StackImportCandidate,
+  anilistType: "ANIME" | "MANGA"
+): Promise<StackImportCandidate> {
+  const query = cleanImportSearchTitle(candidate.title) || candidate.title;
+
+  if (candidate.source === "myanimelist" && candidate.externalId) {
+    const malId = Number(candidate.externalId.split(":").at(-1));
+    if (Number.isFinite(malId) && malId > 0) {
+      const exact = await anilistImportMatchByMalId(malId, anilistType);
+      if (exact) {
+        const progressTotal =
+          anilistType === "ANIME"
+            ? exact.episodes ?? candidate.progressTotal
+            : exact.chapters ?? candidate.progressTotal;
+        return {
+          ...candidate,
+          type: anilistType === "ANIME" ? "anime" : "manga",
+          typeHint: "exact",
+          anilistId: exact.id,
+          anilistType,
+          posterUrl: exact.coverUrl || candidate.posterUrl,
+          tags: uniqTags([...(candidate.tags ?? []), ...(exact.genres ?? [])]),
+          runtime:
+            anilistType === "ANIME" && exact.duration && exact.episodes
+              ? exact.duration * exact.episodes
+              : candidate.runtime,
+          progressTotal: progressTotal ?? undefined,
+          progressCur:
+            candidate.status === "completed" && progressTotal
+              ? progressTotal
+              : candidate.progressCur,
+          matchConfidence: 1,
+          matchLabel: `AniList exact MAL ID: ${exact.title || candidate.title}`,
+        };
+      }
+    }
+  }
+  const res = await fetch(
+    `/api/anilist/search?q=${encodeURIComponent(query)}&limit=8&type=${anilistType}`,
+    { method: "GET" }
+  );
+  const json = (await res.json()) as AnilistSearchResponse;
+  if (!res.ok) throw new Error(json.error || "AniList search failed.");
+
+  const results = json.results ?? [];
+  if (!results.length) {
+    return {
+      ...candidate,
+      warnings: uniqTags([...(candidate.warnings ?? []), `No AniList ${anilistType.toLowerCase()} match found.`]),
+      matchConfidence: 0,
+      matchLabel: "No AniList match",
+    };
+  }
+
+  const scored = results
+    .map((row) => ({ row, score: similarityScore(query, row.title) }))
+    .sort((a, b) => b.score - a.score);
+  const best = scored[0];
+  if (!best || best.score < 0.48) {
+    return {
+      ...candidate,
+      warnings: uniqTags([...(candidate.warnings ?? []), `Low-confidence AniList match for “${candidate.title}”. Review before importing.`]),
+      matchConfidence: best?.score ?? 0,
+      matchLabel: best ? `Possible: ${best.row.title}` : "No AniList match",
+    };
+  }
+
+  const details = await anilistDetails(best.row.id, anilistType);
+  const progressTotal =
+    anilistType === "ANIME"
+      ? details.episodes ?? candidate.progressTotal
+      : details.chapters ?? candidate.progressTotal;
+  const progressCur =
+    candidate.status === "completed" && progressTotal
+      ? progressTotal
+      : candidate.progressCur;
+
+  return {
+    ...candidate,
+    type: anilistType === "ANIME" ? "anime" : "manga",
+    typeHint: "exact",
+    anilistId: best.row.id,
+    anilistType,
+    posterUrl: best.row.coverUrl || details.coverUrl || candidate.posterUrl,
+    tags: uniqTags([...(candidate.tags ?? []), ...(best.row.genres ?? []), ...(details.genres ?? [])]),
+    runtime:
+      anilistType === "ANIME" && details.duration && details.episodes
+        ? details.duration * details.episodes
+        : candidate.runtime,
+    progressTotal: progressTotal ?? undefined,
+    progressCur,
+    matchConfidence: best.score,
+    matchLabel: `AniList: ${best.row.title}`,
+  };
+}
+
+async function matchImportWithIgdb(candidate: StackImportCandidate): Promise<StackImportCandidate> {
+  const query = cleanImportSearchTitle(candidate.title) || candidate.title;
+  const res = await fetch(`/api/igdb/search?q=${encodeURIComponent(query)}&limit=8`, {
+    method: "GET",
+  });
+  const json = (await res.json()) as IgdbSearchResponse;
+  if (!res.ok) throw new Error(json.error || "IGDB search failed.");
+  const results = json.results ?? [];
+  if (!results.length) {
+    return {
+      ...candidate,
+      warnings: uniqTags([...(candidate.warnings ?? []), "No IGDB match found."]),
+      matchConfidence: 0,
+      matchLabel: "No IGDB match",
+    };
+  }
+  const scored = results
+    .map((row) => ({ row, score: similarityScore(query, row.name) }))
+    .sort((a, b) => b.score - a.score);
+  const best = scored[0];
+  if (!best || best.score < 0.48) {
+    return {
+      ...candidate,
+      warnings: uniqTags([...(candidate.warnings ?? []), `Low-confidence IGDB match for “${candidate.title}”. Review before importing.`]),
+      matchConfidence: best?.score ?? 0,
+      matchLabel: best ? `Possible: ${best.row.name}` : "No IGDB match",
+    };
+  }
+  return {
+    ...candidate,
+    type: "game",
+    typeHint: "exact",
+    igdbId: best.row.id,
+    posterUrl: best.row.coverUrl || candidate.posterUrl,
+    tags: uniqTags([...(candidate.tags ?? []), ...(best.row.genres ?? [])]),
+    matchConfidence: best.score,
+    matchLabel: `IGDB: ${best.row.name}`,
+  };
+}
+
+async function matchImportCandidateMetadata(candidate: StackImportCandidate) {
+  try {
+    if (candidate.typeHint === "tv_or_anime") {
+      const [tvResult, animeResult] = await Promise.allSettled([
+        matchImportWithTmdb(candidate, "tv"),
+        matchImportWithAniList(candidate, "ANIME"),
+      ]);
+      const tv = tvResult.status === "fulfilled" ? tvResult.value : null;
+      const anime = animeResult.status === "fulfilled" ? animeResult.value : null;
+      const tvScore = tv?.matchConfidence ?? 0;
+      const animeScore = anime?.matchConfidence ?? 0;
+      if (animeScore > tvScore + 0.03) return anime!;
+      if (tv) return tv;
+      if (anime) return anime;
+      return { ...candidate, warnings: uniqTags([...(candidate.warnings ?? []), "Could not match this TV/anime title."]) };
+    }
+
+    if (candidate.typeHint === "manga_or_book") {
+      const manga = await matchImportWithAniList(candidate, "MANGA");
+      if ((manga.matchConfidence ?? 0) >= 0.86 && manga.anilistId) return manga;
+      return {
+        ...candidate,
+        type: "book" as MediaType,
+        typeHint: "exact" as const,
+        matchConfidence: manga.matchConfidence,
+        matchLabel: "Kept as Book",
+        warnings: uniqTags([...(candidate.warnings ?? []), "No confident manga match; kept as Book."]),
+      };
+    }
+
+    if (candidate.type === "movie") return matchImportWithTmdb(candidate, "movie");
+    if (candidate.type === "tv") return matchImportWithTmdb(candidate, "tv");
+    if (candidate.type === "anime") return matchImportWithAniList(candidate, "ANIME");
+    if (candidate.type === "manga") return matchImportWithAniList(candidate, "MANGA");
+    if (candidate.type === "game") return matchImportWithIgdb(candidate);
+
+    return {
+      ...candidate,
+      matchConfidence: 1,
+      matchLabel: "No metadata provider needed",
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Metadata match failed.";
+    return {
+      ...candidate,
+      warnings: uniqTags([...(candidate.warnings ?? []), message]),
+      matchLabel: "Match error",
+    };
+  }
+}
+
+async function mapImportWithConcurrency<T, R>(
+  input: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+  onProgress?: (done: number, total: number) => void
+) {
+  const results = new Array<R>(input.length);
+  let nextIndex = 0;
+  let done = 0;
+
+  async function runWorker() {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= input.length) return;
+      results[index] = await worker(input[index], index);
+      done += 1;
+      onProgress?.(done, input.length);
+    }
+  }
+
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, input.length)) }, () => runWorker());
+  await Promise.all(workers);
+  return results;
+}
+
 /* ================= APP ================= */
 
 export default function StackApp({ view = "all" }: { view?: StackView }) {
@@ -1561,11 +1939,17 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     "all" | "suggestion" | "problem" | "new" | "reviewed" | "done"
   >("all");
   const [adminHideDone, setAdminHideDone] = useState(true);
-  const [settingsTab, setSettingsTab] = useState<"profile" | "appearance" | "privacy" | "behavior" | "admin">("profile");
+  const [settingsTab, setSettingsTab] = useState<"profile" | "appearance" | "privacy" | "behavior" | "import" | "admin">("profile");
   const [adminOverview, setAdminOverview] = useState<AdminOverviewResponse | null>(null);
   const [adminOverviewStatus, setAdminOverviewStatus] = useState("");
   const [adminMemberQuery, setAdminMemberQuery] = useState("");
   const [selectedAdminMemberId, setSelectedAdminMemberId] = useState<string | null>(null);
+
+  const [importPasteText, setImportPasteText] = useState("");
+  const [importDefaultYear, setImportDefaultYear] = useState(new Date().getFullYear());
+  const [importCandidates, setImportCandidates] = useState<StackImportCandidate[]>([]);
+  const [importStatus, setImportStatus] = useState("");
+  const [importMatching, setImportMatching] = useState(false);
 
   useLayoutEffect(() => {
     const activeUid = loadLocalActiveUserId();
@@ -1622,6 +2006,212 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
   const [cloudLoaded, setCloudLoaded] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
+
+  const importDuplicateIds = useMemo(() => {
+    return new Set(
+      importCandidates
+        .filter((candidate) => importCandidateDuplicate(candidate, items))
+        .map((candidate) => candidate.id)
+    );
+  }, [importCandidates, items]);
+
+  const appendImportCandidates = useCallback((next: StackImportCandidate[]) => {
+    setImportCandidates((prev) => {
+      const seen = new Set(
+        prev.map((candidate) =>
+          `${candidate.source}:${candidate.externalId || `${candidate.type}:${normTitle(candidate.title)}`}`
+        )
+      );
+      const additions = next.filter((candidate) => {
+        const key = `${candidate.source}:${candidate.externalId || `${candidate.type}:${normTitle(candidate.title)}`}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      return [...prev, ...additions];
+    });
+  }, []);
+
+  const parseSmartImportText = useCallback(() => {
+    const text = importPasteText.trim();
+    if (!text) {
+      setImportStatus("Paste a list first.");
+      return;
+    }
+    try {
+      const parsed = parseSmartPaste(text, importDefaultYear);
+      appendImportCandidates(parsed);
+      setImportStatus(
+        parsed.length
+          ? `Parsed ${parsed.length} entries from your pasted list. Review them below before importing.`
+          : "No month/category entries were found. Use headings such as January, Movies, TV Shows/Anime, Manga/Books, and Games played."
+      );
+    } catch (error) {
+      setImportStatus(error instanceof Error ? error.message : "Could not parse the pasted list.");
+    }
+  }, [appendImportCandidates, importDefaultYear, importPasteText]);
+
+  const handleMalImportFiles = useCallback(
+    async (files: File[]) => {
+      if (!files.length) return;
+      setImportStatus("Reading MyAnimeList export…");
+      try {
+        const parsed: StackImportCandidate[] = [];
+        for (const file of files) {
+          const xml = await readMyAnimeListFile(file);
+          parsed.push(...parseMyAnimeListXml(xml));
+        }
+        appendImportCandidates(parsed);
+        setImportStatus(
+          `Loaded ${parsed.length} MyAnimeList entries. Nothing has been added to Stack yet.`
+        );
+      } catch (error) {
+        setImportStatus(error instanceof Error ? error.message : "Could not read the MyAnimeList export.");
+      }
+    },
+    [appendImportCandidates]
+  );
+
+  const handleLetterboxdImportFiles = useCallback(
+    async (files: File[]) => {
+      if (!files.length) return;
+      setImportStatus("Reading Letterboxd export…");
+      try {
+        const parsed = await parseLetterboxdFiles(files);
+        appendImportCandidates(parsed);
+        setImportStatus(
+          `Loaded ${parsed.length} Letterboxd films. Nothing has been added to Stack yet.`
+        );
+      } catch (error) {
+        setImportStatus(error instanceof Error ? error.message : "Could not read the Letterboxd export.");
+      }
+    },
+    [appendImportCandidates]
+  );
+
+  const updateImportCandidate = useCallback(
+    (id: string, patch: Partial<StackImportCandidate>) => {
+      setImportCandidates((prev) =>
+        prev.map((candidate) => (candidate.id === id ? { ...candidate, ...patch } : candidate))
+      );
+    },
+    []
+  );
+
+  const matchImportMetadata = useCallback(async () => {
+    const selected = importCandidates.filter(
+      (candidate) => candidate.selected && !importDuplicateIds.has(candidate.id)
+    );
+    if (!selected.length) {
+      setImportStatus("Select at least one new entry to match.");
+      return;
+    }
+
+    setImportMatching(true);
+    setImportStatus(`Matching 0 / ${selected.length}…`);
+    try {
+      const matched = await mapImportWithConcurrency(
+        selected,
+        3,
+        async (candidate) => matchImportCandidateMetadata(candidate),
+        (done, total) => setImportStatus(`Matching ${done} / ${total}…`)
+      );
+      const byId = new Map(matched.map((candidate) => [candidate.id, candidate]));
+      setImportCandidates((prev) => prev.map((candidate) => byId.get(candidate.id) ?? candidate));
+      setImportStatus(
+        `Metadata matching finished for ${matched.length} entries. Review low-confidence rows before importing.`
+      );
+    } catch (error) {
+      setImportStatus(error instanceof Error ? error.message : "Metadata matching failed.");
+    } finally {
+      setImportMatching(false);
+    }
+  }, [importCandidates, importDuplicateIds]);
+
+  const commitImportCandidates = useCallback(() => {
+    const confirmedId = confirmedUserIdRef.current;
+    if (!userId || !cloudLoaded || loadedUserId !== userId || confirmedId !== userId) {
+      setImportStatus("Import blocked until this exact Stack account finishes secure cloud verification.");
+      return;
+    }
+
+    const selected = importCandidates.filter((candidate) => candidate.selected);
+    const newCandidates = selected.filter((candidate) => !importCandidateDuplicate(candidate, items));
+    const skipped = selected.length - newCandidates.length;
+
+    if (!newCandidates.length) {
+      setImportStatus(
+        skipped
+          ? `Nothing added. ${skipped} selected entr${skipped === 1 ? "y was" : "ies were"} already in Stack.`
+          : "Select at least one entry to import."
+      );
+      return;
+    }
+
+    const importedAt = new Date().toISOString();
+    const newItems: MediaItem[] = newCandidates.map((candidate, index) => {
+      const progressTotal = candidate.progressTotal;
+      const progressCur =
+        candidate.status === "completed" && progressTotal
+          ? progressTotal
+          : candidate.progressCur;
+      const createdAt = candidate.dateFinished
+        ? `${candidate.dateFinished}T12:00:00.000Z`
+        : new Date(Date.now() + index).toISOString();
+
+      return {
+        id:
+          typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+            ? crypto.randomUUID()
+            : `${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`,
+        title: candidate.title.trim(),
+        type: candidate.type as MediaType,
+        rating: candidate.rating,
+        posterUrl: candidate.posterUrl,
+        tmdbId: candidate.tmdbId,
+        tmdbType: candidate.tmdbType,
+        igdbId: candidate.igdbId,
+        anilistId: candidate.anilistId,
+        anilistType: candidate.anilistType,
+        inTheaters: candidate.inTheaters,
+        dateFinished: candidate.dateFinished,
+        notes: candidate.notes,
+        rewatchCount: candidate.rewatchCount,
+        runtime: candidate.runtime,
+        status: candidate.status as Status,
+        tags: uniqTags(candidate.tags ?? []),
+        createdAt,
+        updatedAt: importedAt,
+        favorite: false,
+        isPrivate: false,
+        progressCur,
+        progressTotal,
+        importSource: candidate.source,
+        importExternalId: candidate.externalId,
+        importedAt,
+        importYearMonth: candidate.importYearMonth,
+      };
+    });
+
+    setItems((prev) => [...newItems, ...prev]);
+    const importedIds = new Set(newCandidates.map((candidate) => candidate.id));
+    setImportCandidates((prev) =>
+      prev.map((candidate) =>
+        importedIds.has(candidate.id)
+          ? {
+              ...candidate,
+              selected: false,
+              warnings: uniqTags([...(candidate.warnings ?? []), "Imported into Stack."]),
+            }
+          : candidate
+      )
+    );
+    setImportStatus(
+      `Added ${newItems.length} new entr${newItems.length === 1 ? "y" : "ies"} to Stack${
+        skipped ? `; skipped ${skipped} existing entr${skipped === 1 ? "y" : "ies"}` : ""
+      }. Your normal secure save will persist this one merged library update.`
+    );
+  }, [cloudLoaded, importCandidates, items, loadedUserId, userId]);
 
   // ================= FRIENDS =================
   const [inputUsername, setInputUsername] = useState("");
@@ -7600,13 +8190,14 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
               <div
                 className="stack-settings-tabs rounded-2xl stack-surface border border-white/10 p-2 overflow-x-auto"
-                style={{ gridTemplateColumns: `repeat(${isAdminUser ? 5 : 4}, minmax(120px, 1fr))` }}
+                style={{ gridTemplateColumns: `repeat(${isAdminUser ? 6 : 5}, minmax(120px, 1fr))` }}
               >
                 {[
                   { id: "profile" as const, label: "Profile" },
                   { id: "appearance" as const, label: "Appearance" },
                   { id: "privacy" as const, label: "Privacy" },
                   { id: "behavior" as const, label: "Behavior" },
+                  { id: "import" as const, label: "Import" },
                   ...(isAdminUser ? [{ id: "admin" as const, label: "Owner" }] : []),
                 ].map((tab) => (
                   <button
@@ -7989,6 +8580,30 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                     </div>
                   </div>
                 </Panel>
+              ) : null}
+
+              {settingsTab === "import" ? (
+                <LibraryImportPanel
+                  pasteText={importPasteText}
+                  defaultYear={importDefaultYear}
+                  candidates={importCandidates}
+                  duplicateIds={importDuplicateIds}
+                  status={importStatus}
+                  matching={importMatching}
+                  secureReady={!!userId && cloudLoaded && loadedUserId === userId && confirmedUserIdRef.current === userId}
+                  onPasteTextChange={setImportPasteText}
+                  onDefaultYearChange={setImportDefaultYear}
+                  onParsePaste={parseSmartImportText}
+                  onMalFiles={handleMalImportFiles}
+                  onLetterboxdFiles={handleLetterboxdImportFiles}
+                  onUpdateCandidate={updateImportCandidate}
+                  onMatchMetadata={matchImportMetadata}
+                  onImportSelected={commitImportCandidates}
+                  onClear={() => {
+                    setImportCandidates([]);
+                    setImportStatus("");
+                  }}
+                />
               ) : null}
 
               {settingsTab === "admin" && isAdminUser ? (
@@ -10469,6 +11084,380 @@ function FriendReadOnlyRow({
         </div>
       </div>
     </>
+  );
+}
+
+
+function LibraryImportPanel({
+  pasteText,
+  defaultYear,
+  candidates,
+  duplicateIds,
+  status,
+  matching,
+  secureReady,
+  onPasteTextChange,
+  onDefaultYearChange,
+  onParsePaste,
+  onMalFiles,
+  onLetterboxdFiles,
+  onUpdateCandidate,
+  onMatchMetadata,
+  onImportSelected,
+  onClear,
+}: {
+  pasteText: string;
+  defaultYear: number;
+  candidates: StackImportCandidate[];
+  duplicateIds: Set<string>;
+  status: string;
+  matching: boolean;
+  secureReady: boolean;
+  onPasteTextChange: (value: string) => void;
+  onDefaultYearChange: (value: number) => void;
+  onParsePaste: () => void;
+  onMalFiles: (files: File[]) => void | Promise<void>;
+  onLetterboxdFiles: (files: File[]) => void | Promise<void>;
+  onUpdateCandidate: (id: string, patch: Partial<StackImportCandidate>) => void;
+  onMatchMetadata: () => void | Promise<void>;
+  onImportSelected: () => void;
+  onClear: () => void;
+}) {
+  const selectedNew = candidates.filter(
+    (candidate) => candidate.selected && !duplicateIds.has(candidate.id)
+  ).length;
+  const duplicateCount = candidates.filter((candidate) => duplicateIds.has(candidate.id)).length;
+  const matchedCount = candidates.filter(
+    (candidate) => typeof candidate.matchConfidence === "number" && candidate.matchConfidence > 0
+  ).length;
+  const visibleCandidates = candidates.slice(0, 400);
+
+  const setAllNew = (selected: boolean) => {
+    candidates.forEach((candidate) => {
+      if (!duplicateIds.has(candidate.id)) onUpdateCandidate(candidate.id, { selected });
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <Panel
+        title="Import library"
+        right={
+          <span className="text-xs text-neutral-500">
+            Preview first • additive-only
+          </span>
+        }
+      >
+        <div className="rounded-2xl border border-emerald-400/15 bg-emerald-400/[0.05] px-4 py-3 text-xs text-neutral-300">
+          Imports never replace your full Stack library. Existing matches are skipped by default, and nothing is added until you review the preview and press Import selected.
+        </div>
+
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 mt-4">
+          <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 space-y-3">
+            <div>
+              <div className="text-sm font-medium text-neutral-100">Smart Paste</div>
+              <div className="text-[11px] text-neutral-500 mt-1">
+                Paste month/category lists like your January–December tracker. Rules and unrelated headings are ignored.
+              </div>
+            </div>
+
+            <label className="block">
+              <div className="text-xs text-neutral-400 mb-1">Default year</div>
+              <input
+                type="number"
+                min="1900"
+                max="2200"
+                value={defaultYear}
+                onChange={(e) => onDefaultYearChange(Number(e.target.value) || new Date().getFullYear())}
+                className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-sm outline-none focus:border-neutral-500"
+              />
+            </label>
+
+            <textarea
+              value={pasteText}
+              onChange={(e) => onPasteTextChange(e.target.value)}
+              placeholder={'January\nMovies\nWhiplash (9/10)\n\nTV Shows/Anime\nSolo Leveling Season 1 (7/10)'}
+              rows={8}
+              className="w-full rounded-xl bg-neutral-950 border border-neutral-800 px-3 py-2 text-sm outline-none focus:border-neutral-500 resize-y"
+            />
+
+            <button
+              type="button"
+              onClick={onParsePaste}
+              className="w-full px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
+            >
+              Parse pasted list
+            </button>
+          </div>
+
+          <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 space-y-3">
+            <div>
+              <div className="text-sm font-medium text-neutral-100">MyAnimeList</div>
+              <div className="text-[11px] text-neutral-500 mt-1">
+                Accepts MAL anime and manga exports as .xml or .xml.gz/.gz. Scores, status, progress, dates, tags, and rewatches are preserved when present.
+              </div>
+            </div>
+
+            <label className="block rounded-xl border border-dashed border-white/15 bg-white/[0.025] p-4 hover:bg-white/[0.045] cursor-pointer">
+              <div className="text-sm text-neutral-200">Choose MAL export file(s)</div>
+              <div className="text-[11px] text-neutral-500 mt-1">You can select both anime and manga exports.</div>
+              <input
+                type="file"
+                accept=".xml,.gz,.xml.gz,application/xml,application/gzip"
+                multiple
+                className="mt-3 block w-full text-xs text-neutral-500 file:mr-3 file:rounded-lg file:border-0 file:bg-white/10 file:px-3 file:py-2 file:text-neutral-200"
+                onChange={(e) => {
+                  const files = Array.from(e.currentTarget.files ?? []) as File[];
+                  void onMalFiles(files);
+                  e.currentTarget.value = "";
+                }}
+              />
+            </label>
+
+            <div className="text-[11px] text-neutral-600">
+              Stack reads the file in your browser. It does not need your MyAnimeList password.
+            </div>
+          </div>
+
+          <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 space-y-3">
+            <div>
+              <div className="text-sm font-medium text-neutral-100">Letterboxd</div>
+              <div className="text-[11px] text-neutral-500 mt-1">
+                Accepts the Letterboxd account-export ZIP directly, or loose CSV files such as diary.csv, ratings.csv, watched.csv, and watchlist.csv.
+              </div>
+            </div>
+
+            <label className="block rounded-xl border border-dashed border-white/15 bg-white/[0.025] p-4 hover:bg-white/[0.045] cursor-pointer">
+              <div className="text-sm text-neutral-200">Choose Letterboxd export</div>
+              <div className="text-[11px] text-neutral-500 mt-1">ZIP and multiple CSV selection are supported.</div>
+              <input
+                type="file"
+                accept=".zip,.csv,application/zip,text/csv"
+                multiple
+                className="mt-3 block w-full text-xs text-neutral-500 file:mr-3 file:rounded-lg file:border-0 file:bg-white/10 file:px-3 file:py-2 file:text-neutral-200"
+                onChange={(e) => {
+                  const files = Array.from(e.currentTarget.files ?? []) as File[];
+                  void onLetterboxdFiles(files);
+                  e.currentTarget.value = "";
+                }}
+              />
+            </label>
+
+            <div className="text-[11px] text-neutral-600">
+              Ratings are converted to Stack&apos;s 0–10 scale. Diary dates, rewatches, tags, and reviews are merged when available.
+            </div>
+          </div>
+        </div>
+      </Panel>
+
+      <Panel
+        title="Import preview"
+        right={
+          <span className="text-xs text-neutral-500">
+            {candidates.length} parsed • {selectedNew} selected • {duplicateCount} already in Stack
+          </span>
+        }
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={!candidates.length || matching}
+            onClick={() => void onMatchMetadata()}
+            className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 disabled:opacity-40 text-xs"
+          >
+            {matching ? "Matching…" : "Find posters & metadata"}
+          </button>
+          <button
+            type="button"
+            disabled={!candidates.length}
+            onClick={() => setAllNew(true)}
+            className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 disabled:opacity-40 text-xs"
+          >
+            Select all new
+          </button>
+          <button
+            type="button"
+            disabled={!candidates.length}
+            onClick={() => setAllNew(false)}
+            className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 disabled:opacity-40 text-xs"
+          >
+            Deselect all
+          </button>
+          <button
+            type="button"
+            disabled={!candidates.length}
+            onClick={onClear}
+            className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 disabled:opacity-40 text-xs"
+          >
+            Clear preview
+          </button>
+
+          <div className="ml-auto text-[11px] text-neutral-500">
+            {matchedCount ? `${matchedCount} metadata matches` : "Metadata matching is optional"}
+          </div>
+        </div>
+
+        {status ? (
+          <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.035] px-3 py-2 text-xs text-neutral-300">
+            {status}
+          </div>
+        ) : null}
+
+        {candidates.length ? (
+          <div className="mt-4 max-h-[620px] overflow-auto rounded-2xl border border-white/10 divide-y divide-white/10">
+            {visibleCandidates.map((candidate) => {
+              const duplicate = duplicateIds.has(candidate.id);
+              const confidence = typeof candidate.matchConfidence === "number"
+                ? Math.round(candidate.matchConfidence * 100)
+                : null;
+
+              return (
+                <div key={candidate.id} className="p-3 sm:p-4 bg-neutral-950/55">
+                  <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-3 items-start">
+                    <input
+                      type="checkbox"
+                      checked={!duplicate && candidate.selected}
+                      disabled={duplicate}
+                      onChange={(e) => onUpdateCandidate(candidate.id, { selected: e.target.checked })}
+                      className="mt-2 h-4 w-4 accent-emerald-500"
+                      aria-label={`Select ${candidate.title}`}
+                    />
+
+                    <div className="min-w-0 space-y-3">
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <input
+                            value={candidate.title}
+                            onChange={(e) => onUpdateCandidate(candidate.id, { title: e.target.value })}
+                            className="w-full bg-transparent text-sm font-medium text-neutral-100 outline-none border-b border-transparent focus:border-white/15 pb-1"
+                          />
+                          <div className="flex flex-wrap gap-1.5 mt-1.5 text-[10px]">
+                            <span className="px-2 py-1 rounded-md bg-white/5 border border-white/10 text-neutral-400">
+                              {candidate.sourceLabel}
+                            </span>
+                            {candidate.matchLabel ? (
+                              <span className="px-2 py-1 rounded-md bg-white/5 border border-white/10 text-neutral-400">
+                                {candidate.matchLabel}{confidence !== null ? ` • ${confidence}%` : ""}
+                              </span>
+                            ) : null}
+                            {duplicate ? (
+                              <span className="px-2 py-1 rounded-md bg-amber-400/10 border border-amber-400/20 text-amber-200">
+                                Already in Stack — skipped
+                              </span>
+                            ) : null}
+                          </div>
+                        </div>
+
+                        {candidate.posterUrl ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={candidate.posterUrl}
+                            alt=""
+                            className="w-10 h-14 rounded-lg object-cover border border-white/10 shrink-0"
+                          />
+                        ) : null}
+                      </div>
+
+                      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+                        <Select
+                          label="Type"
+                          value={candidate.type}
+                          onChange={(value) =>
+                            onUpdateCandidate(candidate.id, {
+                              type: value as MediaType,
+                              typeHint: "exact",
+                              matchConfidence: undefined,
+                              matchLabel: undefined,
+                            })
+                          }
+                          options={[
+                            { value: "movie", label: "Movie" },
+                            { value: "tv", label: "TV" },
+                            { value: "anime", label: "Anime" },
+                            { value: "manga", label: "Manga" },
+                            { value: "book", label: "Book" },
+                            { value: "game", label: "Game" },
+                          ]}
+                        />
+                        <Select
+                          label="Status"
+                          value={candidate.status}
+                          onChange={(value) => onUpdateCandidate(candidate.id, { status: value as Status })}
+                          options={STATUSES.map((entry) => ({ value: entry.id, label: entry.label }))}
+                        />
+                        <label className="block">
+                          <div className="text-xs text-neutral-400 mb-1">Rating</div>
+                          <input
+                            inputMode="decimal"
+                            value={typeof candidate.rating === "number" ? String(candidate.rating) : ""}
+                            onChange={(e) => {
+                              const raw = e.target.value.trim();
+                              if (!raw) {
+                                onUpdateCandidate(candidate.id, { rating: undefined });
+                                return;
+                              }
+                              const n = Number(raw);
+                              if (Number.isFinite(n)) onUpdateCandidate(candidate.id, { rating: Math.max(0, Math.min(10, n)) });
+                            }}
+                            className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-sm outline-none focus:border-neutral-500"
+                            placeholder="0–10"
+                          />
+                        </label>
+                        <label className="block">
+                          <div className="text-xs text-neutral-400 mb-1">Finished date</div>
+                          <input
+                            type="date"
+                            value={candidate.dateFinished ?? ""}
+                            onChange={(e) => onUpdateCandidate(candidate.id, { dateFinished: e.target.value || undefined })}
+                            className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-sm outline-none focus:border-neutral-500"
+                          />
+                        </label>
+                      </div>
+
+                      {candidate.notes ? (
+                        <div className="text-[11px] text-neutral-500 whitespace-pre-wrap line-clamp-3">{candidate.notes}</div>
+                      ) : null}
+
+                      {candidate.warnings?.length ? (
+                        <div className="text-[11px] text-amber-200/75">
+                          {candidate.warnings.join(" • ")}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="mt-4 rounded-2xl border border-dashed border-white/10 px-4 py-8 text-center text-sm text-neutral-500">
+            Nothing is queued yet. Paste a list or choose an export file above.
+          </div>
+        )}
+
+        {candidates.length > visibleCandidates.length ? (
+          <div className="text-[11px] text-neutral-500 mt-2">
+            Showing the first {visibleCandidates.length} preview rows for performance. All {candidates.length} parsed rows remain in the import queue.
+          </div>
+        ) : null}
+
+        <div className="mt-4 flex flex-col sm:flex-row sm:items-center gap-3">
+          <button
+            type="button"
+            disabled={!secureReady || selectedNew === 0 || matching}
+            onClick={onImportSelected}
+            className="px-4 py-2.5 rounded-xl stack-good border disabled:opacity-40 text-sm font-medium"
+          >
+            Import {selectedNew || "selected"} new {selectedNew === 1 ? "entry" : "entries"}
+          </button>
+          <div className="text-[11px] text-neutral-500">
+            {secureReady
+              ? "Secure account verification is complete. Import will merge into this user's existing library."
+              : "Import is locked until this exact Stack account finishes secure cloud verification."}
+          </div>
+        </div>
+      </Panel>
+    </div>
   );
 }
 
