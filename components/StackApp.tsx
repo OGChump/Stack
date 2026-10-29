@@ -194,6 +194,27 @@ type AnilistSearchResponse = {
   error?: string;
 };
 
+type StackBackupFileV1 = {
+  format: "stack-backup";
+  version: 1;
+  exportedAt: string;
+  sourceUserId: string;
+  sourceEmail?: string;
+  data: Record<string, any> & {
+    items: MediaItem[];
+    settings: StackSettings;
+    feedback: FeedbackEntry[];
+  };
+  browserPreferences?: {
+    boardView?: boolean;
+  };
+};
+
+type PendingStackBackup = {
+  fileName: string;
+  backup: StackBackupFileV1;
+};
+
 type MediaPick =
   | {
       provider: "tmdb";
@@ -1721,10 +1742,7 @@ async function matchImportWithTmdb(
   };
 }
 
-async function anilistImportMatchByMalId(
-  malId: number,
-  anilistType: "ANIME" | "MANGA"
-): Promise<{
+type AniListImportExactResult = {
   id: number;
   title: string;
   coverUrl?: string;
@@ -1732,39 +1750,112 @@ async function anilistImportMatchByMalId(
   episodes?: number | null;
   duration?: number | null;
   chapters?: number | null;
-} | null> {
-  const query = `
-    query ($idMal: Int, $type: MediaType) {
-      Media(idMal: $idMal, type: $type) {
-        id
-        title { romaji english native }
-        coverImage { extraLarge large medium }
-        genres
-        episodes
-        duration
-        chapters
-      }
-    }
-  `;
-  const res = await fetch("https://graphql.anilist.co", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ query, variables: { idMal: malId, type: anilistType } }),
-  });
-  if (!res.ok) return null;
-  const json = (await res.json()) as any;
-  const media = json?.data?.Media;
-  if (!media?.id) return null;
+  volumes?: number | null;
+};
+
+function applyExactAniListImportMatch(
+  candidate: StackImportCandidate,
+  exact: AniListImportExactResult,
+  anilistType: "ANIME" | "MANGA"
+): StackImportCandidate {
+  const progressTotal =
+    anilistType === "ANIME"
+      ? exact.episodes ?? candidate.progressTotal
+      : exact.chapters ?? candidate.progressTotal;
+
   return {
-    id: Number(media.id),
-    title: String(media.title?.english || media.title?.romaji || media.title?.native || "").trim(),
-    coverUrl:
-      media.coverImage?.extraLarge || media.coverImage?.large || media.coverImage?.medium || undefined,
-    genres: Array.isArray(media.genres) ? media.genres.map((tag: unknown) => String(tag)) : undefined,
-    episodes: typeof media.episodes === "number" ? media.episodes : null,
-    duration: typeof media.duration === "number" ? media.duration : null,
-    chapters: typeof media.chapters === "number" ? media.chapters : null,
+    ...candidate,
+    type: anilistType === "ANIME" ? "anime" : "manga",
+    typeHint: "exact",
+    anilistId: exact.id,
+    anilistType,
+    posterUrl: exact.coverUrl || candidate.posterUrl,
+    tags: uniqTags([...(candidate.tags ?? []), ...(exact.genres ?? [])]),
+    runtime:
+      anilistType === "ANIME" && exact.duration && exact.episodes
+        ? exact.duration * exact.episodes
+        : candidate.runtime,
+    progressTotal: progressTotal ?? undefined,
+    progressCur:
+      candidate.status === "completed" && progressTotal
+        ? progressTotal
+        : candidate.progressCur,
+    matchConfidence: 1,
+    matchLabel: `AniList exact MAL ID: ${exact.title || candidate.title}`,
   };
+}
+
+async function anilistImportMatchByMalId(
+  malId: number,
+  anilistType: "ANIME" | "MANGA"
+): Promise<AniListImportExactResult | null> {
+  // Use Stack's server route for MAL-ID resolution. This avoids browser/CORS
+  // differences and keeps MAL artwork lookup on the same reliable server-side
+  // path as the rest of Stack's provider integrations.
+  const res = await fetch(
+    `/api/anilist/by-mal-id?malId=${encodeURIComponent(String(malId))}&type=${encodeURIComponent(anilistType)}`,
+    { method: "GET", cache: "no-store" }
+  );
+  if (!res.ok) return null;
+  const json = (await res.json()) as {
+    result?: {
+      id: number;
+      title: string;
+      coverUrl?: string;
+      genres?: string[];
+      episodes?: number | null;
+      duration?: number | null;
+      chapters?: number | null;
+    } | null;
+  };
+  return json.result?.id ? json.result : null;
+}
+
+type AniListMalBatchResponse = {
+  results?: Array<{
+    key: string;
+    malId: number;
+    type: "ANIME" | "MANGA";
+    result?: AniListImportExactResult | null;
+  }>;
+  error?: string;
+};
+
+async function enrichMalCandidatesByExactId(
+  candidates: StackImportCandidate[]
+): Promise<StackImportCandidate[]> {
+  const entries = candidates.flatMap((candidate) => {
+    if (candidate.source !== "myanimelist" || !candidate.externalId) return [];
+    const malId = Number(candidate.externalId.split(":").at(-1));
+    if (!Number.isFinite(malId) || malId <= 0) return [];
+    const type: "ANIME" | "MANGA" = candidate.type === "manga" ? "MANGA" : "ANIME";
+    return [{ key: candidate.id, malId, type }];
+  });
+
+  if (!entries.length) return candidates;
+
+  const res = await fetch("/api/anilist/by-mal-id", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entries }),
+    cache: "no-store",
+  });
+  const json = (await res.json()) as AniListMalBatchResponse;
+  if (!res.ok) {
+    throw new Error(json.error || "Batch MAL artwork lookup failed.");
+  }
+
+  const byKey = new Map(
+    (json.results ?? [])
+      .filter((row) => row.result?.id)
+      .map((row) => [row.key, row] as const)
+  );
+
+  return candidates.map((candidate) => {
+    const row = byKey.get(candidate.id);
+    if (!row?.result) return candidate;
+    return applyExactAniListImportMatch(candidate, row.result, row.type);
+  });
 }
 
 async function matchImportWithAniList(
@@ -1778,30 +1869,7 @@ async function matchImportWithAniList(
     if (Number.isFinite(malId) && malId > 0) {
       const exact = await anilistImportMatchByMalId(malId, anilistType);
       if (exact) {
-        const progressTotal =
-          anilistType === "ANIME"
-            ? exact.episodes ?? candidate.progressTotal
-            : exact.chapters ?? candidate.progressTotal;
-        return {
-          ...candidate,
-          type: anilistType === "ANIME" ? "anime" : "manga",
-          typeHint: "exact",
-          anilistId: exact.id,
-          anilistType,
-          posterUrl: exact.coverUrl || candidate.posterUrl,
-          tags: uniqTags([...(candidate.tags ?? []), ...(exact.genres ?? [])]),
-          runtime:
-            anilistType === "ANIME" && exact.duration && exact.episodes
-              ? exact.duration * exact.episodes
-              : candidate.runtime,
-          progressTotal: progressTotal ?? undefined,
-          progressCur:
-            candidate.status === "completed" && progressTotal
-              ? progressTotal
-              : candidate.progressCur,
-          matchConfidence: 1,
-          matchLabel: `AniList exact MAL ID: ${exact.title || candidate.title}`,
-        };
+        return applyExactAniListImportMatch(candidate, exact, anilistType);
       }
     }
   }
@@ -2103,6 +2171,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const [importCandidates, setImportCandidates] = useState<StackImportCandidate[]>([]);
   const [importStatus, setImportStatus] = useState("");
   const [importMatching, setImportMatching] = useState(false);
+  const [malArtworkRepairing, setMalArtworkRepairing] = useState(false);
+  const [pendingStackBackup, setPendingStackBackup] = useState<PendingStackBackup | null>(null);
 
   useLayoutEffect(() => {
     const activeUid = loadLocalActiveUserId();
@@ -2167,6 +2237,19 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         .map((candidate) => candidate.id)
     );
   }, [importCandidates, items]);
+
+  const repairableMalArtworkCount = useMemo(
+    () =>
+      items.filter(
+        (item) =>
+          (item.type === "anime" || item.type === "manga") &&
+          !item.posterUrl &&
+          !item.posterOverrideUrl &&
+          (item.importSource === "myanimelist" ||
+            /^\s*(anime|manga):\d+\s*$/i.test(String(item.importExternalId || "")))
+      ).length,
+    [items]
+  );
 
   const appendImportCandidates = useCallback((next: StackImportCandidate[]) => {
     setImportCandidates((prev) => {
@@ -2257,13 +2340,177 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           const xml = await readMyAnimeListFile(file);
           parsed.push(...parseMyAnimeListXml(xml));
         }
-        await enrichAndAppendImportCandidates(parsed, "MyAnimeList entries");
+
+        const matchTargets = parsed.filter(
+          (candidate) => candidate.selected && !importCandidateDuplicate(candidate, items)
+        );
+
+        if (!matchTargets.length) {
+          appendImportCandidates(parsed);
+          setImportStatus(
+            `Loaded ${parsed.length} MyAnimeList entries. Existing matches are marked as skipped.`
+          );
+          return;
+        }
+
+        setImportMatching(true);
+        setImportStatus(`Finding MAL covers & metadata for ${matchTargets.length} entries…`);
+
+        const exactMatched = await enrichMalCandidatesByExactId(matchTargets);
+        const exactById = new Map(exactMatched.map((candidate) => [candidate.id, candidate]));
+        let enriched = parsed.map((candidate) => exactById.get(candidate.id) ?? candidate);
+
+        // Only fall back to title search for the uncommon MAL rows whose exact-ID lookup
+        // returned no cover. This keeps large MAL imports well below AniList rate limits.
+        const unresolved = enriched.filter(
+          (candidate) =>
+            candidate.selected &&
+            candidate.source === "myanimelist" &&
+            !candidate.posterUrl &&
+            !importCandidateDuplicate(candidate, items)
+        );
+
+        if (unresolved.length) {
+          setImportStatus(
+            `Exact MAL matching finished. Retrying ${unresolved.length} missing cover${unresolved.length === 1 ? "" : "s"} by title…`
+          );
+          const fallbackMatched = await mapImportWithConcurrency(
+            unresolved,
+            1,
+            async (candidate) => matchImportCandidateMetadata(candidate)
+          );
+          const fallbackById = new Map(
+            fallbackMatched.map((candidate) => [candidate.id, candidate])
+          );
+          enriched = enriched.map((candidate) => fallbackById.get(candidate.id) ?? candidate);
+        }
+
+        appendImportCandidates(enriched);
+        const withArtwork = enriched.filter(
+          (candidate) => candidate.source === "myanimelist" && !!candidate.posterUrl
+        ).length;
+        const missingArtwork = enriched.filter(
+          (candidate) =>
+            candidate.source === "myanimelist" &&
+            candidate.selected &&
+            !candidate.posterUrl &&
+            !importCandidateDuplicate(candidate, items)
+        ).length;
+
+        setImportStatus(
+          `Loaded ${parsed.length} MyAnimeList entries; found cover artwork for ${withArtwork}.${
+            missingArtwork
+              ? ` ${missingArtwork} new MAL entr${missingArtwork === 1 ? "y is" : "ies are"} still missing artwork and will be blocked from import until repaired or deselected.`
+              : " All new MAL entries have artwork."
+          }`
+        );
       } catch (error) {
-        setImportStatus(error instanceof Error ? error.message : "Could not read the MyAnimeList export.");
+        setImportStatus(
+          `${error instanceof Error ? error.message : "Could not enrich the MyAnimeList export."} No library data was changed.`
+        );
+      } finally {
+        setImportMatching(false);
       }
     },
-    [enrichAndAppendImportCandidates]
+    [appendImportCandidates, items]
   );
+
+  const repairMissingMalArtwork = useCallback(async () => {
+    const confirmedId = confirmedUserIdRef.current;
+    if (!userId || !cloudLoaded || loadedUserId !== userId || confirmedId !== userId) {
+      setImportStatus("MAL artwork repair is locked until this exact Stack account finishes secure cloud verification.");
+      return;
+    }
+
+    const targets = items.filter(
+      (item) =>
+        (item.type === "anime" || item.type === "manga") &&
+        !item.posterUrl &&
+        !item.posterOverrideUrl &&
+        (item.importSource === "myanimelist" ||
+          /^\s*(anime|manga):\d+\s*$/i.test(String(item.importExternalId || "")))
+    );
+
+    if (!targets.length) {
+      setImportStatus("No imported MAL entries are missing cover artwork.");
+      return;
+    }
+
+    setMalArtworkRepairing(true);
+    setImportStatus(`Repairing MAL artwork for ${targets.length} entr${targets.length === 1 ? "y" : "ies"}…`);
+
+    try {
+      const repairCandidates: StackImportCandidate[] = targets.map((item) => ({
+        id: item.id,
+        source: "myanimelist",
+        sourceLabel: "MyAnimeList repair",
+        externalId: item.importExternalId,
+        title: item.title,
+        type: item.type === "manga" ? "manga" : "anime",
+        typeHint: "exact",
+        status: item.status,
+        rating: item.rating,
+        dateFinished: isKnownFinishDate(item.dateFinished) ? item.dateFinished : undefined,
+        notes: item.notes,
+        tags: item.tags,
+        rewatchCount: item.rewatchCount,
+        progressCur: item.progressCur,
+        progressTotal: item.progressTotal,
+        selected: true,
+      }));
+
+      let repairedCandidates = await enrichMalCandidatesByExactId(repairCandidates);
+      const unresolved = repairedCandidates.filter((candidate) => !candidate.posterUrl);
+
+      if (unresolved.length) {
+        setImportStatus(
+          `Exact MAL repair found most entries. Retrying ${unresolved.length} by title…`
+        );
+        const fallback = await mapImportWithConcurrency(
+          unresolved,
+          1,
+          async (candidate) => matchImportCandidateMetadata(candidate)
+        );
+        const fallbackById = new Map(fallback.map((candidate) => [candidate.id, candidate]));
+        repairedCandidates = repairedCandidates.map(
+          (candidate) => fallbackById.get(candidate.id) ?? candidate
+        );
+      }
+
+      const byId = new Map(repairedCandidates.map((candidate) => [candidate.id, candidate]));
+      const repairedCount = repairedCandidates.filter((candidate) => !!candidate.posterUrl).length;
+
+      setItems((prev) =>
+        prev.map((item) => {
+          const candidate = byId.get(item.id);
+          if (!candidate?.posterUrl) return item;
+          return {
+            ...item,
+            posterUrl: candidate.posterUrl,
+            anilistId: candidate.anilistId ?? item.anilistId,
+            anilistType: candidate.anilistType ?? item.anilistType,
+            tags: uniqTags([...(item.tags ?? []), ...(candidate.tags ?? [])]),
+            runtime: item.runtime ?? candidate.runtime,
+            progressTotal: item.progressTotal ?? candidate.progressTotal,
+          };
+        })
+      );
+
+      setImportStatus(
+        `Repaired cover artwork for ${repairedCount} of ${targets.length} imported MAL entr${targets.length === 1 ? "y" : "ies"}.${
+          repairedCount < targets.length
+            ? ` ${targets.length - repairedCount} still could not be matched and were left unchanged.`
+            : " The repaired items will persist through Stack's normal verified save."
+        }`
+      );
+    } catch (error) {
+      setImportStatus(
+        `${error instanceof Error ? error.message : "MAL artwork repair failed."} Existing library entries were left unchanged.`
+      );
+    } finally {
+      setMalArtworkRepairing(false);
+    }
+  }, [cloudLoaded, items, loadedUserId, userId]);
 
   const handleLetterboxdImportFiles = useCallback(
     async (files: File[]) => {
@@ -2338,6 +2585,16 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       return;
     }
 
+    const malMissingArtwork = newCandidates.filter(
+      (candidate) => candidate.source === "myanimelist" && !candidate.posterUrl
+    );
+    if (malMissingArtwork.length) {
+      setImportStatus(
+        `Import paused: ${malMissingArtwork.length} selected MAL entr${malMissingArtwork.length === 1 ? "y is" : "ies are"} still missing cover artwork. Use Retry posters & metadata, or deselect those rows before importing. Nothing was added.`
+      );
+      return;
+    }
+
     const importedAt = new Date().toISOString();
     const newItems: MediaItem[] = newCandidates.map((candidate, index) => {
       const progressTotal = candidate.progressTotal;
@@ -2404,6 +2661,85 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       }. Your normal secure save will persist this one merged library update.`
     );
   }, [cloudLoaded, importCandidates, items, loadedUserId, userId]);
+
+  const exportStackBackup = useCallback(() => {
+    const confirmedId = confirmedUserIdRef.current;
+    if (!userId || !cloudLoaded || loadedUserId !== userId || confirmedId !== userId) {
+      setImportStatus("Backup export is locked until this exact Stack account finishes secure cloud verification.");
+      return;
+    }
+
+    const normalizedSettings = normalizeSettings(settings);
+    const backup: StackBackupFileV1 = {
+      format: "stack-backup",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      sourceUserId: userId,
+      sourceEmail: authEmail || undefined,
+      data: {
+        ...cloudExtraData,
+        items,
+        settings: normalizedSettings,
+        feedback: feedbackEntries,
+      },
+      browserPreferences: { boardView },
+    };
+
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const day = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.download = `stack-backup-${day}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setImportStatus(`Exported a full Stack backup with ${items.length} library entries.`);
+  }, [authEmail, boardView, cloudExtraData, cloudLoaded, feedbackEntries, items, loadedUserId, settings, userId]);
+
+  const handleStackBackupFile = useCallback(async (file: File | null) => {
+    if (!file) return;
+    try {
+      const raw = JSON.parse(await file.text()) as unknown;
+      const obj = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as any) : null;
+      if (obj?.format !== "stack-backup" || obj?.version !== 1 || !obj?.data || typeof obj.data !== "object") {
+        throw new Error("This is not a supported Stack backup file.");
+      }
+      if (!Array.isArray(obj.data.items)) throw new Error("The Stack backup does not contain a valid items array.");
+      if (!obj.data.settings || typeof obj.data.settings !== "object") throw new Error("The Stack backup is missing settings.");
+      if (!Array.isArray(obj.data.feedback)) throw new Error("The Stack backup does not contain a valid feedback array.");
+
+      const validItems = obj.data.items.filter(
+        (item: any) => item && typeof item.id === "string" && typeof item.title === "string"
+      ) as MediaItem[];
+      if (validItems.length !== obj.data.items.length) {
+        throw new Error("The Stack backup contains malformed library entries and was not loaded.");
+      }
+
+      const backup: StackBackupFileV1 = {
+        format: "stack-backup",
+        version: 1,
+        exportedAt: String(obj.exportedAt || ""),
+        sourceUserId: String(obj.sourceUserId || ""),
+        sourceEmail: obj.sourceEmail ? String(obj.sourceEmail) : undefined,
+        data: { ...obj.data, items: validItems },
+        browserPreferences:
+          obj.browserPreferences && typeof obj.browserPreferences === "object"
+            ? { boardView: typeof obj.browserPreferences.boardView === "boolean" ? obj.browserPreferences.boardView : undefined }
+            : undefined,
+      };
+
+      setPendingStackBackup({ fileName: file.name, backup });
+      setImportStatus(
+        `Loaded backup preview: ${validItems.length} library entries from ${backup.exportedAt ? new Date(backup.exportedAt).toLocaleString() : "an unknown export date"}. Nothing has been restored yet.`
+      );
+    } catch (error) {
+      setPendingStackBackup(null);
+      setImportStatus(error instanceof Error ? error.message : "Could not read this Stack backup.");
+    }
+  }, []);
+
 
   // ================= FRIENDS =================
   const [inputUsername, setInputUsername] = useState("");
@@ -3317,6 +3653,50 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     return normalizedForState;
   }, []);
 
+  const restorePendingStackBackup = useCallback(() => {
+    const pending = pendingStackBackup;
+    const confirmedId = confirmedUserIdRef.current;
+    if (!pending) {
+      setImportStatus("Choose a Stack backup file first.");
+      return;
+    }
+    if (!userId || !cloudLoaded || loadedUserId !== userId || confirmedId !== userId) {
+      setImportStatus("Backup restore is locked until this exact Stack account finishes secure cloud verification.");
+      return;
+    }
+    if (!pending.backup.sourceUserId || pending.backup.sourceUserId !== userId) {
+      setImportStatus("Restore blocked: this backup belongs to a different Stack user ID. No data was changed.");
+      return;
+    }
+
+    const nextItems = pending.backup.data.items;
+    const nextFeedback = parseFeedbackEntries(pending.backup.data.feedback);
+    const nextExtraData = omitKnownDataKeys(pending.backup.data);
+    const nextSettings = normalizeSettings(pending.backup.data.settings);
+    const sourceLabel = pending.backup.sourceEmail || `${pending.backup.sourceUserId.slice(0, 8)}…`;
+    const ok = window.confirm(
+      `Restore ${nextItems.length} library entries and all Stack settings from ${sourceLabel}? This will replace the current account payload with the selected backup.`
+    );
+    if (!ok) return;
+
+    setItems(nextItems);
+    setFeedbackEntries(nextFeedback);
+    setCloudExtraData(nextExtraData);
+    applyLoadedSettings(nextSettings, userId);
+
+    if (typeof pending.backup.browserPreferences?.boardView === "boolean") {
+      const nextBoardView = pending.backup.browserPreferences.boardView;
+      setBoardView(nextBoardView);
+      try {
+        localStorage.setItem(scopedLocalKey(LOCAL_BOARD_VIEW_KEY, userId), nextBoardView ? "1" : "0");
+      } catch {}
+    }
+
+    setImportStatus(
+      `Restored ${nextItems.length} entries and account settings in memory. Stack's normal verified save is persisting the backup to this account now.`
+    );
+  }, [applyLoadedSettings, cloudLoaded, loadedUserId, pendingStackBackup, userId]);
+
   const loadCloud = useCallback(
     async (uidStr: string) => {
       const generation = ++loadGenerationRef.current;
@@ -3573,6 +3953,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     lastPersistedFingerprintRef.current = "";
     setLoadedUserId(null);
     setHasSessionDisplayCache(false);
+    setPendingStackBackup(null);
     setItems([]);
     setFeedbackEntries([]);
     setFriendsList([]);
@@ -5730,6 +6111,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       setUserId(null);
       setItems([]);
       setFeedbackEntries([]);
+      setPendingStackBackup(null);
       setFriendsList([]);
       setIncomingRequests([]);
       setOutgoingRequests([]);
@@ -8782,15 +9164,23 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
                   duplicateIds={importDuplicateIds}
                   status={importStatus}
                   matching={importMatching}
+                  malArtworkRepairing={malArtworkRepairing}
+                  repairableMalArtworkCount={repairableMalArtworkCount}
                   secureReady={!!userId && cloudLoaded && loadedUserId === userId && confirmedUserIdRef.current === userId}
                   onPasteTextChange={setImportPasteText}
                   onDefaultYearChange={setImportDefaultYear}
                   onParsePaste={parseSmartImportText}
                   onMalFiles={handleMalImportFiles}
+                  onRepairMalArtwork={repairMissingMalArtwork}
                   onLetterboxdFiles={handleLetterboxdImportFiles}
                   onUpdateCandidate={updateImportCandidate}
                   onMatchMetadata={matchImportMetadata}
                   onImportSelected={commitImportCandidates}
+                  pendingBackup={pendingStackBackup}
+                  onExportBackup={exportStackBackup}
+                  onBackupFile={handleStackBackupFile}
+                  onRestoreBackup={restorePendingStackBackup}
+                  onClearBackup={() => setPendingStackBackup(null)}
                   onClear={() => {
                     setImportCandidates([]);
                     setImportStatus("");
@@ -11295,15 +11685,23 @@ function LibraryImportPanel({
   duplicateIds,
   status,
   matching,
+  malArtworkRepairing,
+  repairableMalArtworkCount,
   secureReady,
   onPasteTextChange,
   onDefaultYearChange,
   onParsePaste,
   onMalFiles,
+  onRepairMalArtwork,
   onLetterboxdFiles,
   onUpdateCandidate,
   onMatchMetadata,
   onImportSelected,
+  pendingBackup,
+  onExportBackup,
+  onBackupFile,
+  onRestoreBackup,
+  onClearBackup,
   onClear,
 }: {
   pasteText: string;
@@ -11312,15 +11710,23 @@ function LibraryImportPanel({
   duplicateIds: Set<string>;
   status: string;
   matching: boolean;
+  malArtworkRepairing: boolean;
+  repairableMalArtworkCount: number;
   secureReady: boolean;
   onPasteTextChange: (value: string) => void;
   onDefaultYearChange: (value: number) => void;
   onParsePaste: () => void | Promise<void>;
   onMalFiles: (files: File[]) => void | Promise<void>;
+  onRepairMalArtwork: () => void | Promise<void>;
   onLetterboxdFiles: (files: File[]) => void | Promise<void>;
   onUpdateCandidate: (id: string, patch: Partial<StackImportCandidate>) => void;
   onMatchMetadata: () => void | Promise<void>;
   onImportSelected: () => void;
+  pendingBackup: PendingStackBackup | null;
+  onExportBackup: () => void;
+  onBackupFile: (file: File | null) => void | Promise<void>;
+  onRestoreBackup: () => void;
+  onClearBackup: () => void;
   onClear: () => void;
 }) {
   const selectedNew = candidates.filter(
@@ -11414,8 +11820,21 @@ function LibraryImportPanel({
               />
             </label>
 
+            <button
+              type="button"
+              disabled={!secureReady || malArtworkRepairing || repairableMalArtworkCount === 0}
+              onClick={() => void onRepairMalArtwork()}
+              className="w-full px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 disabled:opacity-40 text-xs"
+            >
+              {malArtworkRepairing
+                ? "Repairing MAL covers…"
+                : repairableMalArtworkCount
+                ? `Repair ${repairableMalArtworkCount} missing MAL cover${repairableMalArtworkCount === 1 ? "" : "s"}`
+                : "No missing MAL covers"}
+            </button>
+
             <div className="text-[11px] text-neutral-600">
-              Stack reads the file in your browser. It does not need your MyAnimeList password.
+              Stack reads the file in your browser. It does not need your MyAnimeList password. MAL cover lookups are batched by exact MAL ID to avoid provider rate-limit gaps.
             </div>
           </div>
 
@@ -11446,6 +11865,81 @@ function LibraryImportPanel({
             <div className="text-[11px] text-neutral-600">
               Ratings are converted to Stack&apos;s 0–10 scale. Diary dates, rewatches, tags, reviews, posters, and metadata are merged when available.
             </div>
+          </div>
+        </div>
+      </Panel>
+
+      <Panel
+        title="Stack backup"
+        right={<span className="text-xs text-neutral-500">Lossless account-payload backup</span>}
+      >
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 space-y-3">
+            <div>
+              <div className="text-sm font-medium text-neutral-100">Export Stack JSON</div>
+              <div className="text-[11px] text-neutral-500 mt-1">
+                Downloads the exact restorable Stack account payload: library entries, provider IDs, artwork URLs, ratings, notes, dates, progress, rewatches, privacy/favorites, settings, feedback, and preserved future-compatible JSON fields.
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={!secureReady}
+              onClick={onExportBackup}
+              className="w-full px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 disabled:opacity-40 text-sm"
+            >
+              Export full Stack backup (.json)
+            </button>
+            <div className="text-[10px] text-neutral-600">
+              Authentication secrets and accepted friend relationships are intentionally not exported.
+            </div>
+          </div>
+
+          <div className="rounded-2xl bg-neutral-950/72 border border-white/10 p-4 space-y-3">
+            <div>
+              <div className="text-sm font-medium text-neutral-100">Restore Stack JSON</div>
+              <div className="text-[11px] text-neutral-500 mt-1">
+                Selecting a file only loads a preview. Nothing changes until you explicitly press Restore backup. Restore is restricted to the same Stack user UUID stored in the backup.
+              </div>
+            </div>
+            <label className="block rounded-xl border border-dashed border-white/15 bg-white/[0.025] p-3 hover:bg-white/[0.045] cursor-pointer">
+              <div className="text-xs text-neutral-300">Choose Stack backup JSON</div>
+              <input
+                type="file"
+                accept=".json,application/json"
+                className="mt-2 block w-full text-xs text-neutral-500 file:mr-3 file:rounded-lg file:border-0 file:bg-white/10 file:px-3 file:py-2 file:text-neutral-200"
+                onChange={(e) => {
+                  const file = e.currentTarget.files?.[0] ?? null;
+                  void onBackupFile(file);
+                  e.currentTarget.value = "";
+                }}
+              />
+            </label>
+
+            {pendingBackup ? (
+              <div className="rounded-xl border border-white/10 bg-white/[0.035] p-3 text-xs text-neutral-300 space-y-1">
+                <div className="font-medium text-neutral-200">{pendingBackup.fileName}</div>
+                <div>{pendingBackup.backup.data.items.length} library entries</div>
+                <div className="text-neutral-500">Source: {pendingBackup.backup.sourceEmail || pendingBackup.backup.sourceUserId}</div>
+                <div className="text-neutral-500">Exported: {pendingBackup.backup.exportedAt ? new Date(pendingBackup.backup.exportedAt).toLocaleString() : "Unknown"}</div>
+                <div className="flex flex-wrap gap-2 pt-2">
+                  <button
+                    type="button"
+                    disabled={!secureReady}
+                    onClick={onRestoreBackup}
+                    className="px-3 py-2 rounded-xl stack-bad border disabled:opacity-40 text-xs"
+                  >
+                    Restore backup
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onClearBackup}
+                    className="px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-xs"
+                  >
+                    Clear backup preview
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </div>
         </div>
       </Panel>

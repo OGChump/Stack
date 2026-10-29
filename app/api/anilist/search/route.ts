@@ -1,95 +1,141 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
-type AniTitle = { romaji?: string; english?: string; native?: string };
-type AniCover = { extraLarge?: string; large?: string; medium?: string };
-type AniGenre = string;
+type AniListMediaType = "ANIME" | "MANGA";
 
-type AniMedia = {
+type AniListMedia = {
   id: number;
-  title?: AniTitle;
-  coverImage?: AniCover;
-  genres?: AniGenre[];
+  title?: {
+    romaji?: string | null;
+    english?: string | null;
+    native?: string | null;
+  } | null;
+  coverImage?: {
+    extraLarge?: string | null;
+    large?: string | null;
+    medium?: string | null;
+  } | null;
+  genres?: string[] | null;
 };
 
-type AniListResponse = {
+type AniListGraphQLResponse = {
   data?: {
     Page?: {
-      media?: AniMedia[];
-    };
-  };
-  errors?: Array<{ message: string }>;
+      media?: AniListMedia[] | null;
+    } | null;
+  } | null;
+  errors?: Array<{
+    message?: string;
+  }> | null;
 };
 
-export async function GET(req: Request) {
+export async function GET(request: NextRequest) {
   try {
-    const { searchParams } = new URL(req.url);
-    const q = (searchParams.get("q") || "").trim();
-    const limit = Math.max(1, Math.min(10, Number(searchParams.get("limit") || "5")));
-    const typeParam = (searchParams.get("type") || "ANIME").toUpperCase();
+    const { searchParams } = new URL(request.url);
 
-    const mediaType = typeParam === "MANGA" ? "MANGA" : "ANIME";
+    const q = (searchParams.get("q") ?? "").trim();
+    const requestedType = (searchParams.get("type") ?? "ANIME").toUpperCase();
+    const type: AniListMediaType =
+      requestedType === "MANGA" ? "MANGA" : "ANIME";
 
-    if (q.length < 2) {
-      return NextResponse.json({ results: [] });
+    const requestedLimit = Number(searchParams.get("limit") ?? "7");
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(20, Math.trunc(requestedLimit)))
+      : 7;
+
+    if (!q) {
+      return NextResponse.json(
+        { error: "Missing search query.", results: [] },
+        { status: 400 }
+      );
     }
 
     const query = `
       query ($search: String, $perPage: Int, $type: MediaType) {
-        Page(perPage: $perPage) {
-          media(search: $search, type: $type, sort: POPULARITY_DESC) {
+        Page(page: 1, perPage: $perPage) {
+          media(search: $search, type: $type, sort: SEARCH_MATCH) {
             id
-            title { romaji english native }
-            coverImage { extraLarge large medium }
+            title {
+              romaji
+              english
+              native
+            }
+            coverImage {
+              extraLarge
+              large
+              medium
+            }
             genres
           }
         }
       }
     `;
 
-    const body = JSON.stringify({
-      query,
-      variables: { search: q, perPage: limit, type: mediaType },
-    });
-
-    const res = await fetch("https://graphql.anilist.co", {
+    const response = await fetch("https://graphql.anilist.co", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body,
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        query,
+        variables: {
+          search: q,
+          perPage: limit,
+          type,
+        },
+      }),
       cache: "no-store",
     });
 
-    const json = (await res.json()) as AniListResponse;
+    const json: AniListGraphQLResponse = await response.json();
 
-    if (!res.ok || json.errors?.length) {
-      const msg =
-        json.errors?.map((e) => e.message).join(" | ") ||
-        `AniList search failed (${res.status})`;
-      return NextResponse.json({ error: msg, results: [] }, { status: 500 });
+    if (!response.ok || json.errors?.length) {
+      const message =
+        json.errors?.find((entry) => entry?.message)?.message ||
+        `AniList search failed (${response.status}).`;
+
+      return NextResponse.json(
+        { error: message, results: [] },
+        { status: response.ok ? 502 : response.status }
+      );
     }
 
-    const media = json.data?.Page?.media ?? [];
+    const media = Array.isArray(json.data?.Page?.media)
+      ? json.data.Page.media
+      : [];
 
-    const results = media.map((m) => {
-      const title =
-        m.title?.english?.trim() ||
-        m.title?.romaji?.trim() ||
-        m.title?.native?.trim() ||
-        "Untitled";
+    const results = media
+      .filter((entry): entry is AniListMedia => Boolean(entry?.id))
+      .map((entry) => {
+        const title =
+          entry.title?.english?.trim() ||
+          entry.title?.romaji?.trim() ||
+          entry.title?.native?.trim() ||
+          "";
 
-      const coverUrl =
-        m.coverImage?.extraLarge || m.coverImage?.large || m.coverImage?.medium || "";
+        const coverUrl =
+          entry.coverImage?.extraLarge ||
+          entry.coverImage?.large ||
+          entry.coverImage?.medium ||
+          undefined;
 
-      return {
-        id: m.id,
-        title,
-        coverUrl: coverUrl || undefined,
-        genres: (m.genres ?? []).filter(Boolean),
-      };
-    });
+        return {
+          id: entry.id,
+          title,
+          coverUrl,
+          genres: Array.isArray(entry.genres) ? entry.genres : [],
+        };
+      })
+      .filter((entry) => entry.title);
 
     return NextResponse.json({ results });
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg, results: [] }, { status: 500 });
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error ? error.message : "AniList search failed.";
+
+    return NextResponse.json(
+      { error: message, results: [] },
+      { status: 500 }
+    );
   }
 }
