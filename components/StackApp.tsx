@@ -100,6 +100,72 @@ type MediaItem = {
   importYearMonth?: string;
 };
 
+const UNKNOWN_FINISH_DATE = "0/0/0000";
+
+function isUnknownFinishDate(value?: string) {
+  return String(value || "").trim() === UNKNOWN_FINISH_DATE;
+}
+
+function isKnownFinishDate(value?: string) {
+  const clean = String(value || "").trim();
+  if (!clean || isUnknownFinishDate(clean)) return false;
+  return /^\d{4}-\d{2}-\d{2}$/.test(clean);
+}
+
+function normalizeImportYearMonth(value?: string) {
+  const clean = String(value || "").trim();
+  const match = clean.match(/^(\d{4})-(0[1-9]|1[0-2])$/);
+  return match ? `${match[1]}-${match[2]}` : "";
+}
+
+function importYearMonthTimelineDate(value?: string) {
+  const normalized = normalizeImportYearMonth(value);
+  return normalized ? `${normalized}-01` : "";
+}
+
+function importYearMonthLabel(value?: string) {
+  const normalized = normalizeImportYearMonth(value);
+  if (!normalized) return "";
+
+  const [year, month] = normalized.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, 1));
+  return date.toLocaleDateString(undefined, {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+}
+
+function finishDateInputValue(value?: string) {
+  return isUnknownFinishDate(value) ? "" : String(value || "");
+}
+
+function finishDateDisplayLabel(item: MediaItem, emptyLabel = "No date") {
+  if (isKnownFinishDate(item.dateFinished)) return String(item.dateFinished);
+
+  const monthLabel = importYearMonthLabel(item.importYearMonth);
+  if (monthLabel) return monthLabel;
+
+  if (isUnknownFinishDate(item.dateFinished)) return UNKNOWN_FINISH_DATE;
+  return String(item.dateFinished || emptyLabel);
+}
+
+function timelineDateForItem(item: MediaItem) {
+  if (isKnownFinishDate(item.dateFinished)) return String(item.dateFinished);
+
+  // Smart Paste can know the month/year even when the exact day was never tracked.
+  // Use the first of that month only as an internal timeline anchor; the UI never
+  // presents it as an exact completion day.
+  const monthTimeline = importYearMonthTimelineDate(item.importYearMonth);
+  if (monthTimeline) return monthTimeline;
+
+  // 0/0/0000 means the completion date is genuinely unknown, so it must not fall
+  // back to the import timestamp and inflate the month in which the import occurred.
+  if (isUnknownFinishDate(item.dateFinished)) return "";
+
+  return String(item.dateFinished ?? item.createdAt ?? "");
+}
+
 type TmdbSearchResult = {
   results?: Array<{ id: number; title?: string; name?: string; release_date?: string; first_air_date?: string }>;
 };
@@ -929,8 +995,12 @@ function sortMediaItems<T extends MediaItem>(list: T[], sortMode: SortMode): T[]
     if (sortMode === "rating_high") return (b.rating ?? -1) - (a.rating ?? -1);
     if (sortMode === "rating_low") return (a.rating ?? 999) - (b.rating ?? 999);
 
-    const createdA = new Date((a.dateFinished ?? a.createdAt) as string).getTime();
-    const createdB = new Date((b.dateFinished ?? b.createdAt) as string).getTime();
+    const createdRawA = timelineDateForItem(a);
+    const createdRawB = timelineDateForItem(b);
+    const createdParsedA = createdRawA ? new Date(createdRawA).getTime() : 0;
+    const createdParsedB = createdRawB ? new Date(createdRawB).getTime() : 0;
+    const createdA = Number.isFinite(createdParsedA) ? createdParsedA : 0;
+    const createdB = Number.isFinite(createdParsedB) ? createdParsedB : 0;
     const updatedA = new Date((a.updatedAt ?? a.createdAt) as string).getTime();
     const updatedB = new Date((b.updatedAt ?? b.createdAt) as string).getTime();
 
@@ -1012,11 +1082,10 @@ function computeVisibleProfileStats(items: MediaItem[]) {
 
 function safeDateLabel(value?: string) {
   if (!value) return "—";
-  try {
-    return new Date(value).toLocaleDateString();
-  } catch {
-    return value;
-  }
+  if (isUnknownFinishDate(value)) return UNKNOWN_FINISH_DATE;
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime())) return value;
+  return parsed.toLocaleDateString();
 }
 
 function friendInitials(name: string) {
@@ -1535,6 +1604,20 @@ function diversifyPicks<T extends { score: number; tags: string[] }>(
 
 /* ================= IMPORT HELPERS ================= */
 
+function mergeImportText(...values: Array<string | undefined | null>) {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of values) {
+    const value = String(raw ?? "").trim();
+    if (!value) continue;
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+  return out.join("\n");
+}
+
 function cleanImportSearchTitle(title: string) {
   return title
     .replace(/\s+[–—-]?\s*season\s+\d+\s*$/i, "")
@@ -1781,6 +1864,71 @@ async function matchImportWithAniList(
   };
 }
 
+async function matchImportWithOpenLibrary(candidate: StackImportCandidate): Promise<StackImportCandidate> {
+  const query = cleanImportSearchTitle(candidate.title) || candidate.title;
+  const url =
+    `https://openlibrary.org/search.json?title=${encodeURIComponent(query)}` +
+    `&limit=8&fields=key,title,author_name,first_publish_year,cover_i`;
+  const res = await fetch(url, { method: "GET" });
+  if (!res.ok) throw new Error("Open Library search failed.");
+  const json = (await res.json()) as any;
+  const results = Array.isArray(json?.docs) ? json.docs : [];
+  if (!results.length) {
+    return {
+      ...candidate,
+      type: "book",
+      typeHint: "exact",
+      warnings: uniqTags([...(candidate.warnings ?? []), "No Open Library book match found."]),
+      matchConfidence: 0,
+      matchLabel: "No Open Library match",
+    };
+  }
+
+  const scored = results
+    .map((row: any) => {
+      const title = String(row?.title || "").trim();
+      const resultYear = typeof row?.first_publish_year === "number" ? row.first_publish_year : undefined;
+      let score = similarityScore(query, title);
+      if (candidate.year && resultYear === candidate.year) score = Math.min(1, score + 0.08);
+      return { row, title, score, resultYear };
+    })
+    .filter((entry: any) => entry.title)
+    .sort((a: any, b: any) => b.score - a.score);
+
+  const best = scored[0];
+  if (!best || best.score < 0.58) {
+    return {
+      ...candidate,
+      type: "book",
+      typeHint: "exact",
+      warnings: uniqTags([...(candidate.warnings ?? []), `Low-confidence Open Library match for “${candidate.title}”. Review before importing.`]),
+      matchConfidence: best?.score ?? 0,
+      matchLabel: best ? `Possible book: ${best.title}` : "No Open Library match",
+    };
+  }
+
+  const coverId = Number(best.row?.cover_i);
+  const posterUrl = Number.isFinite(coverId) && coverId > 0
+    ? `https://covers.openlibrary.org/b/id/${coverId}-L.jpg?default=false`
+    : candidate.posterUrl;
+  const authors = Array.isArray(best.row?.author_name)
+    ? best.row.author_name.map((name: unknown) => String(name).trim()).filter(Boolean).slice(0, 3)
+    : [];
+
+  return {
+    ...candidate,
+    type: "book",
+    typeHint: "exact",
+    posterUrl,
+    notes: mergeImportText(
+      candidate.notes,
+      authors.length ? `Author${authors.length === 1 ? "" : "s"}: ${authors.join(", ")}` : undefined
+    ),
+    matchConfidence: best.score,
+    matchLabel: `Open Library: ${best.title}${best.resultYear ? ` (${best.resultYear})` : ""}`,
+  };
+}
+
 async function matchImportWithIgdb(candidate: StackImportCandidate): Promise<StackImportCandidate> {
   const query = cleanImportSearchTitle(candidate.title) || candidate.title;
   const res = await fetch(`/api/igdb/search?q=${encodeURIComponent(query)}&limit=8`, {
@@ -1841,13 +1989,17 @@ async function matchImportCandidateMetadata(candidate: StackImportCandidate) {
     if (candidate.typeHint === "manga_or_book") {
       const manga = await matchImportWithAniList(candidate, "MANGA");
       if ((manga.matchConfidence ?? 0) >= 0.86 && manga.anilistId) return manga;
-      return {
+      const book = await matchImportWithOpenLibrary({
         ...candidate,
-        type: "book" as MediaType,
-        typeHint: "exact" as const,
-        matchConfidence: manga.matchConfidence,
-        matchLabel: "Kept as Book",
-        warnings: uniqTags([...(candidate.warnings ?? []), "No confident manga match; kept as Book."]),
+        type: "book",
+        typeHint: "exact",
+      });
+      return {
+        ...book,
+        warnings: uniqTags([
+          ...(book.warnings ?? []),
+          "No confident manga match; treated as a Book and checked against Open Library.",
+        ]),
       };
     }
 
@@ -1855,6 +2007,7 @@ async function matchImportCandidateMetadata(candidate: StackImportCandidate) {
     if (candidate.type === "tv") return matchImportWithTmdb(candidate, "tv");
     if (candidate.type === "anime") return matchImportWithAniList(candidate, "ANIME");
     if (candidate.type === "manga") return matchImportWithAniList(candidate, "MANGA");
+    if (candidate.type === "book") return matchImportWithOpenLibrary(candidate);
     if (candidate.type === "game") return matchImportWithIgdb(candidate);
 
     return {
@@ -2032,7 +2185,49 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     });
   }, []);
 
-  const parseSmartImportText = useCallback(() => {
+  const enrichAndAppendImportCandidates = useCallback(
+    async (parsed: StackImportCandidate[], label: string) => {
+      const matchTargets = parsed.filter(
+        (candidate) => candidate.selected && !importCandidateDuplicate(candidate, items)
+      );
+
+      if (!matchTargets.length) {
+        appendImportCandidates(parsed);
+        setImportStatus(
+          `Loaded ${parsed.length} ${label}. Existing matches are marked as skipped.`
+        );
+        return;
+      }
+
+      setImportMatching(true);
+      setImportStatus(`Finding posters & metadata 0 / ${matchTargets.length}…`);
+      try {
+        const matched = await mapImportWithConcurrency(
+          matchTargets,
+          3,
+          async (candidate) => matchImportCandidateMetadata(candidate),
+          (done, total) => setImportStatus(`Finding posters & metadata ${done} / ${total}…`)
+        );
+        const byId = new Map(matched.map((candidate) => [candidate.id, candidate]));
+        const enriched = parsed.map((candidate) => byId.get(candidate.id) ?? candidate);
+        appendImportCandidates(enriched);
+        const withArtwork = enriched.filter((candidate) => !!candidate.posterUrl).length;
+        setImportStatus(
+          `Loaded ${parsed.length} ${label}; found artwork for ${withArtwork}. Review any low-confidence matches before importing.`
+        );
+      } catch (error) {
+        appendImportCandidates(parsed);
+        setImportStatus(
+          `${error instanceof Error ? error.message : "Automatic metadata matching failed."} The entries are still in preview; you can retry posters & metadata.`
+        );
+      } finally {
+        setImportMatching(false);
+      }
+    },
+    [appendImportCandidates, items]
+  );
+
+  const parseSmartImportText = useCallback(async () => {
     const text = importPasteText.trim();
     if (!text) {
       setImportStatus("Paste a list first.");
@@ -2040,16 +2235,17 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     }
     try {
       const parsed = parseSmartPaste(text, importDefaultYear);
-      appendImportCandidates(parsed);
-      setImportStatus(
-        parsed.length
-          ? `Parsed ${parsed.length} entries from your pasted list. Review them below before importing.`
-          : "No month/category entries were found. Use headings such as January, Movies, TV Shows/Anime, Manga/Books, and Games played."
-      );
+      if (!parsed.length) {
+        setImportStatus(
+          "No month/category entries were found. Use headings such as January, Movies, TV Shows/Anime, Manga/Books, and Games played."
+        );
+        return;
+      }
+      await enrichAndAppendImportCandidates(parsed, "pasted entries");
     } catch (error) {
       setImportStatus(error instanceof Error ? error.message : "Could not parse the pasted list.");
     }
-  }, [appendImportCandidates, importDefaultYear, importPasteText]);
+  }, [enrichAndAppendImportCandidates, importDefaultYear, importPasteText]);
 
   const handleMalImportFiles = useCallback(
     async (files: File[]) => {
@@ -2061,15 +2257,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           const xml = await readMyAnimeListFile(file);
           parsed.push(...parseMyAnimeListXml(xml));
         }
-        appendImportCandidates(parsed);
-        setImportStatus(
-          `Loaded ${parsed.length} MyAnimeList entries. Nothing has been added to Stack yet.`
-        );
+        await enrichAndAppendImportCandidates(parsed, "MyAnimeList entries");
       } catch (error) {
         setImportStatus(error instanceof Error ? error.message : "Could not read the MyAnimeList export.");
       }
     },
-    [appendImportCandidates]
+    [enrichAndAppendImportCandidates]
   );
 
   const handleLetterboxdImportFiles = useCallback(
@@ -2078,15 +2271,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       setImportStatus("Reading Letterboxd export…");
       try {
         const parsed = await parseLetterboxdFiles(files);
-        appendImportCandidates(parsed);
-        setImportStatus(
-          `Loaded ${parsed.length} Letterboxd films. Nothing has been added to Stack yet.`
-        );
+        await enrichAndAppendImportCandidates(parsed, "Letterboxd films");
       } catch (error) {
         setImportStatus(error instanceof Error ? error.message : "Could not read the Letterboxd export.");
       }
     },
-    [appendImportCandidates]
+    [enrichAndAppendImportCandidates]
   );
 
   const updateImportCandidate = useCallback(
@@ -2155,8 +2345,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         candidate.status === "completed" && progressTotal
           ? progressTotal
           : candidate.progressCur;
-      const createdAt = candidate.dateFinished
-        ? `${candidate.dateFinished}T12:00:00.000Z`
+      const rawFinishDate = String(candidate.dateFinished || "").trim();
+      const importedFinishDate = rawFinishDate || (candidate.status === "completed" ? UNKNOWN_FINISH_DATE : undefined);
+      const createdAt = isKnownFinishDate(importedFinishDate)
+        ? `${importedFinishDate}T12:00:00.000Z`
         : new Date(Date.now() + index).toISOString();
 
       return {
@@ -2174,7 +2366,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         anilistId: candidate.anilistId,
         anilistType: candidate.anilistType,
         inTheaters: candidate.inTheaters,
-        dateFinished: candidate.dateFinished,
+        dateFinished: importedFinishDate,
         notes: candidate.notes,
         rewatchCount: candidate.rewatchCount,
         runtime: candidate.runtime,
@@ -3748,7 +3940,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           return { cur, total };
         };
 
-        if (!hadCompleted && nowCompleted && !merged.dateFinished) {
+        if (!hadCompleted && nowCompleted && !isKnownFinishDate(merged.dateFinished)) {
           merged.dateFinished = todayYMD();
         }
 
@@ -3766,7 +3958,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           curNum >= totalNum
         ) {
           merged.status = "completed";
-          if (!merged.dateFinished) merged.dateFinished = todayYMD();
+          if (!isKnownFinishDate(merged.dateFinished)) merged.dateFinished = todayYMD();
         }
 
         if (merged.status === "completed") {
@@ -5166,7 +5358,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
     const map = new Map<string, MediaItem[]>();
     for (const i of filtered) {
-      const baseDate = (i.dateFinished ?? i.createdAt).slice(0, 10);
+      const baseDate = timelineDateForItem(i).slice(0, 10);
       const k = toGroupKey(groupMode, baseDate);
       if (!map.has(k)) map.set(k, []);
       map.get(k)!.push(i);
@@ -5190,7 +5382,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const statsMonthOptions = useMemo(() => {
     const months = new Set<string>();
     for (const i of items) {
-      const key = (i.dateFinished ?? i.createdAt ?? "").slice(0, 7);
+      const key = timelineDateForItem(i).slice(0, 7);
       if (key) months.add(key);
     }
 
@@ -5205,7 +5397,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     if (statsMonth === "all") return items;
 
     return items.filter((i) => {
-      const key = (i.dateFinished ?? i.createdAt ?? "").slice(0, 7);
+      const key = timelineDateForItem(i).slice(0, 7);
       return key === statsMonth;
     });
   }, [items, statsMonth]);
@@ -5374,7 +5566,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       if (i.status !== "completed") continue;
       if (excludeTypes.has(i.type)) continue;
 
-      const dateStr = (i.dateFinished ?? i.createdAt ?? "").slice(0, 7);
+      const dateStr = timelineDateForItem(i).slice(0, 7);
       if (!dateStr) continue;
 
       const pos = idx.get(dateStr);
@@ -5400,7 +5592,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       if (i.status !== "completed") continue;
       if (excludeTypes.has(i.type)) continue;
 
-      const day = (i.dateFinished ?? i.createdAt ?? "").slice(0, 10);
+      const day = timelineDateForItem(i).slice(0, 10);
       if (day) daysSet.add(day);
     }
 
@@ -5486,7 +5678,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         if (i.status !== "completed") continue;
         if (excludeTypes.has(i.type)) continue;
 
-        const d = (i.dateFinished ?? i.createdAt ?? "").slice(0, 10);
+        const d = timelineDateForItem(i).slice(0, 10);
         if (!d) continue;
         if (d < start) continue;
         if (end && d > end) continue;
@@ -9200,7 +9392,7 @@ function MALRow({
 
   const [isEditing, setIsEditing] = React.useState(false);
   const [draftTitle, setDraftTitle] = React.useState(item.title);
-  const [draftDate, setDraftDate] = React.useState(item.dateFinished ?? "");
+  const [draftDate, setDraftDate] = React.useState(finishDateInputValue(item.dateFinished));
   const [draftRating, setDraftRating] = React.useState(typeof item.rating === "number" ? String(item.rating) : "");
   const [draftNotes, setDraftNotes] = React.useState(item.notes ?? "");
   const [draftPosterOverride, setDraftPosterOverride] = React.useState(item.posterOverrideUrl ?? "");
@@ -9211,7 +9403,7 @@ function MALRow({
   useEffect(() => {
     if (isEditing) return;
     setDraftTitle(item.title);
-    setDraftDate(item.dateFinished ?? "");
+    setDraftDate(finishDateInputValue(item.dateFinished));
     setDraftRating(typeof item.rating === "number" ? String(item.rating) : "");
     setDraftNotes(item.notes ?? "");
     setDraftPosterOverride(item.posterOverrideUrl ?? "");
@@ -9220,7 +9412,7 @@ function MALRow({
   const cancelEdit = () => {
     setIsEditing(false);
     setDraftTitle(item.title);
-    setDraftDate(item.dateFinished ?? "");
+    setDraftDate(finishDateInputValue(item.dateFinished));
     setDraftRating(typeof item.rating === "number" ? String(item.rating) : "");
     setDraftNotes(item.notes ?? "");
     setDraftPosterOverride(item.posterOverrideUrl ?? "");
@@ -9240,7 +9432,11 @@ function MALRow({
 
     onUpdate({
       title: nextTitle || item.title,
-      dateFinished: nextDate ? nextDate : undefined,
+      dateFinished: nextDate
+        ? nextDate
+        : isUnknownFinishDate(item.dateFinished)
+        ? UNKNOWN_FINISH_DATE
+        : undefined,
       rating: nextRating,
       notes: nextNotes,
       posterOverrideUrl: draftPosterOverride.trim() || undefined,
@@ -9294,7 +9490,7 @@ function MALRow({
   const hoursText = typeof item.hoursPlayed === "number" ? `${item.hoursPlayed.toFixed(1)}h` : "—";
 
   const hasLongNote = !!item.notes && item.notes.length > 120;
-  const mobileDateLabel = item.dateFinished ? item.dateFinished : "No date";
+  const mobileDateLabel = finishDateDisplayLabel(item);
   const mobileRatingLabel = formatRatingValue(item.rating, ratingFormat);
 
   return (
@@ -9700,8 +9896,8 @@ function MALRow({
                       className="rounded-md bg-neutral-950 border border-neutral-800 px-2 py-[2px] text-xs outline-none focus:border-neutral-500"
                       title="Date watched"
                     />
-                  ) : item.dateFinished ? (
-                    <span className="text-neutral-500">{item.dateFinished}</span>
+                  ) : item.dateFinished || item.importYearMonth ? (
+                    <span className="text-neutral-500">{finishDateDisplayLabel(item)}</span>
                   ) : (
                     <span className="text-neutral-600">No date</span>
                   )}
@@ -10295,7 +10491,7 @@ function MediaItemDetailModal({
   const [isEditing, setIsEditing] = React.useState(!!initialEditing);
   const [draftTitle, setDraftTitle] = React.useState(item.title);
   const [draftStatus, setDraftStatus] = React.useState<Status>(item.status);
-  const [draftDate, setDraftDate] = React.useState(item.dateFinished ?? "");
+  const [draftDate, setDraftDate] = React.useState(finishDateInputValue(item.dateFinished));
   const [draftRating, setDraftRating] = React.useState(
     typeof item.rating === "number" ? String(item.rating) : ""
   );
@@ -10334,7 +10530,7 @@ function MediaItemDetailModal({
 
     setDraftTitle(item.title);
     setDraftStatus(item.status);
-    setDraftDate(item.dateFinished ?? "");
+    setDraftDate(finishDateInputValue(item.dateFinished));
     setDraftRating(typeof item.rating === "number" ? String(item.rating) : "");
     setDraftNotes(item.notes ?? "");
     setDraftTags((item.tags ?? []).join(", "));
@@ -10401,7 +10597,11 @@ function MediaItemDetailModal({
     const patch: Partial<MediaItem> = {
       title: cleanTitle,
       status: draftStatus,
-      dateFinished: cleanDate || undefined,
+      dateFinished: cleanDate
+        ? cleanDate
+        : isUnknownFinishDate(item.dateFinished)
+        ? UNKNOWN_FINISH_DATE
+        : undefined,
       rating: nextRating,
       notes: cleanNotes || undefined,
       tags: nextTags,
@@ -10692,7 +10892,7 @@ function MediaItemDetailModal({
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-neutral-400">
                     <div>
                       Date watched:{" "}
-                      <span className="text-neutral-200">{item.dateFinished || "—"}</span>
+                      <span className="text-neutral-200">{finishDateDisplayLabel(item, "—")}</span>
                     </div>
                     <div>
                       Updated:{" "}
@@ -11036,10 +11236,10 @@ function FriendReadOnlyRow({
             </button>
             <div className="text-xs text-neutral-400 mt-1 flex flex-wrap items-center gap-2">
               <span className="capitalize">{item.status.replace("_", " ")}</span>
-              {item.dateFinished ? (
+              {item.dateFinished || item.importYearMonth ? (
                 <>
                   <span className="text-neutral-600">•</span>
-                  <span className="text-neutral-500">{item.dateFinished}</span>
+                  <span className="text-neutral-500">{finishDateDisplayLabel(item)}</span>
                 </>
               ) : null}
               {(Number(item.rewatchCount ?? 0) || 0) > 0 ? (
@@ -11115,7 +11315,7 @@ function LibraryImportPanel({
   secureReady: boolean;
   onPasteTextChange: (value: string) => void;
   onDefaultYearChange: (value: number) => void;
-  onParsePaste: () => void;
+  onParsePaste: () => void | Promise<void>;
   onMalFiles: (files: File[]) => void | Promise<void>;
   onLetterboxdFiles: (files: File[]) => void | Promise<void>;
   onUpdateCandidate: (id: string, patch: Partial<StackImportCandidate>) => void;
@@ -11149,7 +11349,7 @@ function LibraryImportPanel({
         }
       >
         <div className="rounded-2xl border border-emerald-400/15 bg-emerald-400/[0.05] px-4 py-3 text-xs text-neutral-300">
-          Imports never replace your full Stack library. Existing matches are skipped by default, and nothing is added until you review the preview and press Import selected.
+          Imports never replace your full Stack library. Existing matches are skipped by default, and nothing is added until you review the preview and press Import selected. Smart Paste month entries use the first day of that month (for example, January 2025 becomes January 1, 2025). MAL keeps its real finish date when present; only a one-episode/chapter completed title may conservatively use its MAL start date as an estimate. Other truly unknown completed MAL dates use 0/0/0000.
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 mt-4">
@@ -11157,12 +11357,12 @@ function LibraryImportPanel({
             <div>
               <div className="text-sm font-medium text-neutral-100">Smart Paste</div>
               <div className="text-[11px] text-neutral-500 mt-1">
-                Paste month/category lists like your January–December tracker. Rules and unrelated headings are ignored.
+                Paste month/category lists like your January–December tracker. Stack uses the first day of each detected month, so January 2025 becomes January 1, 2025.
               </div>
             </div>
 
             <label className="block">
-              <div className="text-xs text-neutral-400 mb-1">Default year</div>
+              <div className="text-xs text-neutral-400 mb-1">Year for pasted month entries</div>
               <input
                 type="number"
                 min="1900"
@@ -11183,7 +11383,7 @@ function LibraryImportPanel({
 
             <button
               type="button"
-              onClick={onParsePaste}
+              onClick={() => void onParsePaste()}
               className="w-full px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 text-sm"
             >
               Parse pasted list
@@ -11194,7 +11394,7 @@ function LibraryImportPanel({
             <div>
               <div className="text-sm font-medium text-neutral-100">MyAnimeList</div>
               <div className="text-[11px] text-neutral-500 mt-1">
-                Accepts MAL anime and manga exports as .xml or .xml.gz/.gz. Scores, status, progress, dates, tags, and rewatches are preserved when present.
+                Accepts MAL anime and manga exports as .xml or .xml.gz/.gz. Scores, status, progress, dates, tags, and rewatches are preserved; AniList matching automatically adds covers and metadata when available.
               </div>
             </div>
 
@@ -11223,7 +11423,7 @@ function LibraryImportPanel({
             <div>
               <div className="text-sm font-medium text-neutral-100">Letterboxd</div>
               <div className="text-[11px] text-neutral-500 mt-1">
-                Accepts the Letterboxd account-export ZIP directly, or loose CSV files such as diary.csv, ratings.csv, watched.csv, and watchlist.csv.
+                Accepts the Letterboxd account-export ZIP directly, or loose CSV files such as diary.csv, ratings.csv, watched.csv, and watchlist.csv. TMDB matching automatically adds posters and metadata when available.
               </div>
             </div>
 
@@ -11244,7 +11444,7 @@ function LibraryImportPanel({
             </label>
 
             <div className="text-[11px] text-neutral-600">
-              Ratings are converted to Stack&apos;s 0–10 scale. Diary dates, rewatches, tags, and reviews are merged when available.
+              Ratings are converted to Stack&apos;s 0–10 scale. Diary dates, rewatches, tags, reviews, posters, and metadata are merged when available.
             </div>
           </div>
         </div>
@@ -11265,7 +11465,7 @@ function LibraryImportPanel({
             onClick={() => void onMatchMetadata()}
             className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 hover:bg-white/15 disabled:opacity-40 text-xs"
           >
-            {matching ? "Matching…" : "Find posters & metadata"}
+            {matching ? "Matching…" : "Retry posters & metadata"}
           </button>
           <button
             type="button"
@@ -11293,7 +11493,7 @@ function LibraryImportPanel({
           </button>
 
           <div className="ml-auto text-[11px] text-neutral-500">
-            {matchedCount ? `${matchedCount} metadata matches` : "Metadata matching is optional"}
+            {matchedCount ? `${matchedCount} metadata matches` : "Posters & metadata match automatically"}
           </div>
         </div>
 
@@ -11404,13 +11604,24 @@ function LibraryImportPanel({
                           />
                         </label>
                         <label className="block">
-                          <div className="text-xs text-neutral-400 mb-1">Finished date</div>
+                          <div className="text-xs text-neutral-400 mb-1">
+                            Finished date
+                            {candidate.importYearMonth && !candidate.dateFinished ? (
+                              <span className="text-neutral-600"> • {importYearMonthLabel(candidate.importYearMonth)}</span>
+                            ) : null}
+                          </div>
                           <input
                             type="date"
                             value={candidate.dateFinished ?? ""}
                             onChange={(e) => onUpdateCandidate(candidate.id, { dateFinished: e.target.value || undefined })}
                             className="w-full h-[42px] rounded-xl bg-neutral-950 border border-neutral-800 px-3 text-sm outline-none focus:border-neutral-500"
+                            title={candidate.importYearMonth && !candidate.dateFinished ? "Exact day optional — the imported month/year will still be preserved." : "Finished date"}
                           />
+                          {candidate.importYearMonth && !candidate.dateFinished ? (
+                            <div className="text-[10px] text-neutral-600 mt-1">
+                              Exact day unknown; Stack will count this in {importYearMonthLabel(candidate.importYearMonth)}.
+                            </div>
+                          ) : null}
                         </label>
                       </div>
 

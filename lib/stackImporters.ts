@@ -128,24 +128,26 @@ function mergeCandidates(candidates: StackImportCandidate[]) {
       continue;
     }
 
-    const mergedMonths = uniqueStrings([
-      existing.importYearMonth,
-      candidate.importYearMonth,
-    ]);
+    const repeatedRewatchCount = Math.max(
+      (existing.rewatchCount ?? 0) + 1,
+      candidate.rewatchCount ?? 0
+    );
 
     byKey.set(key, {
       ...existing,
+      // A repeated title remains one library entry. The later occurrence is treated
+      // as the most recent viewing, while the rewatch counter records the repeat.
       rating: candidate.rating ?? existing.rating,
       dateFinished: candidate.dateFinished ?? existing.dateFinished,
       notes: mergeNotes(existing.notes, candidate.notes),
       tags: uniqueStrings([...(existing.tags ?? []), ...(candidate.tags ?? [])]),
-      rewatchCount: Math.max(existing.rewatchCount ?? 0, candidate.rewatchCount ?? 0) || undefined,
+      rewatchCount: repeatedRewatchCount || undefined,
       inTheaters: !!existing.inTheaters || !!candidate.inTheaters,
-      importYearMonth: mergedMonths.join(", "),
+      importYearMonth: candidate.importYearMonth ?? existing.importYearMonth,
       warnings: uniqueStrings([
         ...(existing.warnings ?? []),
         ...(candidate.warnings ?? []),
-        "Repeated title in the pasted list was merged into one Stack entry.",
+        "Repeated title in the pasted list was merged into one Stack entry; the latest tracked month is used and the rewatch count was increased.",
       ]),
     });
   }
@@ -247,6 +249,10 @@ function parsePasteEntry(
     tags: [],
     rewatchCount: isRewatch ? 1 : undefined,
     inTheaters: inTheaters || undefined,
+    dateFinished:
+      status === "completed"
+        ? `${year}-${String(month).padStart(2, "0")}-01`
+        : undefined,
     importYearMonth: `${year}-${String(month).padStart(2, "0")}`,
     selected: true,
   };
@@ -361,6 +367,11 @@ export function parseMyAnimeListXml(xmlTextValue: string) {
     const score = cleanNumber(xmlText(node, ["my_score"]));
     const status = malStatusToStack(xmlText(node, ["my_status"]));
     const finishDate = cleanDate(xmlText(node, ["my_finish_date"]));
+    const startDate = cleanDate(xmlText(node, ["my_start_date"]));
+    const estimatedFinishDate =
+      !finishDate && status === "completed" && total === 1 && startDate
+        ? startDate
+        : undefined;
     const tags = splitTags(xmlText(node, ["my_tags"]));
     const comments = xmlText(node, ["my_comments"]);
     const rewatches = cleanNonNegativeInt(xmlText(node, ["my_times_watched"]));
@@ -375,9 +386,17 @@ export function parseMyAnimeListXml(xmlTextValue: string) {
       typeHint: "exact",
       status,
       rating: typeof score === "number" && score > 0 ? Math.min(10, score) : undefined,
-      dateFinished: finishDate,
-      notes: comments || undefined,
+      dateFinished: finishDate || estimatedFinishDate,
+      notes: mergeNotes(
+        comments || undefined,
+        estimatedFinishDate
+          ? "Finish date was missing in MyAnimeList; Stack estimated it from the MAL start date because this completed title has one episode."
+          : undefined
+      ),
       tags,
+      warnings: estimatedFinishDate
+        ? ["Estimated finish date from MAL start date for a one-episode completed title."]
+        : undefined,
       rewatchCount: rewatches && rewatches > 0 ? rewatches : undefined,
       progressCur: progress,
       progressTotal: total,
@@ -394,6 +413,11 @@ export function parseMyAnimeListXml(xmlTextValue: string) {
     const score = cleanNumber(xmlText(node, ["my_score"]));
     const status = malStatusToStack(xmlText(node, ["my_status"]));
     const finishDate = cleanDate(xmlText(node, ["my_finish_date"]));
+    const startDate = cleanDate(xmlText(node, ["my_start_date"]));
+    const estimatedFinishDate =
+      !finishDate && status === "completed" && totalChapters === 1 && startDate
+        ? startDate
+        : undefined;
     const tags = splitTags(xmlText(node, ["my_tags"]));
     const comments = xmlText(node, ["my_comments"]);
     const rereads = cleanNonNegativeInt(xmlText(node, ["my_times_read"]));
@@ -408,9 +432,17 @@ export function parseMyAnimeListXml(xmlTextValue: string) {
       typeHint: "exact",
       status,
       rating: typeof score === "number" && score > 0 ? Math.min(10, score) : undefined,
-      dateFinished: finishDate,
-      notes: comments || undefined,
+      dateFinished: finishDate || estimatedFinishDate,
+      notes: mergeNotes(
+        comments || undefined,
+        estimatedFinishDate
+          ? "Finish date was missing in MyAnimeList; Stack estimated it from the MAL start date because this completed title has one chapter."
+          : undefined
+      ),
       tags,
+      warnings: estimatedFinishDate
+        ? ["Estimated finish date from MAL start date for a one-chapter completed title."]
+        : undefined,
       rewatchCount: rereads && rereads > 0 ? rereads : undefined,
       progressCur: progressChapters,
       progressTotal: totalChapters,
