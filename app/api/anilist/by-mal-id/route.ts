@@ -1,219 +1,131 @@
 import { NextRequest, NextResponse } from "next/server";
 
-type AniListType = "ANIME" | "MANGA";
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
-type LookupRequestEntry = {
-  key: string;
-  malId: number;
-  type: AniListType;
-};
-
+type MediaType = "ANIME" | "MANGA";
+type Entry = { key: string; malId: number; type: MediaType };
 type AniListMedia = {
   id?: number | null;
-  title?: {
-    romaji?: string | null;
-    english?: string | null;
-    native?: string | null;
-  } | null;
-  coverImage?: {
-    extraLarge?: string | null;
-    large?: string | null;
-    medium?: string | null;
-  } | null;
+  title?: { romaji?: string | null; english?: string | null; native?: string | null } | null;
+  coverImage?: { extraLarge?: string | null; large?: string | null; medium?: string | null } | null;
   genres?: string[] | null;
   episodes?: number | null;
   duration?: number | null;
   chapters?: number | null;
   volumes?: number | null;
 };
-
-type AniListBatchResponse = {
-  data?: Record<string, AniListMedia | null> | null;
-  errors?: Array<{ message?: string; status?: number }> | null;
+type GqlResponse = {
+  data?: Record<string, AniListMedia | null>;
+  errors?: Array<{ message?: string; status?: number }>;
 };
+const MAX_PER_REQUEST = 40;
+const UPSTREAM_BATCH = 20;
+const UPSTREAM_PAUSE_MS = 1300;
+const MAX_RETRIES = 3;
 
-type LookupResult = {
-  id: number;
-  title: string;
-  coverUrl?: string;
-  genres?: string[];
-  episodes?: number | null;
-  duration?: number | null;
-  chapters?: number | null;
-  volumes?: number | null;
-};
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-export const dynamic = "force-dynamic";
-
-const MAX_BATCH_SIZE = 400;
-const GRAPHQL_CHUNK_SIZE = 20;
-
-function normalizeType(value: unknown): AniListType {
-  return String(value || "").toUpperCase() === "MANGA" ? "MANGA" : "ANIME";
-}
-
-function normalizeEntry(value: unknown, index: number): LookupRequestEntry | null {
+function parseEntry(value: unknown, index: number): Entry | null {
   if (!value || typeof value !== "object") return null;
   const row = value as Record<string, unknown>;
   const malId = Number(row.malId);
-  if (!Number.isFinite(malId) || malId <= 0) return null;
-  const rawKey = typeof row.key === "string" ? row.key.trim() : "";
+  if (!Number.isSafeInteger(malId) || malId <= 0) return null;
   return {
-    key: rawKey || `entry-${index}`,
-    malId: Math.trunc(malId),
-    type: normalizeType(row.type),
+    key: typeof row.key === "string" && row.key.trim() ? row.key.slice(0, 160) : `entry-${index}`,
+    malId,
+    type: row.type === "MANGA" ? "MANGA" : "ANIME",
   };
 }
 
-function mediaToResult(media: AniListMedia | null | undefined): LookupResult | null {
+function normalize(media?: AniListMedia | null) {
   if (!media?.id) return null;
-  const title = String(
-    media.title?.english || media.title?.romaji || media.title?.native || ""
-  ).trim();
-  const coverUrl =
-    media.coverImage?.extraLarge ||
-    media.coverImage?.large ||
-    media.coverImage?.medium ||
-    undefined;
-
   return {
-    id: Number(media.id),
-    title,
-    coverUrl,
-    genres: Array.isArray(media.genres)
-      ? media.genres.map((value) => String(value))
-      : undefined,
-    episodes: typeof media.episodes === "number" ? media.episodes : null,
-    duration: typeof media.duration === "number" ? media.duration : null,
-    chapters: typeof media.chapters === "number" ? media.chapters : null,
-    volumes: typeof media.volumes === "number" ? media.volumes : null,
+    id: media.id,
+    title: media.title?.english || media.title?.romaji || media.title?.native || "",
+    coverUrl: media.coverImage?.extraLarge || media.coverImage?.large || media.coverImage?.medium || undefined,
+    genres: Array.isArray(media.genres) ? media.genres : [],
+    episodes: media.episodes ?? null,
+    duration: media.duration ?? null,
+    chapters: media.chapters ?? null,
+    volumes: media.volumes ?? null,
   };
 }
 
-async function fetchChunk(entries: LookupRequestEntry[]) {
-  const selections = entries
-    .map(
-      (entry, index) => `
-        m${index}: Media(idMal: ${entry.malId}, type: ${entry.type}) {
-          id
-          title { romaji english native }
-          coverImage { extraLarge large medium }
-          genres
-          episodes
-          duration
-          chapters
-          volumes
-        }
-      `
-    )
-    .join("\n");
+async function fetchUpstream(entries: Entry[]): Promise<Array<Entry & { result: ReturnType<typeof normalize> }>> {
+  const selections = entries.map((entry, index) => `m${index}: Media(idMal: ${entry.malId}, type: ${entry.type}) {
+    id title { english romaji native } coverImage { extraLarge large medium }
+    genres episodes duration chapters volumes
+  }`).join("\n");
+  const query = `query StackByMalId { ${selections} }`;
 
-  const query = `query StackMalArtworkBatch { ${selections} }`;
-  const response = await fetch("https://graphql.anilist.co", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({ query }),
-    cache: "no-store",
-  });
-
-  const json: AniListBatchResponse = await response.json().catch(() => ({}));
-
-  if (!response.ok && !json.data) {
-    const retryAfter = response.headers.get("retry-after");
-    const suffix = retryAfter ? ` Retry after ${retryAfter}s.` : "";
-    throw new Error(`AniList MAL lookup failed (${response.status}).${suffix}`);
-  }
-
-  const data = json.data ?? {};
-  return entries.map((entry, index) => ({
-    key: entry.key,
-    malId: entry.malId,
-    type: entry.type,
-    result: mediaToResult(data[`m${index}`]),
-  }));
-}
-
-async function lookupEntries(entries: LookupRequestEntry[]) {
-  const output: Array<{
-    key: string;
-    malId: number;
-    type: AniListType;
-    result: LookupResult | null;
-  }> = [];
-
-  for (let start = 0; start < entries.length; start += GRAPHQL_CHUNK_SIZE) {
-    const chunk = entries.slice(start, start + GRAPHQL_CHUNK_SIZE);
-    const rows = await fetchChunk(chunk);
-    output.push(...rows);
-
-    // A tiny pause between GraphQL batches avoids burst-limiter spikes while still
-    // reducing a 100-entry MAL import to only five AniList requests.
-    if (start + GRAPHQL_CHUNK_SIZE < entries.length) {
-      await new Promise((resolve) => setTimeout(resolve, 175));
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+    const response = await fetch("https://graphql.anilist.co", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ query }),
+      cache: "no-store",
+    });
+    const raw = (await response.json().catch(() => ({}))) as GqlResponse;
+    const rateLimited = response.status === 429 || raw.errors?.some((e) => e.status === 429);
+    if (rateLimited && attempt < MAX_RETRIES) {
+      const seconds = Number(response.headers.get("retry-after") || "0");
+      await sleep(Math.max(2000 * (attempt + 1), Number.isFinite(seconds) ? seconds * 1000 : 0));
+      continue;
     }
-  }
-
-  return output;
-}
-
-export async function GET(request: NextRequest) {
-  const { searchParams } = new URL(request.url);
-  const entry = normalizeEntry(
-    {
-      key: "single",
-      malId: searchParams.get("malId"),
-      type: searchParams.get("type"),
-    },
-    0
-  );
-
-  if (!entry) {
-    return NextResponse.json(
-      { error: "A valid MAL ID is required." },
-      { status: 400 }
-    );
-  }
-
-  try {
-    const [row] = await lookupEntries([entry]);
-    return NextResponse.json({ result: row?.result ?? null });
-  } catch (error: unknown) {
-    const message =
-      error instanceof Error ? error.message : "AniList lookup failed.";
-    console.error("AniList MAL-ID lookup failed", error);
-    return NextResponse.json({ error: message }, { status: 502 });
-  }
-}
-
-export async function POST(request: NextRequest) {
-  try {
-    const body: unknown = await request.json();
-    const rawEntries =
-      body && typeof body === "object" && Array.isArray((body as { entries?: unknown }).entries)
-        ? (body as { entries: unknown[] }).entries
-        : [];
-
-    const entries = rawEntries
-      .slice(0, MAX_BATCH_SIZE)
-      .map((value, index) => normalizeEntry(value, index))
-      .filter((value): value is LookupRequestEntry => Boolean(value));
-
-    if (!entries.length) {
-      return NextResponse.json(
-        { error: "At least one valid MAL lookup entry is required.", results: [] },
-        { status: 400 }
-      );
+    if (!response.ok || raw.errors?.length) {
+      const reason = raw.errors?.find((e) => e.message)?.message || `AniList failed (${response.status})`;
+      const error = new Error(reason) as Error & { status?: number; retryAfter?: string };
+      error.status = rateLimited ? 429 : 502;
+      if (rateLimited) error.retryAfter = response.headers.get("retry-after") || "10";
+      throw error;
     }
-
-    const results = await lookupEntries(entries);
-    return NextResponse.json({ results });
-  } catch (error: unknown) {
-    const message =
-      error instanceof Error ? error.message : "AniList batch lookup failed.";
-    console.error("AniList MAL-ID batch lookup failed", error);
-    return NextResponse.json({ error: message, results: [] }, { status: 502 });
+    const data = raw.data ?? {};
+    return entries.map((entry, index) => ({ ...entry, result: normalize(data[`m${index}`]) }));
   }
+  throw new Error("AniList rate limit continued beyond retry budget.");
+}
+
+async function lookup(entries: Entry[]) {
+  const results: Array<Entry & { result: ReturnType<typeof normalize> }> = [];
+  for (let start = 0; start < entries.length; start += UPSTREAM_BATCH) {
+    if (start) await sleep(UPSTREAM_PAUSE_MS);
+    results.push(...(await fetchUpstream(entries.slice(start, start + UPSTREAM_BATCH))));
+  }
+  return results;
+}
+
+function failure(error: unknown) {
+  console.error("AniList MAL lookup failed", error);
+  const err = error as Error & { status?: number; retryAfter?: string };
+  const status = err.status === 429 ? 429 : 502;
+  const headers: Record<string, string> = { "Cache-Control": "no-store" };
+  if (status === 429) headers["Retry-After"] = err.retryAfter || "10";
+  return NextResponse.json({ error: err.message || "AniList lookup failed." }, { status, headers });
+}
+
+export async function GET(req: NextRequest) {
+  const params = new URL(req.url).searchParams;
+  const entry = parseEntry({ key: "single", malId: params.get("malId"), type: params.get("type") }, 0);
+  if (!entry) return NextResponse.json({ error: "A valid MAL ID is required." }, { status: 400 });
+  try {
+    const rows = await lookup([entry]);
+    return NextResponse.json({ result: rows[0]?.result ?? null }, { headers: { "Cache-Control": "no-store" } });
+  } catch (error) { return failure(error); }
+}
+
+export async function POST(req: NextRequest) {
+  let body: unknown;
+  try { body = await req.json(); }
+  catch { return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 }); }
+  const raw = body && typeof body === "object" && "entries" in body ? (body as { entries?: unknown }).entries : undefined;
+  if (!Array.isArray(raw) || !raw.length || raw.length > MAX_PER_REQUEST) {
+    return NextResponse.json({ error: `Send 1–${MAX_PER_REQUEST} MAL entries per request.` }, { status: 400 });
+  }
+  const entries = raw.map(parseEntry);
+  if (entries.some((e) => e === null)) return NextResponse.json({ error: "One or more MAL IDs were invalid." }, { status: 400 });
+  try {
+    return NextResponse.json({ results: await lookup(entries as Entry[]) }, { headers: { "Cache-Control": "no-store" } });
+  } catch (error) { return failure(error); }
 }

@@ -358,6 +358,7 @@ const LOCAL_COLOR_THEME_KEY = "stack-color-theme-v1";
 const LOCAL_BACKGROUND_IMAGE_KEY = "stack-background-image-v1";
 const LOCAL_BANNER_IMAGE_KEY = "stack-banner-image-v1";
 const LOCAL_LIBRARY_STYLE_KEY = "stack-library-style-v1";
+const LOCAL_CORNER_STYLE_KEY = "stack-corner-style-v1";
 const LOCAL_ACTIVE_USER_KEY = "stack-active-user-v1";
 const SESSION_CONFIRMED_USER_KEY = "stack-session-confirmed-user-v1";
 const SESSION_DISPLAY_CACHE_KEY = "stack-session-display-cache-v1";
@@ -634,6 +635,24 @@ function saveLocalLibraryStyle(style: StackLibraryStyle, uid?: string | null) {
   try {
     document.documentElement.dataset.stackLibraryStyle = style;
   } catch {}
+}
+
+function loadLocalCornerStyle(uid?: string | null): StackCornerStyle | null {
+  if (typeof window === "undefined") return null;
+  const activeUid = String(uid ?? loadLocalActiveUserId()).trim();
+  if (!activeUid) return null;
+  try {
+    const value = localStorage.getItem(scopedLocalKey(LOCAL_CORNER_STYLE_KEY, activeUid));
+    return value === "square" || value === "rounded" ? value : null;
+  } catch { return null; }
+}
+
+function saveLocalCornerStyle(style: StackCornerStyle, uid?: string | null) {
+  if (typeof document !== "undefined") document.documentElement.dataset.stackCornerStyle = style;
+  if (typeof window === "undefined") return;
+  const activeUid = String(uid ?? loadLocalActiveUserId()).trim();
+  if (!activeUid) return;
+  try { localStorage.setItem(scopedLocalKey(LOCAL_CORNER_STYLE_KEY, activeUid), style); } catch {}
 }
 
 function applyStackBannerToDocument(urlValue: unknown) {
@@ -1834,21 +1853,40 @@ async function enrichMalCandidatesByExactId(
 
   if (!entries.length) return candidates;
 
-  const res = await fetch("/api/anilist/by-mal-id", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ entries }),
-    cache: "no-store",
-  });
-  const json = (await res.json()) as AniListMalBatchResponse;
-  if (!res.ok) {
-    throw new Error(json.error || "Batch MAL artwork lookup failed.");
+  // Vercel invocations are short and provider rate limits are strict.
+  // Keep each request small, paced, and retry transient rate limits.
+  const allRows: NonNullable<AniListMalBatchResponse["results"]> = [];
+  const MAL_BATCH_SIZE = 40;
+  const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  for (let start = 0; start < entries.length; start += MAL_BATCH_SIZE) {
+    if (start > 0) await pause(2200);
+    const batch = entries.slice(start, start + MAL_BATCH_SIZE);
+    let succeeded = false;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const res = await fetch("/api/anilist/by-mal-id", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entries: batch }),
+        cache: "no-store",
+      });
+      const json = (await res.json().catch(() => ({}))) as AniListMalBatchResponse;
+      if (res.ok) {
+        allRows.push(...(json.results ?? []));
+        succeeded = true;
+        break;
+      }
+      const waitSeconds = Number(res.headers.get("retry-after") ?? "0");
+      if ((res.status === 429 || res.status >= 500) && attempt < 3) {
+        await pause(Math.max(2500 * (attempt + 1), Number.isFinite(waitSeconds) ? waitSeconds * 1000 : 0));
+        continue;
+      }
+      throw new Error(json.error || `MAL artwork lookup failed (${res.status}). Nothing was imported.`);
+    }
+    if (!succeeded) throw new Error("MAL artwork matching could not finish. No library changes were made.");
   }
 
   const byKey = new Map(
-    (json.results ?? [])
-      .filter((row) => row.result?.id)
-      .map((row) => [row.key, row] as const)
+    allRows.filter((row) => row.result?.id).map((row) => [row.key, row] as const)
   );
 
   return candidates.map((candidate) => {
@@ -2133,6 +2171,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   const confirmedUserIdRef = useRef<string | null>(null);
   const lastPersistedFingerprintRef = useRef<string>("");
   const loadGenerationRef = useRef(0);
+  const cloudDirtyRef = useRef(false);
+  const currentDraftFingerprintRef = useRef("");
+  const savePendingCountRef = useRef(0);
+  const persistQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [pendingAuthUser, setPendingAuthUser] = useState<{
     id: string;
     email: string;
@@ -2180,6 +2222,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     const savedBackground = loadLocalBackgroundImage(activeUid);
     const savedBanner = loadLocalBannerImage(activeUid);
     const savedLibraryStyle = loadLocalLibraryStyle(activeUid);
+    const savedCornerStyle = loadLocalCornerStyle(activeUid);
+    if (savedCornerStyle) document.documentElement.dataset.stackCornerStyle = savedCornerStyle;
 
     // Only restore preferences belonging to the last verified Stack user.
     // No media/library data is loaded until Supabase auth is verified below.
@@ -2206,6 +2250,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       backgroundImageUrl: savedBackground || "",
       bannerImageUrl: savedBanner || "",
       libraryStyle: savedLibraryStyle ?? prev.libraryStyle,
+      cornerStyle: savedCornerStyle ?? prev.cornerStyle,
     }));
 
     if (savedLibraryStyle || hasSavedBoardPreference) {
@@ -2377,7 +2422,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           const fallbackMatched = await mapImportWithConcurrency(
             unresolved,
             1,
-            async (candidate) => matchImportCandidateMetadata(candidate)
+            async (candidate, index) => {
+              if (index > 0) await new Promise<void>((resolve) => setTimeout(resolve, 1200));
+              return matchImportCandidateMetadata(candidate);
+            }
           );
           const fallbackById = new Map(
             fallbackMatched.map((candidate) => [candidate.id, candidate])
@@ -2469,7 +2517,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         const fallback = await mapImportWithConcurrency(
           unresolved,
           1,
-          async (candidate) => matchImportCandidateMetadata(candidate)
+          async (candidate, index) => {
+            if (index > 0) await new Promise<void>((resolve) => setTimeout(resolve, 1200));
+            return matchImportCandidateMetadata(candidate);
+          }
         );
         const fallbackById = new Map(fallback.map((candidate) => [candidate.id, candidate]));
         repairedCandidates = repairedCandidates.map(
@@ -3008,6 +3059,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       setDisplayPreferencesReady(true);
     }
 
+    if (patch.cornerStyle === "square" || patch.cornerStyle === "rounded") {
+      saveLocalCornerStyle(patch.cornerStyle, userId);
+    }
+
     // Surface is intentionally standardized to glass and the removed legacy
     // settings are normalized away rather than deleting any saved user data.
     const safePatch: Partial<StackSettings> = {
@@ -3031,6 +3086,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     const backgroundKey = scopedLocalKey(LOCAL_BACKGROUND_IMAGE_KEY, userId);
     const bannerKey = scopedLocalKey(LOCAL_BANNER_IMAGE_KEY, userId);
     const libraryKey = scopedLocalKey(LOCAL_LIBRARY_STYLE_KEY, userId);
+    const cornerKey = scopedLocalKey(LOCAL_CORNER_STYLE_KEY, userId);
 
     const onStorage = (e: StorageEvent) => {
       if (e.key === themeKey && isStackColorTheme(e.newValue)) {
@@ -3050,6 +3106,12 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         const nextBanner = String(e.newValue ?? "").trim();
         applyStackBannerToDocument(nextBanner);
         setSettings((prev) => ({ ...prev, bannerImageUrl: nextBanner }));
+        return;
+      }
+
+      if (e.key === cornerKey && (e.newValue === "square" || e.newValue === "rounded")) {
+        document.documentElement.dataset.stackCornerStyle = e.newValue;
+        setSettings((prev) => ({ ...prev, cornerStyle: e.newValue as StackCornerStyle }));
         return;
       }
 
@@ -3630,6 +3692,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
 
     const libraryStyle = nextSettings.libraryStyle ?? DEFAULT_SETTINGS.libraryStyle;
     saveLocalLibraryStyle(libraryStyle, uidStr);
+    saveLocalCornerStyle(nextSettings.cornerStyle === "square" ? "square" : "rounded", uidStr);
 
     try {
       const savedBoard = localStorage.getItem(scopedLocalKey(LOCAL_BOARD_VIEW_KEY, uidStr));
@@ -3698,25 +3761,31 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
   }, [applyLoadedSettings, cloudLoaded, loadedUserId, pendingStackBackup, userId]);
 
   const loadCloud = useCallback(
-    async (uidStr: string) => {
+    async (uidStr: string, options?: { background?: boolean }) => {
+      // Never replace unsaved edits or a pending save with a cloud snapshot.
+      if (options?.background && (cloudDirtyRef.current || savePendingCountRef.current > 0)) {
+        return;
+      }
       const generation = ++loadGenerationRef.current;
       const isCurrentLoad = () =>
         generation === loadGenerationRef.current &&
         activeAuthUserRef.current === uidStr &&
         confirmedUserIdRef.current === uidStr;
 
-      loadedUserIdRef.current = null;
-      lastPersistedFingerprintRef.current = "";
-      setLoadedUserId(null);
-      setSaveStatus("Loading…");
-      setCloudLoaded(false);
+      if (!options?.background) {
+        loadedUserIdRef.current = null;
+        lastPersistedFingerprintRef.current = "";
+        setLoadedUserId(null);
+        setSaveStatus("Loading…");
+        setCloudLoaded(false);
+      }
 
       // Keep an existing user-scoped local backup only as an emergency copy.
       // It is NEVER automatically applied to cloud data or to another account.
       const localBackup = loadLocalBackup(uidStr);
       const localBackupCount = localBackup?.length ?? 0;
 
-      const { data, error } = await supabase
+      let { data, error } = await supabase
         .from("media_items")
         .select("data")
         .eq("user_id", uidStr)
@@ -3735,12 +3804,56 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       }
 
       if (!data) {
-        setSaveStatus(
-          localBackupCount > 0
-            ? `Account storage row is missing. Your ${localBackupCount}-item local backup is preserved; nothing was written.`
-            : "Account storage row is missing. Nothing was written."
-        );
-        return;
+        // Only a *recently created* exact verified Auth account can initialize
+        // empty storage; established accounts always fail closed.
+        // Never use UPSERT: a duplicate means another initialization won the race.
+        const { data: identity, error: identityError } = await supabase.auth.getUser();
+        const verified = identity?.user;
+        const createdAt = Date.parse(String(verified?.created_at || ""));
+        const isFreshVerifiedAccount =
+          !identityError && verified?.id === uidStr &&
+          activeAuthUserRef.current === uidStr &&
+          confirmedUserIdRef.current === uidStr &&
+          localBackupCount === 0 && Number.isFinite(createdAt) &&
+          Date.now() >= createdAt && Date.now() - createdAt <= 24 * 60 * 60 * 1000;
+        if (!isFreshVerifiedAccount) {
+          setSaveStatus(
+            localBackupCount > 0
+              ? `Account storage row is missing. Your ${localBackupCount}-item backup is preserved; nothing was written.`
+              : "Established account storage is missing. Initialization blocked to protect data."
+          );
+          return;
+        }
+
+        // Profile is also strictly insert-only, and a preexisting profile is untouched.
+        const { data: existingProfile, error: profileReadError } = await supabase
+          .from("profiles").select("id").eq("id", uidStr).maybeSingle();
+        if (!profileReadError && !existingProfile && isCurrentLoad()) {
+          const { error: profileInsertError } = await supabase.from("profiles").insert({ id: uidStr });
+          if (profileInsertError && profileInsertError.code !== "23505") {
+            console.warn("Stack profile initialization requires attention:", profileInsertError.message);
+          }
+        }
+
+        if (!isCurrentLoad()) return;
+        const insert = await supabase.from("media_items").insert({
+          user_id: uidStr,
+          data: { items: [], settings: { ...DEFAULT_SETTINGS }, feedback: [] },
+        });
+        if (insert.error && insert.error.code !== "23505") {
+          console.error("Stack initial storage create failed", insert.error);
+          setSaveStatus("New account storage could not be initialized. No existing row was replaced.");
+          return;
+        }
+        const retry = await supabase.from("media_items")
+          .select("data").eq("user_id", uidStr).maybeSingle();
+        if (!isCurrentLoad()) return;
+        if (retry.error || !retry.data) {
+          setSaveStatus("New account storage could not be verified. No existing row was changed.");
+          return;
+        }
+        data = retry.data;
+        error = retry.error;
       }
 
       const raw = data.data as unknown;
@@ -3771,6 +3884,9 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         return;
       }
 
+      // Do not swap the currently edited state for a background snapshot.
+      if (options?.background && (cloudDirtyRef.current || savePendingCountRef.current > 0)) return;
+
       // The cloud row is authoritative. Local backups are refreshed FROM cloud,
       // never the other way around automatically.
       const loadedSettings = applyLoadedSettings(rawObj?.settings, uidStr);
@@ -3798,6 +3914,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       );
       setLoadedUserId(uidStr);
       setCloudLoaded(true);
+      cloudDirtyRef.current = false;
       setSaveStatus(
         parsedItems.length === 0 && localBackupCount > 0
           ? `Loaded empty cloud library. A ${localBackupCount}-item local backup was preserved and was not applied automatically.`
@@ -3814,6 +3931,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       nextSettings: StackSettings,
       nextFeedback: FeedbackEntry[]
     ) => {
+      savePendingCountRef.current += 1;
+      const commit = async () => {
       if (
         activeAuthUserRef.current !== uidStr ||
         confirmedUserIdRef.current !== uidStr ||
@@ -3903,6 +4022,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       }
 
       lastPersistedFingerprintRef.current = fingerprint;
+      cloudDirtyRef.current = currentDraftFingerprintRef.current !== fingerprint;
       saveSessionDisplayCache(
         uidStr,
         next,
@@ -3912,6 +4032,11 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       );
       setHasSessionDisplayCache(true);
       setSaveStatus("Saved");
+      };
+      const queued = persistQueueRef.current.catch(() => {}).then(commit);
+      persistQueueRef.current = queued.then(() => {}, () => {});
+      try { await queued; }
+      finally { savePendingCountRef.current = Math.max(0, savePendingCountRef.current - 1); }
     },
     [cloudLoaded, saveLocalBackup, loadLocalBackup, cloudExtraData]
   );
@@ -3951,6 +4076,10 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     loadedUserIdRef.current = null;
     confirmedUserIdRef.current = null;
     lastPersistedFingerprintRef.current = "";
+    currentDraftFingerprintRef.current = "";
+    cloudDirtyRef.current = false;
+    savePendingCountRef.current = 0;
+    persistQueueRef.current = Promise.resolve();
     setLoadedUserId(null);
     setHasSessionDisplayCache(false);
     setPendingStackBackup(null);
@@ -4031,6 +4160,8 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       const savedBackground = loadLocalBackgroundImage(uidStr);
       const savedBanner = loadLocalBannerImage(uidStr);
       const savedLibraryStyle = loadLocalLibraryStyle(uidStr);
+      const savedCornerStyle = loadLocalCornerStyle(uidStr);
+      if (savedCornerStyle) document.documentElement.dataset.stackCornerStyle = savedCornerStyle;
 
       applyStackThemeToDocument(savedTheme);
       applyStackBackgroundToDocument(savedBackground);
@@ -4042,6 +4173,7 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
         backgroundImageUrl: savedBackground,
         bannerImageUrl: savedBanner,
         libraryStyle: savedLibraryStyle ?? prev.libraryStyle,
+        cornerStyle: savedCornerStyle ?? prev.cornerStyle,
       }));
 
       try {
@@ -4128,7 +4260,9 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
     if (!userId || !cloudLoaded || loadedUserId !== userId) return;
 
     const reloadFromCloud = () => {
-      loadCloud(userId);
+      if (!cloudDirtyRef.current && savePendingCountRef.current === 0) {
+        void loadCloud(userId, { background: true });
+      }
     };
 
     const onVisibilityChange = () => {
@@ -4143,6 +4277,14 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [userId, cloudLoaded, loadedUserId, loadCloud]);
+
+  useEffect(() => {
+    if (userId && cloudLoaded && loadedUserId === userId) {
+      const fingerprint = persistenceFingerprint(items, settings, feedbackEntries);
+      currentDraftFingerprintRef.current = fingerprint;
+      cloudDirtyRef.current = fingerprint !== lastPersistedFingerprintRef.current;
+    }
+  }, [userId, loadedUserId, cloudLoaded, items, settings, feedbackEntries]);
 
   useEffect(() => {
     if (
@@ -6268,17 +6410,18 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
           `stack-poster-${posterSize}`,
           `stack-surface-${surfaceStyle}`,
           `stack-corners-${cornerStyle}`,
+          showingVerifiedSessionCache ? "pointer-events-none" : "",
         ]
           .filter(Boolean)
           .join(" ")}
       >
         {showingVerifiedSessionCache ? (
           <div
-            className="fixed inset-0 z-[70] cursor-wait"
+            className="fixed top-3 right-3 sm:top-4 sm:right-4 z-[70] pointer-events-none"
             aria-live="polite"
             aria-label="Stack is securely revalidating your account data"
           >
-            <div className="absolute top-3 right-3 sm:top-4 sm:right-4 flex items-center gap-2 rounded-xl border border-white/10 bg-black/85 px-3 py-2 shadow-xl backdrop-blur-xl">
+            <div className="pointer-events-auto flex items-center gap-2 rounded-xl border border-white/10 bg-black/85 px-3 py-2 shadow-xl backdrop-blur-xl">
               <div className="min-w-0">
                 <div className="text-[11px] font-medium text-neutral-200">Secure sync</div>
                 <div className="max-w-[240px] truncate text-[10px] text-neutral-500">
@@ -6336,6 +6479,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             border-radius: 9999px !important;
           }
 
+          /* Pre-paint preference is applied before React/route hydration. */
+          html[data-stack-corner-style="square"] .stack-bg :where(
+            [class~="rounded-[2rem]"], .rounded-3xl, .rounded-2xl,
+            .rounded-xl, .rounded-lg, .rounded-md
+          ) { border-radius: 0 !important; }
+          html[data-stack-corner-style="square"] .stack-bg .rounded-full {
+            border-radius: 9999px !important;
+          }
+
           .stack-poster-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
@@ -6359,6 +6511,15 @@ export default function StackApp({ view = "all" }: { view?: StackView }) {
             background: rgba(7,10,18,0.76);
             box-shadow: 0 12px 34px rgba(0,0,0,0.22);
             transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+          }
+
+          @media (min-width: 640px) {
+            .stack-poster-grid { align-items: stretch; }
+            .stack-poster-card { height: 100%; display: flex; flex-direction: column; }
+            .stack-poster-card > .p-3 { flex: 1; display: flex; flex-direction: column; }
+            .stack-poster-card > .p-3 > select { margin-top: auto; }
+            .stack-poster-card > .p-3 > .grid:last-child { flex: none; }
+            .stack-poster-card > .p-3 > div:has(+ select) { min-height: 1.25rem; }
           }
 
           .stack-poster-card:hover {
